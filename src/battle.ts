@@ -37,6 +37,17 @@ export interface ChatLine {
   enemy: boolean;
   mode: string;
 }
+/** /mission.json：战局主目标。坦克/空战里 status 为 running 就说明人在局内，这是最稳的判据。 */
+export interface MissionState {
+  running: boolean;
+  objectives: string[];
+}
+
+/** /map_info.json：地图元信息，valid 为真说明地图已加载（机库里通常为假）。 */
+export interface MapInfo {
+  valid: boolean;
+}
+
 export interface HudSnapshot {
   events: HudEvent[];
   damage: HudEvent[];
@@ -47,6 +58,8 @@ export interface MapObject {
   type: string;
   x: number;
   y: number;
+  /** 真机给的是 color[] = [r,g,b]（友方 23,77,255 / 敌方 250,12,0 / 自己 250,200,30），这里拍平成 "r,g,b"。 */
+  color: string;
 }
 
 export interface BattleSnapshot {
@@ -115,7 +128,19 @@ function toHudEvent(raw: unknown): HudEvent | null {
 }
 
 /** 击毁类关键字:不同版本的消息措辞不一样,统一用包含匹配兜一层。 */
-const KILL_WORDS = ['destroyed', 'killed', 'shot down', 'burned', 'shattered', '击毁', '击落'];
+/**
+ * 击毁类关键字。
+ *
+ * 中文客户端的措辞和英文完全不是一回事：实测同一局里同时出现
+ *   「X (ZTZ99A) 击毁了 Y (HSTV-L)」
+ *   「X 的攻击引燃了 Y」  ← 引燃即击毁，之前漏了它，中文局几乎全漏
+ *   「⋇ X 先拔头筹！」    ← 首杀播报
+ * 所以这里中英并列，且只用包含匹配（版本间措辞还会变）。
+ */
+const KILL_WORDS = [
+  'destroyed', 'killed', 'shot down', 'burned', 'shattered',
+  '击毁', '击落', '引燃', '摧毁', '击杀', '先拔头筹',
+];
 /**
  * 一次轮询里最多为几条击毁各推一个事件。
  *
@@ -227,7 +252,10 @@ export class BattleClient {
     for (const entry of raw) {
       if (typeof entry !== 'object' || entry === null) continue;
       const item = entry as Record<string, unknown>;
-      out.push({ icon: str(item.icon), type: str(item.type), x: num(item.x), y: num(item.y) });
+      const rgb = Array.isArray(item['color[]'])
+        ? (item['color[]'] as unknown[]).map((part) => Math.trunc(num(part))).join(',')
+        : '';
+      out.push({ icon: str(item.icon), type: str(item.type), x: num(item.x), y: num(item.y), color: rgb || str(item.color) });
     }
     return out;
   }
@@ -250,6 +278,70 @@ export class BattleClient {
     }
     return out;
   }
+
+  /** 战局主目标。读不到就返回 null（机库/游戏没开）。 */
+  async mission(): Promise<MissionState | null> {
+    const raw = await this.json('/mission.json');
+    if (typeof raw !== 'object' || raw === null) return null;
+    const item = raw as Record<string, unknown>;
+    const objectives: string[] = [];
+    if (Array.isArray(item.objectives)) {
+      for (const entry of item.objectives.slice(0, 4)) {
+        if (typeof entry !== 'object' || entry === null) continue;
+        const text = str((entry as Record<string, unknown>).text).trim();
+        if (text) objectives.push(text.replace(/\s+/g, ' '));
+      }
+    }
+    const status = str(item.status).toLowerCase();
+    return { running: status === 'running', objectives };
+  }
+
+  /** 地图元信息。valid 为真说明地图已加载。 */
+  async mapInfo(): Promise<MapInfo | null> {
+    const raw = await this.json('/map_info.json');
+    if (typeof raw !== 'object' || raw === null) return null;
+    return { valid: bool((raw as Record<string, unknown>).valid) };
+  }
+}
+
+/**
+ * /indicators 的 type 形如 tankModels/ussr_t_80ue1_sm、aircraftModels/...，
+ * 直接把前缀去掉当载具名，比空字符串有用。
+ */
+function vehicleFromType(type: string): string {
+  const name = type.trim();
+  if (!name) return '';
+  const slash = name.lastIndexOf('/');
+  return slash >= 0 ? name.slice(slash + 1) : name;
+}
+
+/** 重生点、机场、据点这些不是单位，统计敌我数量时要排掉。 */
+const NON_UNIT_TYPES = ['respawn_base', 'airfield', 'capture_zone', 'point_of_interest'];
+
+function isUnitObject(object: MapObject): boolean {
+  const type = object.type.toLowerCase();
+  if (!type || type === 'none') return false;
+  return !NON_UNIT_TYPES.some((word) => type.includes(word));
+}
+
+/**
+ * 敌我判定。真机的小地图单位不带 enemy/friend 字样，靠颜色区分：
+ * 友方 [23,77,255] / 敌方 [250,12,0] / 自己 [250,200,30]。
+ * 老客户端的 icon 里可能带 enemy/friend，所以颜色判不出来时回退看 icon。
+ */
+function sideOf(object: MapObject): 'enemy' | 'ally' | 'self' | '' {
+  const parts = object.color.split(',').map((part) => Number(part.trim()));
+  if (parts.length === 3 && parts.every((part) => Number.isFinite(part))) {
+    const [r, g, b] = parts;
+    if (r > 180 && g < 90 && b < 90) return 'enemy';
+    if (r > 200 && g > 150 && b < 110) return 'self';
+    if (b > 180 && r < 110) return 'ally';
+    if (g > 150 && r < 120 && b < 120) return 'ally';
+  }
+  const icon = object.icon.toLowerCase();
+  if (icon.includes('enemy')) return 'enemy';
+  if (icon.includes('friend') || icon.includes('ally')) return 'ally';
+  return '';
 }
 
 function maxId(events: HudEvent[], fallback: number): number {
@@ -265,6 +357,20 @@ function maxId(events: HudEvent[], fallback: number): number {
  * 这个语义没有官方文档背书,所以 damage 只用来判断"有击毁"并给出细节,
  * events 只当作战况素材放进讲解,不当成自己的战绩。
  */
+/**
+ * 一次探测的全部信号。
+ *
+ * 为什么不能只看 /state：真机对局里 /state 恒返回 { "valid": false }（只有这一个键），
+ * 而 /mission.json 的 status 是 running、/map_info.json 的 valid 是 true、/map_obj.json 有 229 条单位。
+ * 只认 state.valid 会让「人在局里」被判成不在战局——这就是当初 wt_battle_state 一直报「不在战局」的原因。
+ */
+interface BattleProbe {
+  online: boolean;
+  inBattle: boolean;
+  state: GameState | null;
+  objects: MapObject[];
+}
+
 export class BattleWatcher {
   private readonly client: BattleClient;
   private readonly now: () => number;
@@ -315,20 +421,21 @@ export class BattleWatcher {
     this.snapshot = { vehicle, mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
   }
 
-  private async refreshSnapshot(state: GameState): Promise<void> {
+  private async refreshSnapshot(state: GameState | null, objects: MapObject[]): Promise<void> {
     const ind = await this.client.indicators();
-    const objects = await this.client.mapObjects();
     let enemies = 0;
     let allies = 0;
     for (const object of objects) {
-      const icon = object.icon.toLowerCase();
-      if (icon.includes('enemy') || icon.startsWith('aircraft_enemy') || icon.startsWith('tank_enemy')) enemies += 1;
-      else if (icon.includes('friend') || icon.includes('ally')) allies += 1;
+      if (!isUnitObject(object)) continue;
+      const side = sideOf(object);
+      if (side === 'enemy') enemies += 1;
+      else if (side === 'ally') allies += 1;
     }
+    const vehicle = (state && state.vehicle) || (ind ? vehicleFromType(ind.type) : '');
     this.snapshot = {
-      vehicle: state.vehicle || (ind ? ind.type : '') || '',
-      mode: state.mode,
-      army: state.army,
+      vehicle,
+      mode: state ? state.mode : this.snapshot.mode,
+      army: state ? state.army : this.snapshot.army,
       speed: ind ? ind.speed : 0,
       altitude: ind ? ind.altitude : 0,
       enemies,
@@ -336,10 +443,28 @@ export class BattleWatcher {
     };
   }
 
+  /** 四路并发探一次：谁通都算在线，任一强信号为真就算在战局。 */
+  private async probe(): Promise<BattleProbe> {
+    const [state, mission, mapInfo, objects] = await Promise.all([
+      this.client.state(),
+      this.client.mission(),
+      this.client.mapInfo(),
+      this.client.mapObjects(),
+    ]);
+    const online = state !== null || mission !== null || mapInfo !== null || objects.length > 0;
+    const missionRunning = mission !== null && mission.running;
+    const mapReady = mapInfo !== null && mapInfo.valid;
+    const stateOk = state !== null && state.valid && state.mapValid;
+    // 单独的 objects.length 不能当判据：机库里 map_obj.json 可能还残留上一局的单位。
+    const inBattle = missionRunning || stateOk || (mapReady && objects.length > 0);
+    return { online, inBattle, state, objects };
+  }
   /** 主动刷新一次读数,不产生事件;游戏没开就保持原样。 */
   async refresh(): Promise<BattleSnapshot> {
-    const state = await this.client.state();
-    if (state && state.valid && state.mapValid) await this.refreshSnapshot(state);
+    const probe = await this.probe();
+    this.online = probe.online;
+    this.inBattle = probe.inBattle;
+    if (probe.inBattle) await this.refreshSnapshot(probe.state, probe.objects);
     return this.snapshot;
   }
   /** 预热:只把游标推到当前最新,不产生事件。 */
@@ -352,8 +477,8 @@ export class BattleWatcher {
   /** 拉一次并给出这一轮要推的事件;游戏没开就返回空数组。 */
   async poll(): Promise<BattleEvent[]> {
     const out: BattleEvent[] = [];
-    const state = await this.client.state();
-    if (!state) {
+    const probe = await this.probe();
+    if (!probe.online) {
       if (this.inBattle) {
         out.push({ kind: 'leave', summary: this.summaryOf() });
         this.inBattle = false;
@@ -362,12 +487,13 @@ export class BattleWatcher {
       return out;
     }
     this.online = true;
-    const inBattle = state.valid && state.mapValid;
+    const state = probe.state;
+    const inBattle = probe.inBattle;
 
     if (inBattle && !this.inBattle) {
       this.inBattle = true;
-      this.resetBattle(state.vehicle);
-      await this.refreshSnapshot(state);
+      this.resetBattle((state && state.vehicle) || '');
+      await this.refreshSnapshot(state, probe.objects);
       await this.warmup();
       out.push({ kind: 'enter', snapshot: this.snapshot });
       return out;
@@ -385,7 +511,7 @@ export class BattleWatcher {
     this.lastEvt = maxId(hud.events, this.lastEvt);
     this.lastDmg = maxId(hud.damage, this.lastDmg);
 
-    await this.refreshSnapshot(state);
+    await this.refreshSnapshot(state, probe.objects);
 
     let killPushed = 0;
     for (const hit of hud.damage) {

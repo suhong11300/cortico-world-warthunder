@@ -944,10 +944,11 @@ export class WtWorld implements World {
   private async reportBattle(): Promise<string> {
     const battle = this.ensureBattle();
     if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
-    const state = await battle.client.state();
-    if (!state) return '遥测没连上(' + this.originText() + ')。确认游戏在运行、端口和配置一致。';
-    if (!state.valid || !state.mapValid) return '遥测在线,但当前不在战局(菜单或战局加载中)。';
+    // 交给 watcher 探：它同时看 /mission.json、/map_info.json、/map_obj.json 与 /state。
+    // 只看 /state 会误判——真机对局里 /state 常常只有 { "valid": false }。
     const snapshot = await battle.watcher.refresh();
+    if (!battle.watcher.online_now) return '遥测没连上(' + this.originText() + ')。确认游戏在运行、端口和配置一致。';
+    if (!battle.watcher.inBattleNow) return '遥测在线,但当前不在战局(菜单或战局加载中)。';
     const tally = battle.watcher.tally;
     return [
       '🎮 当前战局',

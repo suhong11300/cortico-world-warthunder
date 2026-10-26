@@ -7,6 +7,8 @@ interface Routes {
   hud?: { events: Array<{ id: number; type?: string; msg?: string }>; damage: Array<{ id: number; type?: string; msg?: string }> };
   map?: unknown[];
   chat?: Array<{ id: number; msg?: string; sender?: string; enemy?: boolean; mode?: string }>;
+  mission?: unknown;
+  mapInfo?: unknown;
   broken?: boolean;
 }
 
@@ -34,6 +36,10 @@ function makeClient(read: () => Routes) {
       body = routes.indicators ?? {};
     } else if (url.includes('/map_obj.json')) {
       body = routes.map ?? [];
+    } else if (url.includes('/mission.json')) {
+      body = routes.mission ?? {};
+    } else if (url.includes('/map_info.json')) {
+      body = routes.mapInfo ?? {};
     }
     return { ok: true, status: 200, text: async () => JSON.stringify(body) };
   }) as unknown as typeof globalThis.fetch;
@@ -242,5 +248,61 @@ describe('对局聊天', () => {
   it('服务挂了或不是数组都返回空数组', async () => {
     expect(await makeClient(() => ({ broken: true })).gamechat(0)).toEqual([]);
     expect(await makeClient(() => ({ chat: [] })).gamechat(0)).toEqual([]);
+  });
+});
+
+/** 下面两条按真机抓到的形状写：对局里 /state 恒为 { "valid": false }，判在局只能靠 /mission.json。 */
+describe('真机形状的在局判定', () => {
+  it('state 只有 valid:false 时,靠 mission 的 running 认出人在局里', async () => {
+    const routes: Routes = {
+      state: { valid: false },
+      indicators: { valid: true, type: 'tankModels/ussr_t_80ue1_sm', speed: 29 },
+      mission: { objectives: [{ primary: true, status: 'in_progress', text: '占领并守住战区' }], status: 'running' },
+      mapInfo: { valid: true },
+      map: [
+        { type: 'airfield', icon: 'none', color: '23,77,255' },
+        { type: 'MediumTank', icon: 'MediumTank', color: '250,12,0' },
+        { type: 'Fighter', icon: 'Fighter', color: '23,77,255' },
+        { type: 'respawn_base_tank', icon: 'respawn_base_tank', color: '250,12,0' },
+        { type: 'Player', icon: 'Player', color: '250,200,30' },
+      ],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000 });
+    const events = await watcher.poll();
+    expect(events.map((event) => event.kind)).toEqual(['enter']);
+    expect(watcher.inBattleNow).toBe(true);
+    expect(watcher.currentSnapshot.vehicle).toBe('ussr_t_80ue1_sm');
+    // 按颜色判：红色敌方 1 个（重生点不算单位），蓝色友方 1 个，黄色是自己
+    expect(watcher.currentSnapshot.enemies).toBe(1);
+    expect(watcher.currentSnapshot.allies).toBe(1);
+  });
+
+  it('机库里 mission 不在跑时,残留的地图单位不能算在战局', async () => {
+    const routes: Routes = {
+      state: { valid: false },
+      mission: { objectives: [], status: 'menu' },
+      mapInfo: { valid: false },
+      map: [{ type: 'ground_model', icon: 'tank_enemy_mbt' }],
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000 });
+    expect(await watcher.poll()).toEqual([]);
+    expect(watcher.inBattleNow).toBe(false);
+  });
+
+  it('中文客户端的引燃也算击毁', async () => {
+    const routes: Routes = {
+      mission: { status: 'running', objectives: [] },
+      mapInfo: { valid: true },
+      indicators: { valid: true, type: 'tankModels/ussr_t_80ue1_sm', speed: 0 },
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000 });
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual(['enter']);
+    // 预热会把游标推到最新，所以这一条要在进局之后再加
+    routes.hud?.damage.push({ id: 1701, msg: 'Qing#11 (M1A1 HC) 的攻击引燃了 ^LeCuk^ haoshuainiu (M1A2T)' });
+    const next = await watcher.poll();
+    expect(next.map((event) => event.kind)).toContain('kill');
+    expect(watcher.tally.kills).toBe(1);
   });
 });
