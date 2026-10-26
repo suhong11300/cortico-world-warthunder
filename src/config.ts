@@ -1,0 +1,104 @@
+import type { ConfigProperty, ConfigGroup } from 'cortico/core/types.ts';
+
+/** `worlds.wt` 配置段。enabled 是框架总闸,World 定义里恒为 false,不写进面板。 */
+export interface WtConfigSection {
+  enabled: boolean;
+  /** 自动播报总开关:关掉后只在被显式调用时才说话。 */
+  autoBrief: boolean;
+  /** 本地遥测服务地址,战争雷霆客户端运行时监听。 */
+  gameHost: string;
+  gamePort: number;
+  /** 轮询间隔(毫秒),实际下限 800。 */
+  pollMs: number;
+  /** 定时讲解间隔(毫秒),0 表示只报事件不报态势。 */
+  commentaryEveryMs: number;
+  /** 知识库更新源:一个返回 {version, entries} 的 JSON 地址,留空则不更新。 */
+  kbUrl: string;
+  kbAutoUpdateHours: number;
+  /** 视觉降级方案:off 关闭,probe 允许截图 + OCR 自检。 */
+  visionMode: 'off' | 'probe';
+  /** 截图区域 "x,y,w,h",留空表示整屏。 */
+  visionRegion: string;
+  /** 文案生成:host 用宿主模型,openai 用自填的兼容接口,off 只用模板。 */
+  llmMode: 'host' | 'openai' | 'off';
+  llmBaseUrl: string;
+  llmModel: string;
+  /** 自填接口的密钥;留空则只有 host 与模板两档可用。 */
+  llmApiKey: string;
+  /** 单次请求的输入上限(字符),超出截断,用来压住花费。 */
+  maxInputChars: number;
+  /** 单次请求的输出上限(token)。 */
+  maxOutputTokens: number;
+  /** 每日预算(元),到顶后只发模板文案。 */
+  dailyBudgetYuan: number;
+  /** 计价:每百万输入 token 的元数。 */
+  priceInPerM: number;
+  /** 计价:每百万输出 token 的元数。 */
+  priceOutPerM: number;
+  language: 'zh' | 'en';
+}
+
+export const WT_DEFAULTS: WtConfigSection = {
+  enabled: false,
+  autoBrief: true,
+  gameHost: '127.0.0.1',
+  gamePort: 8111,
+  pollMs: 1500,
+  commentaryEveryMs: 45000,
+  kbUrl: '',
+  kbAutoUpdateHours: 24,
+  visionMode: 'off',
+  visionRegion: '',
+  llmMode: 'host',
+  llmBaseUrl: 'https://api.deepseek.com',
+  llmModel: 'deepseek-chat',
+  llmApiKey: '',
+  maxInputChars: 1200,
+  maxOutputTokens: 160,
+  dailyBudgetYuan: 1,
+  priceInPerM: 1,
+  priceOutPerM: 2,
+  language: 'zh',
+};
+
+interface Entry {
+  key: string;
+  title: string;
+  description: string;
+  prop: Omit<ConfigProperty, 'title' | 'description'>;
+}
+
+const ENTRIES: Entry[] = [
+  { key: 'worlds.wt.autoBrief', title: '自动播报', description: '战局事件与定时讲解是否自动推送。关掉后只在被显式调用时出声。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.gameHost', title: '遥测地址', description: '战争雷霆客户端的本地遥测服务所在主机。本机运行留 127.0.0.1。', prop: { type: 'string' } },
+  { key: 'worlds.wt.gamePort', title: '遥测端口', description: '默认 8111。改过启动参数或端口被占用时改这里。', prop: { type: 'number' } },
+  { key: 'worlds.wt.pollMs', title: '轮询间隔(ms)', description: '读取战局状态的频率,越小越跟手也越耗 CPU。1000 到 3000 之间最合适。', prop: { type: 'number' } },
+  { key: 'worlds.wt.commentaryEveryMs', title: '讲解间隔(ms)', description: '战局中定时讲一句态势的间隔;0 表示只在击毁、阵亡、结算时开口。', prop: { type: 'number' } },
+  { key: 'worlds.wt.kbUrl', title: '知识库源', description: '一个返回 {version, entries} 的 JSON 地址;留空则只用内置词条。', prop: { type: 'string' } },
+  { key: 'worlds.wt.kbAutoUpdateHours', title: '自动更新(小时)', description: '开机后每隔多少小时检查一次知识库源;0 表示只在手动调用时更新。', prop: { type: 'number' } },
+  { key: 'worlds.wt.visionMode', title: '视觉降级', description: 'off 关闭;probe 允许截图与 OCR 自检,用于官方遥测不可用时。', prop: { type: 'string', enum: ['off', 'probe'] } },
+  { key: 'worlds.wt.visionRegion', title: '截图区域', description: '形如 "x,y,w,h";留空表示整屏。缩到记分板或击杀提示能显著提速。', prop: { type: 'string' } },
+  { key: 'worlds.wt.llmMode', title: '文案模型', description: 'host 用宿主当前模型;openai 用下面的兼容接口;off 只用模板文案。', prop: { type: 'string', enum: ['host', 'openai', 'off'] } },
+  { key: 'worlds.wt.llmBaseUrl', title: '接口地址', description: 'OpenAI 兼容的 /v1 前缀地址,例如 https://api.deepseek.com。', prop: { type: 'string' } },
+  { key: 'worlds.wt.llmModel', title: '模型名', description: '接口里填的 model 字段。', prop: { type: 'string' } },
+  { key: 'worlds.wt.llmApiKey', title: '接口密钥', description: '仅 llmMode=openai 时使用;会明文存在 config.json,别填主账号密钥。', prop: { type: 'string' } },
+  { key: 'worlds.wt.maxInputChars', title: '输入上限(字符)', description: '拼给模型的素材超过这个长度就截断,用来压输入花费。', prop: { type: 'number' } },
+  { key: 'worlds.wt.maxOutputTokens', title: '输出上限(token)', description: '单次生成的最大 token 数,直接决定单条播报的上限花费。', prop: { type: 'number' } },
+  { key: 'worlds.wt.dailyBudgetYuan', title: '每日预算(元)', description: '到顶后自动退回模板文案,不再调用模型。', prop: { type: 'number' } },
+  { key: 'worlds.wt.priceInPerM', title: '输入价(元/M)', description: '按每百万输入 token 计价,用于本地记账。', prop: { type: 'number' } },
+  { key: 'worlds.wt.priceOutPerM', title: '输出价(元/M)', description: '按每百万输出 token 计价,用于本地记账。', prop: { type: 'number' } },
+  { key: 'worlds.wt.language', title: '播报语言', description: '播报文案与模型提示使用的语言。', prop: { type: 'string', enum: ['zh', 'en'] } },
+];
+
+/** World 配置的 JSON Schema 声明;每个键都要在 defaults 里存在。 */
+export const WT_CONFIG_GROUP: ConfigGroup = {
+  id: 'world:wt',
+  owner: 'world:wt',
+  schema: {
+    type: 'object',
+    title: '战争雷霆百科',
+    properties: Object.fromEntries(
+      ENTRIES.map((e) => [e.key, { ...e.prop, title: e.title, description: e.description, 'x-hot': true }]),
+    ),
+  },
+};

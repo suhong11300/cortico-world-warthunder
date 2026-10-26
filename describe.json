@@ -1,0 +1,262 @@
+{
+  "tools": [
+    {
+      "name": "wt_status",
+      "description": "战争雷霆百科自检:遥测是否连上、是否在战局、知识库版本与条数、文案模型来源、今日花费、视觉通道状态。不确定为什么没播报时先调它。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "自检遥测连接、战局状态、知识库版本与今日花费。",
+        "en": "Self-check: telemetry link, battle state, knowledge base version and today spend."
+      }
+    },
+    {
+      "name": "wt_search",
+      "description": "在本地战争雷霆知识库里检索概念、载具与玩法。回答\"什么是 BR\"\"P-51 怎么打\"\"历史模式规则\"这类问题前先用它取证,别凭记忆编。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "description": "关键词,中文或英文都行。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 5
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "在本地知识库里检索战争雷霆的概念、载具与玩法。",
+        "en": "Search the local knowledge base for concepts, vehicles and gameplay."
+      }
+    },
+    {
+      "name": "wt_vehicle",
+      "description": "按名称或别名查一台载具的完整词条:国家线、类别、战斗评级与打法要点。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60,
+            "description": "载具名或别名,如 野马 / T-34-85 / Tiger II。"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "按名称或别名取一台载具的完整词条。",
+        "en": "Fetch one vehicle entry by name or alias."
+      }
+    },
+    {
+      "name": "wt_kb_status",
+      "description": "看知识库当前版本、条数分布、远程更新来源与上次更新时间。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "看知识库版本、条数分布与更新来源。",
+        "en": "Show knowledge base version, counts and update source."
+      }
+    },
+    {
+      "name": "wt_kb_update",
+      "description": "从 worlds.wt.kbUrl 拉一次知识库更新;没配来源时会直说。更新成功后立即生效,不用重启。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "忽略小时级的节流,强制拉一次。"
+          }
+        }
+      },
+      "tags": [
+        "write"
+      ],
+      "summary": {
+        "zh": "从配置的地址拉一次知识库更新。",
+        "en": "Pull one knowledge base update from the configured URL."
+      }
+    },
+    {
+      "name": "wt_battle_state",
+      "description": "主动读一次当前战局:是否在战局、载具、速度高度、附近敌我数量与本局战绩。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "tags": [
+        "read",
+        "snapshot"
+      ],
+      "summary": {
+        "zh": "主动读一次当前战局的载具、读数与战绩。",
+        "en": "Read the current battle: vehicle, readings and tally."
+      }
+    },
+    {
+      "name": "wt_commentary",
+      "description": "手生成一条战况播报并推到对话里。mode=sitrep 讲态势,cheer 是高光喝彩,urge 是逆风打气。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "sitrep",
+              "cheer",
+              "urge"
+            ],
+            "default": "sitrep"
+          }
+        }
+      },
+      "tags": [
+        "speak"
+      ],
+      "summary": {
+        "zh": "生成一条战况播报推到对话:态势、喝彩或打气。",
+        "en": "Compose one battle commentary line: sitrep, cheer or urge."
+      }
+    },
+    {
+      "name": "wt_vision_probe",
+      "description": "视觉降级通道自检:截一张当前屏幕、用系统 OCR 读文字并挑出战况线索。官方遥测连不上时才用它。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "region": {
+            "type": "string",
+            "maxLength": 40,
+            "description": "可选,形如 \"x,y,w,h\";留空按配置或整屏。"
+          }
+        }
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "视觉降级通道自检:截屏后做系统 OCR 并挑出战况线索。",
+        "en": "Fallback vision probe: screenshot, system OCR, extract battle hints."
+      }
+    },
+    {
+      "name": "wt_budget",
+      "description": "看今天的文案模型用量与花费;reset=true 时把当天账本清零。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reset": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "tags": [
+        "read",
+        "write"
+      ],
+      "summary": {
+        "zh": "看今天的文案模型用量与花费,可清零。",
+        "en": "Show or reset today usage and spend of the commentary model."
+      }
+    }
+  ],
+  "events": [
+    {
+      "type": "wt.ready",
+      "description": {
+        "zh": "World 挂载完成,附遥测与知识库状态。",
+        "en": "The World was mounted, with telemetry and knowledge base status."
+      }
+    },
+    {
+      "type": "wt.battle_started",
+      "description": {
+        "zh": "进入战局。",
+        "en": "A battle started."
+      }
+    },
+    {
+      "type": "wt.kill",
+      "description": {
+        "zh": "本局击毁目标,带当前连击数。",
+        "en": "A kill happened, with the current streak."
+      }
+    },
+    {
+      "type": "wt.death",
+      "description": {
+        "zh": "本局载具被击毁。",
+        "en": "The vehicle was destroyed."
+      }
+    },
+    {
+      "type": "wt.behind",
+      "description": {
+        "zh": "局势逆风,需要打气。",
+        "en": "The battle is going badly; encouragement is due."
+      }
+    },
+    {
+      "type": "wt.commentary",
+      "description": {
+        "zh": "定时或手动的战况解说。",
+        "en": "A periodic or manual battle commentary."
+      }
+    },
+    {
+      "type": "wt.result",
+      "description": {
+        "zh": "离开战局,带本局战绩与时长。",
+        "en": "The battle ended, with tally and duration."
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "key": "worlds.wt.envPrompt",
+      "title": "战争雷霆百科环境段",
+      "role": "envPrompt",
+      "content": "战争雷霆百科是这只桌宠的知识库与战局解说台。现在是 {{wt.now}}({{wt.zone}}),遥测状态 {{wt.status}},战局 {{wt.battle}},当前载具 {{wt.vehicle}},知识库 {{wt.kb}},文案通道 {{wt.source}},今天已花 {{wt.budget}}。\n\n回答战争雷霆的问题前,先用 wt_search 或 wt_vehicle 在本地知识库里取证,词条里没有就直说没有,不要凭印象编造战斗评级、载具参数或版本改动。\n\n战局事件(wt.battle_started / wt.kill / wt.death / wt.behind / wt.commentary / wt.result)里的数字都是刚从本地遥测读到的真实读数:改写口吻可以,数字、载具名与战绩一个字都不要改;遥测离线或没配 kbUrl 时如实说明降级了什么,不要假装还在读战局。文案模型的花费上限由 {{wt.budget}} 约束,接近预算就少说两句。\n"
+    }
+  ]
+}

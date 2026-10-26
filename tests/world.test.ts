@@ -1,0 +1,296 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ToolCallContext } from 'cortico/core/types.ts';
+import { nullLogger } from 'cortico/core/util.ts';
+import { dryMountWorld } from 'cortico/extensions/dry-mount.ts';
+import { WT_DEFAULTS, type WtConfigSection } from '../src/config.ts';
+import { WT } from '../src/definition.ts';
+import { WtWorld } from '../src/world.ts';
+import { FakeHost } from './helpers/fake-host.ts';
+
+interface Routes {
+  state?: unknown;
+  indicators?: unknown;
+  hud?: { events: Array<{ id: number; msg?: string }>; damage: Array<{ id: number; msg?: string }> };
+  map?: unknown[];
+  broken?: boolean;
+}
+
+/** 8111 的假服务:按 lastEvt / lastDmg 真过滤,和真接口语义一致。 */
+function fakeFetch(read: () => Routes): typeof globalThis.fetch {
+  return (async (input: unknown) => {
+    const url = String(input);
+    const routes = read();
+    if (routes.broken) return { ok: false, status: 500, text: async () => 'boom' };
+    let body: unknown = {};
+    if (url.includes('/hudmsg')) {
+      const evt = Number((url.match(/lastEvt=(-?\d+)/) ?? [])[1] ?? -1);
+      const dmg = Number((url.match(/lastDmg=(-?\d+)/) ?? [])[1] ?? -1);
+      const hud = routes.hud ?? { events: [], damage: [] };
+      body = { events: hud.events.filter((item) => item.id > evt), damage: hud.damage.filter((item) => item.id > dmg) };
+    } else if (url.includes('/state')) {
+      body = routes.state ?? {};
+    } else if (url.includes('/indicators')) {
+      body = routes.indicators ?? {};
+    } else if (url.includes('/map_obj.json')) {
+      body = routes.map ?? [];
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  }) as unknown as typeof globalThis.fetch;
+}
+
+const inBattle = { valid: true, map_valid: true, vehicle_type: 'P-51D-30', game_mode: 'domination', army: 'usa' };
+const inMenu = { valid: true, map_valid: false, vehicle_type: '', game_mode: '', army: '' };
+const flying = { valid: true, speed: 480, altitude: 2100, type: 'P-51D-30' };
+
+let scratchDir: string;
+const dirs: string[] = [];
+beforeEach(() => {
+  scratchDir = mkdtempSync(join(tmpdir(), 'wt-scratch-'));
+});
+afterEach(() => {
+  rmSync(scratchDir, { recursive: true, force: true });
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+interface Rig {
+  world: WtWorld;
+  host: FakeHost & { cognition?: { request: (req: { brief: string }) => Promise<{ text: string } | { error: string }> } };
+  cfg: WtConfigSection;
+}
+
+function rig(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({})): Rig {
+  const dataDir = mkdtempSync(join(tmpdir(), 'wt-data-'));
+  dirs.push(dataDir);
+  const cfg: WtConfigSection = { ...WT_DEFAULTS, ...patch };
+  const world = new WtWorld({ cfg, timezone: 'Asia/Shanghai', dataDir, now: () => 100_000, fetchImpl: fakeFetch(read) });
+  const host = new FakeHost() as Rig['host'];
+  return { world, host, cfg };
+}
+
+async function boot(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({})): Promise<Rig> {
+  const rigged = rig(patch, read);
+  await rigged.world.start(rigged.host);
+  return rigged;
+}
+
+async function pollOnce(world: WtWorld): Promise<void> {
+  await (world as unknown as { pollOnce(): Promise<void> }).pollOnce();
+}
+
+async function call(world: WtWorld, name: string, args: Record<string, unknown> = {}): Promise<string> {
+  const tool = world.tools().find((item) => item.name === name);
+  if (!tool) throw new Error('缺工具:' + name);
+  return String(await tool.handler(args, { role: 'test', log: nullLogger() } as unknown as ToolCallContext));
+}
+
+describe('装配契约', () => {
+  it('干装载没有失败项,也没有 enabled 约定警告', async () => {
+    const report = await dryMountWorld(WT, { scratchDir });
+    expect(report.failures).toEqual([]);
+    expect(report.warnings.filter((line) => line.includes('enabled is not false'))).toEqual([]);
+  });
+
+  it('id 与九个工具名都对得上', async () => {
+    const { world } = rig();
+    expect(world.id).toBe('wt');
+    expect(world.tools().map((tool) => tool.name)).toEqual([
+      'wt_status',
+      'wt_search',
+      'wt_vehicle',
+      'wt_kb_status',
+      'wt_kb_update',
+      'wt_battle_state',
+      'wt_commentary',
+      'wt_vision_probe',
+      'wt_budget',
+    ]);
+  });
+
+  it('默认值是禁用总闸、但自动播报开着,端口走 8111', () => {
+    expect(WT_DEFAULTS.enabled).toBe(false);
+    expect(WT_DEFAULTS.autoBrief).toBe(true);
+    expect(WT_DEFAULTS.gamePort).toBe(8111);
+    expect(WT_DEFAULTS.gameHost).toBe('127.0.0.1');
+  });
+
+  it('环境段给出八个占位符', async () => {
+    const { world } = await boot();
+    const vars = world.envPromptVars() ?? {};
+    expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.kb', 'wt.now', 'wt.source', 'wt.status', 'wt.vehicle', 'wt.zone']);
+    expect(vars['wt.status']).toBe('遥测离线');
+    expect(vars['wt.kb']).toContain('53 条');
+    await world.stop();
+  });
+
+  it('WebUI 挂上自己的配置组与提示词文档', async () => {
+    const { world } = await boot();
+    const ui = world.webUi();
+    expect(ui.label).toBe('战争雷霆百科');
+    expect(ui.config?.[0].owner).toBe('world:wt');
+    expect(ui.config?.[0].id).toBe('world:wt');
+    expect(ui.promptDocs?.[0].key).toBe('worlds.wt.envPrompt');
+    expect(ui.promptDocs?.[0].role).toBe('envPrompt');
+    await world.stop();
+  });
+});
+
+describe('挂载与播报', () => {
+  it('挂载即投一条就绪事件', async () => {
+    const { world, host } = await boot();
+    expect(host.events.length).toBe(1);
+    expect(host.events[0].type).toBe('wt.ready');
+    expect(host.events[0].origin).toBe('internal');
+    expect(host.pushOpts[0]).toEqual({ trigger: 'flush' });
+    await world.stop();
+  });
+
+  it('进战局推 battle_started 并带上载具', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying };
+    const { world, host } = await boot({}, () => routes);
+    await pollOnce(world);
+    expect(host.events.map((event) => event.type)).toEqual(['wt.ready', 'wt.battle_started']);
+    expect((host.events[1] as { meta?: Record<string, unknown> }).meta?.vehicle).toBe('P-51D-30');
+    await world.stop();
+  });
+
+  it('击毁推 kill,阵亡推 death', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
+    const { world, host } = await boot({}, () => routes);
+    await pollOnce(world);
+
+    routes.hud = { events: [], damage: [{ id: 3, msg: 'destroyed T-34' }] };
+    await pollOnce(world);
+    expect(host.events.at(-1)?.type).toBe('wt.kill');
+
+    routes.indicators = { valid: false, speed: 0, altitude: 0, type: 'P-51D-30' };
+    await pollOnce(world);
+    expect(host.events.at(-1)?.type).toBe('wt.death');
+    await world.stop();
+  });
+
+  it('关掉自动播报后只留就绪事件', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying };
+    const { world, host } = await boot({ autoBrief: false }, () => routes);
+    await pollOnce(world);
+    expect(host.events.map((event) => event.type)).toEqual(['wt.ready']);
+    await world.stop();
+  });
+
+  it('宿主有人格通道时播报文案走它,数字仍在素材里', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying };
+    const { world, host } = await boot({}, () => routes);
+    let brief = '';
+    host.cognition = {
+      request: async (req) => {
+        brief = req.brief;
+        return { text: '稳住，狗斗别丢能量。' };
+      },
+    };
+    await pollOnce(world);
+    expect(host.events.at(-1)?.text).toBe('稳住，狗斗别丢能量。');
+    expect(brief).toContain('数字一个都不要改');
+    await world.stop();
+  });
+
+  it('人格通道报错时退回模板文案,照样播', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying };
+    const { world, host } = await boot({}, () => routes);
+    host.cognition = { request: async () => ({ error: '人格没启用' }) };
+    await pollOnce(world);
+    const text = host.events.at(-1)?.text ?? '';
+    expect(text.length).toBeGreaterThan(0);
+    expect(text).not.toBe('人格没启用');
+    expect(host.events.at(-1)?.type).toBe('wt.battle_started');
+    await world.stop();
+  });
+});
+
+describe('工具', () => {
+  it('wt_status 报出遥测、知识库与额度', async () => {
+    const { world } = await boot();
+    const text = await call(world, 'wt_status');
+    expect(text).toContain('战争雷霆百科');
+    expect(text).toContain('8111');
+    expect(text).toContain('知识库:v1.0.0');
+    expect(text).toContain('预算');
+    await world.stop();
+  });
+
+  it('wt_status 在遥测断开后直说没连上', async () => {
+    const { world } = await boot({}, () => ({ broken: true }));
+    await pollOnce(world);
+    const text = await call(world, 'wt_status');
+    expect(text).toContain('没连上');
+    expect(text).toContain('不在战局');
+    await world.stop();
+  });
+
+  it('wt_search 能检索到野马,也能回答没找到', async () => {
+    const { world } = await boot();
+    const hit = await call(world, 'wt_search', { query: '野马' });
+    expect(hit).toContain('P-51D-30 野马');
+    const miss = await call(world, 'wt_search', { query: '不存在的奇怪东西' });
+    expect(miss).toContain('没找到');
+    const empty = await call(world, 'wt_search', {});
+    expect(empty).toContain('没给出关键词');
+    await world.stop();
+  });
+
+  it('wt_vehicle 给完整词条,未知载具给提示', async () => {
+    const { world } = await boot();
+    const entry = await call(world, 'wt_vehicle', { name: '野马' });
+    expect(entry).toContain('[载具] P-51D-30 野马');
+    expect(entry).toContain('RB 5.0');
+    const unknown = await call(world, 'wt_vehicle', { name: '不存在的载具' });
+    expect(unknown).toContain('知识库里没有');
+    await world.stop();
+  });
+
+  it('wt_kb_status 与 wt_kb_update 说明来源状态', async () => {
+    const { world } = await boot();
+    const status = await call(world, 'wt_kb_status');
+    expect(status).toContain('v1.0.0');
+    expect(status).toContain('仅内置');
+    const update = await call(world, 'wt_kb_update');
+    expect(update).toContain('知识库源没配');
+    await world.stop();
+  });
+
+  it('wt_budget 记账并支持清零', async () => {
+    const { world } = await boot();
+    const before = await call(world, 'wt_budget');
+    expect(before).toContain('预算 1 元');
+    const reset = await call(world, 'wt_budget', { reset: true });
+    expect(reset).toContain('清零');
+    await world.stop();
+  });
+
+  it('wt_vision_probe 在关闭时说清怎么开', async () => {
+    const { world } = await boot();
+    const text = await call(world, 'wt_vision_probe');
+    expect(text).toContain('视觉通道是关的');
+    await world.stop();
+  });
+
+  it('wt_battle_state 离线与在菜单两种回执都直说', async () => {
+    const offline = await boot({}, () => ({ broken: true }));
+    expect(await call(offline.world, 'wt_battle_state')).toContain('遥测没连上');
+    await offline.world.stop();
+
+    const menu = await boot({}, () => ({ state: inMenu, indicators: { valid: false } }));
+    expect(await call(menu.world, 'wt_battle_state')).toContain('当前不在战局');
+    await menu.world.stop();
+  });
+
+  it('wt_commentary 手动解说会推一条事件', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying };
+    const { world, host } = await boot({}, () => routes);
+    const text = await call(world, 'wt_commentary', { mode: 'cheer' });
+    expect(text).toContain('已推送到对话');
+    expect(host.events.at(-1)?.type).toBe('wt.commentary');
+    await world.stop();
+  });
+});
