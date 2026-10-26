@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ToolCallContext } from 'cortico/core/types.ts';
@@ -15,6 +16,7 @@ interface Routes {
   indicators?: unknown;
   hud?: { events: Array<{ id: number; msg?: string }>; damage: Array<{ id: number; msg?: string }> };
   map?: unknown[];
+  chat?: Array<{ id: number; msg?: string; sender?: string; enemy?: boolean; mode?: string }>;
   broken?: boolean;
 }
 
@@ -31,6 +33,9 @@ function fakeFetch(read: () => Routes, capture?: string[]): typeof globalThis.fe
       const dmg = Number((url.match(/lastDmg=(-?\d+)/) ?? [])[1] ?? -1);
       const hud = routes.hud ?? { events: [], damage: [] };
       body = { events: hud.events.filter((item) => item.id > evt), damage: hud.damage.filter((item) => item.id > dmg) };
+    } else if (url.includes('/gamechat')) {
+      const cursor = Number((url.match(/lastId=(-?\d+)/) ?? [])[1] ?? 0);
+      body = (routes.chat ?? []).filter((item) => item.id > cursor);
     } else if (url.includes('/state')) {
       body = routes.state ?? {};
     } else if (url.includes('/indicators')) {
@@ -62,17 +67,34 @@ interface Rig {
   cfg: WtConfigSection;
 }
 
-function rig(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({}), capture?: string[]): Rig {
+function rig(
+  patch: Partial<WtConfigSection> = {},
+  read: () => Routes = () => ({}),
+  capture?: string[],
+  spawnImpl?: typeof import('node:child_process').spawn,
+): Rig {
   const dataDir = mkdtempSync(join(tmpdir(), 'wt-data-'));
   dirs.push(dataDir);
   const cfg: WtConfigSection = { ...WT_DEFAULTS, ...patch };
-  const world = new WtWorld({ cfg, timezone: 'Asia/Shanghai', dataDir, now: () => 100_000, fetchImpl: fakeFetch(read, capture) });
+  const world = new WtWorld({
+    cfg,
+    timezone: 'Asia/Shanghai',
+    dataDir,
+    now: () => 100_000,
+    fetchImpl: fakeFetch(read, capture),
+    ...(spawnImpl ? { spawnImpl } : {}),
+  });
   const host = new FakeHost() as Rig['host'];
   return { world, host, cfg };
 }
 
-async function boot(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({}), capture?: string[]): Promise<Rig> {
-  const rigged = rig(patch, read, capture);
+async function boot(
+  patch: Partial<WtConfigSection> = {},
+  read: () => Routes = () => ({}),
+  capture?: string[],
+  spawnImpl?: typeof import('node:child_process').spawn,
+): Promise<Rig> {
+  const rigged = rig(patch, read, capture, spawnImpl);
   await rigged.world.start(rigged.host);
   return rigged;
 }
@@ -94,7 +116,7 @@ describe('装配契约', () => {
     expect(report.warnings.filter((line) => line.includes('enabled is not false'))).toEqual([]);
   });
 
-  it('id 与九个工具名都对得上', async () => {
+  it('id 与十一个工具名都对得上', async () => {
     const { world } = rig();
     expect(world.id).toBe('wt');
     expect(world.tools().map((tool) => tool.name)).toEqual([
@@ -105,6 +127,8 @@ describe('装配契约', () => {
       'wt_kb_update',
       'wt_battle_state',
       'wt_commentary',
+      'wt_chat',
+      'wt_say',
       'wt_vision_probe',
       'wt_budget',
     ]);
@@ -117,10 +141,10 @@ describe('装配契约', () => {
     expect(WT_DEFAULTS.gameHost).toBe('127.0.0.1');
   });
 
-  it('环境段给出八个占位符', async () => {
+  it('环境段给出九个占位符', async () => {
     const { world } = await boot();
     const vars = world.envPromptVars() ?? {};
-    expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.kb', 'wt.now', 'wt.source', 'wt.status', 'wt.vehicle', 'wt.zone']);
+    expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.chat', 'wt.kb', 'wt.now', 'wt.source', 'wt.status', 'wt.vehicle', 'wt.zone']);
     expect(vars['wt.status']).toBe('遥测离线');
     expect(vars['wt.kb']).toContain('53 条');
     await world.stop();
@@ -129,7 +153,7 @@ describe('装配契约', () => {
   it('WebUI 挂上自己的配置组与提示词文档', async () => {
     const { world } = await boot();
     const ui = world.webUi();
-    expect(ui.label).toBe('战争雷霆百科');
+    expect(ui.label).toBe('war thunder安东星助手');
     expect(ui.config?.[0].owner).toBe('world:wt');
     expect(ui.config?.[0].id).toBe('world:wt');
     expect(ui.promptDocs?.[0].key).toBe('worlds.wt.envPrompt');
@@ -350,5 +374,159 @@ describe('滥用面的闸', () => {
     expect(second).not.toContain('第一句用模型说的');
     expect(used).toBe(1);
     expect(await call(world, 'wt_status')).toContain('本分钟模型调用已达上限 1 次');
+  });
+});
+
+describe('对局聊天工具', () => {
+  const chatRoutes = (): Routes => ({
+    state: inMenu,
+    chat: [
+      { id: 70, msg: 'nice shot', sender: 'pecusgaming', enemy: false, mode: 'All' },
+      { id: 71, msg: 'slightly op tbh', sender: 'shino_rs', enemy: true, mode: 'All' },
+    ],
+  });
+
+  it('translate 先给原文再给译文,并把聊天原文交给模型', async () => {
+    const briefs: string[] = [];
+    const { world, host } = await boot({}, chatRoutes);
+    host.cognition = {
+      request: async (req: { brief: string }) => {
+        briefs.push(req.brief);
+        return { text: '打得好 / 这玩意儿有点强' };
+      },
+    };
+    const out = await call(world, 'wt_chat');
+    expect(out).toContain('💬 对局对话（2 条）');
+    expect(out).toContain('pecusgaming');
+    expect(out).toContain('对面');
+    expect(out).toContain('打得好 / 这玩意儿有点强');
+    expect(briefs.length).toBe(1);
+    expect(briefs[0]).toContain('nice shot');
+    expect(briefs[0]).toContain('翻译成简体中文');
+    await world.stop();
+  });
+
+  it('recent 只给原文,不花模型额度', async () => {
+    const briefs: string[] = [];
+    const { world, host } = await boot({}, chatRoutes);
+    host.cognition = {
+      request: async (req: { brief: string }) => {
+        briefs.push(req.brief);
+        return { text: '不该被用到' };
+      },
+    };
+    const out = await call(world, 'wt_chat', { action: 'recent' });
+    expect(out).toContain('nice shot');
+    expect(out).not.toContain('不该被用到');
+    expect(briefs.length).toBe(0);
+    await world.stop();
+  });
+
+  it('compose 给出一行可粘贴文本,并说明不代发', async () => {
+    const briefs: string[] = [];
+    const { world, host } = await boot({}, () => ({ state: inMenu }));
+    host.cognition = {
+      request: async (req: { brief: string }) => {
+        briefs.push(req.brief);
+        return { text: '"nice shot, well played"' };
+      },
+    };
+    const out = await call(world, 'wt_chat', { action: 'compose', draft: '打得好，干得漂亮' });
+    expect(out).toContain('✍️ 代稿（英文）');
+    expect(out).toContain('nice shot, well played');
+    expect(out).not.toContain('"nice shot');
+    expect(out).toContain('不代发');
+    expect(briefs[0]).toContain('打得好，干得漂亮');
+    await world.stop();
+  });
+
+  it('compose 没给原文时提示用法', async () => {
+    const { world } = await boot({}, () => ({ state: inMenu }));
+    const out = await call(world, 'wt_chat', { action: 'compose' });
+    expect(out).toContain('wt_chat action=compose draft=');
+    await world.stop();
+  });
+
+  it('模型关掉时代稿退到内置短语表并说明', async () => {
+    const { world } = await boot({ llmMode: 'off' }, () => ({ state: inMenu }));
+    const out = await call(world, 'wt_chat', { action: 'compose', draft: '打得好' });
+    expect(out).toContain('nice shot');
+    expect(out).toContain('内置短语表');
+    await world.stop();
+  });
+
+  it('遥测没连上时直接说明', async () => {
+    const { world } = await boot({}, () => ({ broken: true }));
+    const out = await call(world, 'wt_chat');
+    expect(out).toContain('遥测没连上');
+    await world.stop();
+  });
+});
+
+describe('发言落地', () => {
+  function fakeSpawn(plan: { out?: string; err?: string; code?: number }) {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const impl = ((cmd: string, args: string[]) => {
+      const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; kill: () => void };
+      const stdout = new EventEmitter();
+      const stderr = new EventEmitter();
+      child.stdout = stdout;
+      child.stderr = stderr;
+      child.kill = () => undefined;
+      calls.push({ cmd, args });
+      setImmediate(() => {
+        if (plan.out) stdout.emit('data', plan.out);
+        if (plan.err) stderr.emit('data', plan.err);
+        child.emit('close', plan.code ?? 0);
+      });
+      return child;
+    }) as unknown as typeof import('node:child_process').spawn;
+    return { impl, calls };
+  }
+
+  it('默认档是剪贴板,不碰游戏输入', () => {
+    expect(WT_DEFAULTS.chatSendMode).toBe('clipboard');
+  });
+
+  it('clipboard 档把文本塞进剪贴板并说明怎么发', async () => {
+    const fake = fakeSpawn({ out: 'CLIP_OK' });
+    const { world } = await boot({}, () => ({ state: inMenu }), undefined, fake.impl);
+    const out = await call(world, 'wt_say', { text: 'nice shot!' });
+    expect(out).toContain('已复制到剪贴板');
+    expect(out).toContain('Ctrl+V');
+    expect(out).toContain('nice shot!');
+    expect(fake.calls.length).toBe(1);
+    await world.stop();
+  });
+
+  it('off 档只解释,不发命令', async () => {
+    const fake = fakeSpawn({ out: 'CLIP_OK' });
+    const { world } = await boot({ chatSendMode: 'off' }, () => ({ state: inMenu }), undefined, fake.impl);
+    const out = await call(world, 'wt_say', { text: 'gg' });
+    expect(out).toContain('关着的');
+    expect(fake.calls.length).toBe(0);
+    await world.stop();
+  });
+
+  it('confirm 档先预演,确认后直写发言栏', async () => {
+    const fake = fakeSpawn({ out: 'WINDOW 9 aces.exe\nSENT 8' });
+    const { world } = await boot({ chatSendMode: 'confirm' }, () => ({ state: inMenu }), undefined, fake.impl);
+    const preview = await call(world, 'wt_say', { text: 'push now!' });
+    expect(preview).toContain('预演');
+    expect(fake.calls.length).toBe(0);
+    const sent = await call(world, 'wt_say', { text: 'push now!', confirm: true });
+    expect(sent).toContain('已写进发言栏');
+    expect(sent).toContain('8 字符');
+    expect(fake.calls.length).toBe(1);
+    await world.stop();
+  });
+
+  it('没给内容时提示用法', async () => {
+    const fake = fakeSpawn({ out: 'CLIP_OK' });
+    const { world } = await boot({}, () => ({ state: inMenu }), undefined, fake.impl);
+    const out = await call(world, 'wt_say', {});
+    expect(out).toContain('wt_say text=');
+    expect(fake.calls.length).toBe(0);
+    await world.stop();
   });
 });

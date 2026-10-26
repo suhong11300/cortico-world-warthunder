@@ -2,10 +2,17 @@ import { fileURLToPath } from 'node:url';
 import type { ToolDef, TriggerMode, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import { WT_CONFIG_GROUP, type WtConfigSection } from './config.ts';
-import { BattleClient, BattleWatcher, type BattleEvent, type BattleSnapshot } from './battle.ts';
+import { BattleClient, BattleWatcher, type BattleEvent, type BattleSnapshot, type ChatLine } from './battle.ts';
 import {
   battleLine,
   behindText,
+  chatBlock,
+  chatDegraded,
+  chatDraftFallback,
+  chatDraftHint,
+  chatDraftInstruction,
+  chatInstruction,
+  chatTargetLabel,
   clip,
   commentaryText,
   deathText,
@@ -20,6 +27,7 @@ import {
 import { fetchRemoteKb, findVehicle, kbCounts, kbPath, loadKb, readKbFile, searchKb, writeKbFile, type KbView } from './kb.ts';
 import { compose, describeError, readSpend, writeSpend } from './llm.ts';
 import { extractVisionHints, probeVision } from './vision.ts';
+import { cleanOutgoing, copyToClipboard, sendToGame } from './sendkey.ts';
 import { assertFetchableUrl, assertLocalHost, parseRegion, redactSecret, scrubUrl } from './guard.ts';
 
 /** 提示词模板文件;describe 与 WebUI 都指向它。 */
@@ -30,6 +38,12 @@ const MAX_POLL_MS = 30000;
 const MAX_SEARCH = 8;
 const MAX_NAME = 60;
 const MAX_VISION_HINTS = 6;
+/** 内存里最多留多少条对局聊天;再多的用 wt_chat lines 参数往前要也没用,直接读最新。 */
+const CHAT_BUFFER = 60;
+/** 代稿的原文上限;再长就不像对局里能说的话了。 */
+const MAX_DRAFT = 300;
+/** 游戏发言栏能塞下的长度;超过这条就不是对局里能说的话了。 */
+const MAX_OUTGOING = 200;
 /** 每天最多手动清零几次账本;清零是绕过预算的唯一手段,得留痕并限量。 */
 const MAX_RESETS_PER_DAY = 3;
 /** 模型调用的滑动窗口与配额都在这里定,配置只能在这个范围内调。 */
@@ -45,6 +59,8 @@ export interface WtWorldOptions {
   now?: () => number;
   /** 测试注入用;缺省走全局 fetch,这样 8111 可以被假数据替换。 */
   fetchImpl?: typeof globalThis.fetch;
+  /** 测试注入用;缺省起真的 powershell.exe。 */
+  spawnImpl?: typeof import('node:child_process').spawn;
 }
 
 /** 九个工具的声明;definition.ts 用它生成 describe.json,handler 在这里按需挂。 */
@@ -52,7 +68,7 @@ export const WT_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'wt_status',
     description:
-      '战争雷霆百科自检:遥测是否连上、是否在战局、知识库版本与条数、文案模型来源、今日花费、视觉通道状态。不确定为什么没播报时先调它。',
+      'war thunder安东星助手自检:遥测是否连上、是否在战局、知识库版本与条数、文案模型来源、今日花费、视觉通道状态。不确定为什么没播报时先调它。',
     tags: ['read'],
     parameters: { type: 'object', additionalProperties: false, properties: {} },
   },
@@ -121,6 +137,37 @@ export const WT_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     },
   },
   {
+    name: 'wt_chat',
+    description:
+      '《战争雷霆》对局聊天的读取、翻译与代稿。用户说"对面在说什么""翻译一下聊天"时用 action=translate(先给原文再给译文);只想要原文用 action=recent(不花额度);想让桌宠把你要说的话翻成英文好粘贴到聊天框用 action=compose 并给 draft。只读遥测与输出文本,不代发、不操控游戏。',
+    tags: ['read'],
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['translate', 'recent', 'compose'], default: 'translate', description: 'translate 出原文加译文;recent 只出原文;compose 把 draft 翻成目标语言给一行可粘贴文本。' },
+        lines: { type: 'integer', minimum: 1, maximum: 40, description: '这次看最近多少条,缺省用 worlds.wt.chatLines。' },
+        target: { type: 'string', enum: ['zh', 'en', 'ja', 'ru'], description: '翻成什么语言,缺省用 worlds.wt.chatTarget;compose 时缺省英文。' },
+        draft: { type: 'string', maxLength: 300, description: 'compose 用:你想发到对局聊天里的那句话。' },
+      },
+    },
+  },
+  {
+    name: 'wt_say',
+    description:
+      '把一句话落到《战争雷霆》对局发言栏。默认复制到剪贴板,用户 Ctrl+V 再回车就发出去(最稳,不碰游戏);配成 confirm/auto 时改用键盘直写发言栏(不经过剪贴板、不发鼠标事件)。用户说"帮我把这句发出去""翻译完直接发"时用它。',
+    tags: ['act'],
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        text: { type: 'string', minLength: 1, maxLength: 200, description: '要发的内容;英文最稳,中文也能走 Unicode 输入。' },
+        confirm: { type: 'boolean', default: false, description: '预演之后确认发送。' },
+      },
+      required: ['text'],
+    },
+  },
+  {
     name: 'wt_vision_probe',
     description:
       '视觉降级通道自检:截一张当前屏幕、用系统 OCR 读文字并挑出战况线索。官方遥测连不上时才用它。',
@@ -153,7 +200,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 }
 
-/** 战争雷霆百科 World:知识库 + 战局遥测 + 可降级的文案模型。 */
+/** war thunder安东星助手 World:知识库 + 战局遥测 + 可降级的文案模型。 */
 export class WtWorld implements World {
   readonly id = 'wt';
 
@@ -176,6 +223,9 @@ export class WtWorld implements World {
   private lastKbAt = '';
   /** 最近一分钟内的模型调用时间戳;事件风暴与工具连打都在这里被削平。 */
   private modelCalls: number[] = [];
+  /** 读过的对局聊天,进战局时清空(新一局的 id 会从头开始)。 */
+  private chatHistory: ChatLine[] = [];
+  private chatCursor = 0;
 
   constructor(opts: WtWorldOptions) {
     this.opts = opts;
@@ -359,6 +409,9 @@ export class WtWorld implements World {
     const lang = this.lang();
     switch (event.kind) {
       case 'enter': {
+        // 新一局的聊天 id 从头开始,旧游标留着会一条都读不到。
+        this.chatHistory = [];
+        this.chatCursor = 0;
         if (!cfg.autoBrief) return;
         const material = '刚进入战局。' + battleLine(event.snapshot, 'zh');
         const text = await this.composeText(material, '用一句话宣告进战局,并说明你会盯着哪些事', () => enterText(event.snapshot, lang));
@@ -535,6 +588,8 @@ export class WtWorld implements World {
       this.kbUpdateTool(),
       this.battleStateTool(),
       this.commentaryTool(),
+      this.chatTool(),
+      this.sayTool(),
       this.visionTool(),
       this.budgetTool(),
     ];
@@ -623,6 +678,132 @@ export class WtWorld implements World {
     };
   }
 
+  // ---- 对局对话 ----
+
+  /**
+   * 拉一次对局聊天并入缓冲。
+   *
+   * 只在被调用时拉,不在轮询里拉:聊天是给人看的,不需要实时入队,也不会因为
+   * 别人刷屏就把模型额度烧掉。进战局时缓冲与游标都会重置。
+   */
+  private async readChat(limit: number): Promise<ChatLine[]> {
+    const battle = this.ensureBattle();
+    if (!battle) return [];
+    const fresh = await battle.client.gamechat(this.chatCursor);
+    if (fresh.length > 0) {
+      let max = this.chatCursor;
+      for (const line of fresh) if (line.id > max) max = line.id;
+      this.chatCursor = max;
+      this.chatHistory = [...this.chatHistory, ...fresh].slice(-CHAT_BUFFER);
+    }
+    return this.chatHistory.slice(-Math.max(1, limit));
+  }
+
+  private chatTool(): ToolDef {
+    return {
+      ...decl('wt_chat'),
+      handler: async (args) => {
+        const cfg = this.opts.cfg;
+        const lang = this.lang();
+        const mode = args.action === 'recent' ? 'recent' : args.action === 'compose' ? 'compose' : 'translate';
+        const limit = clamp(Number(args.lines ?? cfg.chatLines), 1, 40);
+        const fallbackTarget = mode === 'compose' ? 'en' : cfg.chatTarget;
+        const target = typeof args.target === 'string' && args.target.trim() ? args.target.trim() : fallbackTarget;
+        if (mode === 'compose') {
+          const draft = typeof args.draft === 'string' ? args.draft.trim() : '';
+          if (!draft) return '要代稿就给原文,用法:wt_chat action=compose draft=打得漂亮';
+          const clipped = clip(draft, MAX_DRAFT);
+          let degraded = false;
+          const material = '用户想发到《战争雷霆》对局聊天里的话:' + clipped;
+          const text = await this.composeText(material, chatDraftInstruction(target, lang), () => {
+            degraded = true;
+            const hit = chatDraftFallback(clipped, target);
+            return hit ?? (lang === 'en' ? '(no built-in phrase matches; turn the model channel on or type it yourself)' : '（这句内置短语表里没有，开模型通道或自己写）');
+          });
+          const oneLine = text
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .slice(0, 1)
+            .join(' ')
+            .replace(/^["'“”「『]+|["'“”」』]+$/g, '');
+          return ['✍️ 代稿（' + chatTargetLabel(target, lang) + '）', oneLine, chatDraftHint(target, degraded, lang)].join('\n');
+        }
+        const battle = this.ensureBattle();
+        if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
+        const state = await battle.client.state();
+        if (!state) return '遥测没连上(' + this.originText() + ')。游戏在跑、端口对得上才读得到对局聊天。';
+        const lines = await this.readChat(limit);
+        const original = chatBlock(lines, lang);
+        if (lines.length === 0) return original;
+        if (mode === 'recent') return original + '\n(要译文就再调一次 action=translate)';
+        const material = [
+          '对局聊天原文(每条一行,格式 [频道/阵营] 玩家名: 内容):',
+          ...lines.map((line) => {
+            const side = line.enemy ? '对面' : '我方';
+            const chan = line.mode && line.mode.toLowerCase() !== 'all' ? line.mode : '全体';
+            return '[' + chan + '/' + side + '] ' + (line.sender || '未知玩家') + ': ' + line.msg;
+          }),
+        ].join('\n');
+        const text = await this.composeText(material, chatInstruction(target, lang), () => chatDegraded(target, lang));
+        return original + '\n\n🗣 ' + chatTargetLabel(target, lang) + ':\n' + text;
+      },
+    };
+  }
+
+  /**
+   * 把文本写进游戏发言栏。
+   *
+   * 默认 confirm:第一次只预演,第二次带 confirm=true 才真发 —— 因为这条会真的让游戏里
+   * 出现一句话,不是本地文件写错了还能改。auto 档留给「我知道我在干什么」的人。
+   */
+  private sayTool(): ToolDef {
+    return {
+      ...decl('wt_say'),
+      handler: async (args) => {
+        const cfg = this.opts.cfg;
+        if (cfg.chatSendMode === 'off') {
+          return '发言落地是关着的(worlds.wt.chatSendMode=off),现在只能把文本给你自己粘。改成 clipboard 就会直接复制到剪贴板,改成 confirm 则先预演、你说一声再打进发言栏。';
+        }
+        const raw = typeof args.text === 'string' ? args.text.trim() : '';
+        if (!raw) return '没给出要发的内容,用法:wt_say text="nice shot"';
+        const text = cleanOutgoing(raw, MAX_OUTGOING);
+        if (cfg.chatSendMode === 'clipboard') {
+          const copied = await copyToClipboard({
+            text,
+            ...(this.opts.spawnImpl ? { spawnImpl: this.opts.spawnImpl } : {}),
+          });
+          if (!copied.ok) return '❌ 没复制上:' + (copied.error ?? '未知原因');
+          return [
+            '📋 已复制到剪贴板(' + text.length + ' 字符)',
+            '「' + text + '」',
+            '回游戏里 Ctrl+V 粘进聊天框再回车就发出去了。要让我直接打进发言栏,把 worlds.wt.chatSendMode 改成 confirm 或 auto。',
+          ].join('\n');
+        }
+        if (cfg.chatSendMode === 'confirm' && args.confirm !== true) {
+          return [
+            '📝 预演(还没发):',
+            '「' + text + '」',
+            '确认发送就再调一次 wt_say text="' + text + '" confirm=true。',
+            '发送方式:把游戏窗口抢回前台 → Enter 打开输入框 → 逐字输入 → Enter 发出;不走剪贴板,不发鼠标事件。',
+          ].join('\n');
+        }
+        const sent = await sendToGame({
+          dataDir: this.opts.dataDir,
+          text,
+          delayMs: clamp(cfg.chatSendDelayMs, 60, 2000),
+          ...(this.opts.spawnImpl ? { spawnImpl: this.opts.spawnImpl } : {}),
+        });
+        if (!sent.ok) return '❌ 没发出去:' + (sent.error ?? '未知原因');
+        return [
+          '✅ 已写进发言栏(' + sent.sent + ' 字符)',
+          '「' + text + '」',
+          '游戏里没出现的话:通常是聊天键位被改过、或前台没抢回来(切回游戏再试一次)。',
+        ].join('\n');
+      },
+    };
+  }
+
   private visionTool(): ToolDef {
     return {
       ...decl('wt_vision_probe'),
@@ -697,13 +878,17 @@ export class WtWorld implements World {
     const inBattle = battle ? battle.inBattleNow : false;
     const snapshot = battle ? battle.currentSnapshot : null;
     const lines = [
-      '🐯 战争雷霆百科 · 自检',
+      '🐯 war thunder安东星助手 · 自检',
       '📡 遥测:' + this.originText() + ' · ' + (this.online ? '在线' : '没连上'),
       '🎮 战局:' + (inBattle && snapshot ? '战局中(' + battleLine(snapshot, 'zh') + ')' : '不在战局'),
       '📚 知识库:v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')' +
         (this.view.remoteVersion ? ' · 远程 ' + this.view.remoteCount + ' 条' : ' · 仅内置'),
       '🧠 文案:' + this.sourceText(),
       '💰 今日 ' + book.yuan.toFixed(4) + ' 元 / 预算 ' + Math.max(0, cfg.dailyBudgetYuan) + ' 元',
+      '💬 对话:' +
+        (this.chatHistory.length > 0
+          ? '已缓存 ' + this.chatHistory.length + ' 条 · 目标语言 ' + chatTargetLabel(cfg.chatTarget, this.lang())
+          : '还没读过(用 wt_chat 拉)'),
       '🖼 视觉:' + (cfg.visionMode === 'probe' ? 'probe(可截图 OCR)' : 'off'),
       '🕘 现在:' + this.stamp(),
     ];
@@ -765,6 +950,10 @@ export class WtWorld implements World {
       'wt.source': this.sourceText(),
       'wt.budget': '今日 ' + book.yuan.toFixed(4) + ' 元 / 预算 ' + Math.max(0, cfg.dailyBudgetYuan) + ' 元',
       'wt.vehicle': snapshot && snapshot.vehicle ? snapshot.vehicle : '未知',
+      'wt.chat':
+        this.chatHistory.length > 0
+          ? '最近缓存 ' + this.chatHistory.length + ' 条(最后一条:' + clip(this.chatHistory[this.chatHistory.length - 1].msg, 40) + ')'
+          : '还没读过对局对话',
     };
   }
 
@@ -772,7 +961,7 @@ export class WtWorld implements World {
     const cfg = this.opts.cfg;
     const book = readSpend(this.opts.dataDir, this.todayKey());
     return {
-      label: '战争雷霆百科',
+      label: 'war thunder安东星助手',
       lamps: [
         { label: '遥测', state: this.online ? 'online' : 'offline', hint: this.originText() },
         { label: '知识库', state: this.view.entries.length > 0 ? 'online' : 'offline', hint: 'v' + this.view.version + ' · ' + this.view.entries.length + ' 条' },
@@ -786,7 +975,7 @@ export class WtWorld implements World {
       promptDocs: [
         {
           key: 'worlds.wt.envPrompt',
-          title: '战争雷霆百科环境段',
+          title: 'war thunder安东星助手环境段',
           description: '把当前遥测状态、知识库版本与花费上限写给模型。',
           path: ENV_PROMPT_FILE,
           role: 'envPrompt' as const,

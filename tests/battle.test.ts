@@ -6,6 +6,7 @@ interface Routes {
   indicators?: unknown;
   hud?: { events: Array<{ id: number; type?: string; msg?: string }>; damage: Array<{ id: number; type?: string; msg?: string }> };
   map?: unknown[];
+  chat?: Array<{ id: number; msg?: string; sender?: string; enemy?: boolean; mode?: string }>;
   broken?: boolean;
 }
 
@@ -24,6 +25,9 @@ function makeClient(read: () => Routes) {
         events: hud.events.filter((item) => item.id > evt),
         damage: hud.damage.filter((item) => item.id > dmg),
       };
+    } else if (url.includes('/gamechat')) {
+      const cursor = Number((url.match(/lastId=(-?\d+)/) ?? [])[1] ?? 0);
+      body = (routes.chat ?? []).filter((item) => item.id > cursor);
     } else if (url.includes('/state')) {
       body = routes.state ?? {};
     } else if (url.includes('/indicators')) {
@@ -198,5 +202,45 @@ describe('战局状态机', () => {
     expect(snapshot.enemies).toBe(1);
     expect(snapshot.allies).toBe(1);
     expect(watcher.inBattleNow).toBe(false);
+  });
+});
+
+describe('对局聊天', () => {
+  it('按 lastId 增量取,字段按契约映射', async () => {
+    const routes: Routes = {
+      chat: [
+        { id: 70, msg: 'hahaha', sender: 'pecusgaming', enemy: false, mode: 'All' },
+        { id: 71, msg: 'slightly op tbh', sender: 'shino_rs', enemy: true, mode: 'Team' },
+      ],
+    };
+    const client = makeClient(() => routes);
+    const first = await client.gamechat(0);
+    expect(first.length).toBe(2);
+    expect(first[0]).toEqual({ id: 70, msg: 'hahaha', sender: 'pecusgaming', enemy: false, mode: 'All' });
+    expect(first[1].enemy).toBe(true);
+    expect(first[1].mode).toBe('Team');
+    const second = await client.gamechat(70);
+    expect(second.map((line) => line.id)).toEqual([71]);
+  });
+
+  it('缺字段补默认值,空正文丢弃,控制字符被洗掉', async () => {
+    const routes: Routes = {
+      chat: [
+        { id: 5, msg: '  gg\u0000  ' },
+        { id: 6, msg: '   ' },
+        { id: 7, msg: 'hi', sender: 'a', mode: '' },
+      ],
+    };
+    const lines = await makeClient(() => routes).gamechat(0);
+    expect(lines.length).toBe(2);
+    expect(lines[0].msg).toBe('gg');
+    expect(lines[0].sender).toBe('');
+    expect(lines[0].mode).toBe('All');
+    expect(lines[1].mode).toBe('All');
+  });
+
+  it('服务挂了或不是数组都返回空数组', async () => {
+    expect(await makeClient(() => ({ broken: true })).gamechat(0)).toEqual([]);
+    expect(await makeClient(() => ({ chat: [] })).gamechat(0)).toEqual([]);
   });
 });

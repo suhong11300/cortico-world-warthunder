@@ -1,8 +1,8 @@
 {
   "name": "cortico-world-warthunder",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
-  "description": "在对话中提供战争雷霆的本地百科与战局播报。知识库覆盖概念、载具与玩法，可检索、可更新；读取本机 8111 遥测讲解战局、为击毁喝彩、为逆风打气；遥测不可用时可用截图 OCR 兜底；文案可按设定人格改写，模型与花费可配置。",
+  "description": "在对话中提供战争雷霆的本地百科、战局播报与对局翻译。知识库覆盖概念、载具与玩法，可检索、可更新；读取本机 8111 遥测讲解战局、为击毁喝彩、为逆风打气，并可翻译对局聊天、代写要发的话；遥测不可用时可用截图 OCR 兜底；文案可按设定人格改写，模型与花费可配置。",
   "license": "MIT",
   "author": "苏鸿与维基 (suhong11300)",
   "repository": {
@@ -19,7 +19,9 @@
     "warthunder",
     "战争雷霆",
     "game",
-    "telemetry"
+    "telemetry",
+    "war-thunder",
+    "translation"
   ],
   "engines": {
     "node": ">=22"
@@ -29,10 +31,11 @@
   "cortico": {
     "kind": "world",
     "api": 6,
-    "displayName": "战争雷霆百科",
+    "displayName": "war thunder安东星助手",
     "icon": "icon.svg",
     "screenshots": [
       "screenshots/brief.png",
+      "screenshots/chat.png",
       "screenshots/kb.png",
       "screenshots/budget.png"
     ],
@@ -47,12 +50,12 @@
     ],
     "locales": {
       "zh": {
-        "displayName": "战争雷霆百科",
-        "description": "在对话中提供战争雷霆的本地百科与战局播报。知识库覆盖概念、载具与玩法，可检索、可更新；读取本机 8111 遥测讲解战局、为击毁喝彩、为逆风打气；遥测不可用时可用截图 OCR 兜底；文案可按设定人格改写，模型与花费可配置。"
+        "displayName": "war thunder安东星助手",
+        "description": "在对话中提供战争雷霆的本地百科、战局播报与对局翻译。知识库覆盖概念、载具与玩法，可检索、可更新；读取本机 8111 遥测讲解战局、为击毁喝彩、为逆风打气，并可翻译对局聊天、代写要发的话；遥测不可用时可用截图 OCR 兜底；文案可按设定人格改写，模型与花费可配置。"
       },
       "en": {
-        "displayName": "War Thunder Codex",
-        "description": "Local War Thunder knowledge plus live battle commentary. A searchable, updatable knowledge base covering concepts, vehicles and play; reads the local 8111 telemetry for sitreps, kill cheers and comeback lines; falls back to screenshot OCR when telemetry is unavailable; copy follows the persona you set, with a configurable model and spend caps."
+        "displayName": "War Thunder Anton Star Helper",
+        "description": "In-chat War Thunder codex, battle caller and match translator. The knowledge base covers concepts, vehicles and gameplay, searchable and updatable; it reads the local 8111 telemetry to call the battle, cheer kills and push back when behind, and can translate in-battle chat plus draft lines to send; screenshot OCR is the fallback when telemetry is unavailable; wording follows the persona you set, and both model and spend are configurable."
       }
     },
     "describe": "describe.json"

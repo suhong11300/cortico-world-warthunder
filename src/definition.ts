@@ -4,7 +4,7 @@ import { WT_TOOL_DECLS, WtWorld } from './world.ts';
 
 export const WT: WorldDefinition<WtConfigSection> = {
   id: 'wt',
-  label: '战争雷霆百科',
+  label: 'war thunder安东星助手',
   defaults: () => ({ ...WT_DEFAULTS }),
   // `ctx.cfg` 是 `worlds.wt` 的活引用:热改的键现读即生效。
   create: (ctx) =>
@@ -47,6 +47,14 @@ export const WT: WorldDefinition<WtConfigSection> = {
       wt_vision_probe: {
         zh: '视觉降级通道自检:截屏后做系统 OCR 并挑出战况线索。',
         en: 'Fallback vision probe: screenshot, system OCR, extract battle hints.',
+      },
+      wt_chat: {
+        zh: '读对局聊天并翻译成指定语言;先给原文再给译文。',
+        en: 'Read in-battle chat and translate it; original first, then the translation.',
+      },
+      wt_say: {
+        zh: '把一句话打进游戏发言栏并回车发出；默认先预演再确认。',
+        en: 'Type a line into the in-game chat box and press Enter; dry run first unless confirmed.',
       },
       wt_budget: {
         zh: '看今天的文案模型用量与花费,可清零。',

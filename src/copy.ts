@@ -138,3 +138,103 @@ export function degradeNote(reason: string, lang: Lang): string {
   if (lang === 'en') return '(template copy: ' + reason + ')';
   return '（模板文案：' + reason + '）';
 }
+
+/** 只用到这几个字段，避免 copy 反过来依赖 battle 的类型。 */
+export interface ChatLineView {
+  sender: string;
+  msg: string;
+  enemy: boolean;
+  mode: string;
+}
+
+const CHAT_TARGET_LABEL: Record<string, { zh: string; en: string }> = {
+  zh: { zh: '简体中文', en: 'Simplified Chinese' },
+  en: { zh: '英文', en: 'English' },
+  ja: { zh: '日文', en: 'Japanese' },
+  ru: { zh: '俄文', en: 'Russian' },
+};
+
+export function chatTargetLabel(target: string, lang: Lang): string {
+  const entry = CHAT_TARGET_LABEL[target] ?? CHAT_TARGET_LABEL.zh;
+  return lang === "en" ? entry.en : entry.zh;
+}
+
+/** 原文列表：翻译失败或模型关掉时，这段仍然可读。 */
+export function chatBlock(lines: ChatLineView[], lang: Lang): string {
+  if (lines.length === 0) return chatMissing(lang);
+  const head = lang === "en" ? "💬 Match chat (" + lines.length + ")" : "💬 对局对话（" + lines.length + " 条）";
+  const body = lines.map((line) => {
+    const side = line.enemy ? (lang === "en" ? "enemy" : "对面") : (lang === "en" ? "team" : "我方");
+    const mode = line.mode && line.mode.toLowerCase() !== "all" ? line.mode : (lang === "en" ? "all" : "全体");
+    const who = line.sender || (lang === "en" ? "unknown" : "未知玩家");
+    return "· [" + mode + "/" + side + "] " + who + "：" + line.msg;
+  });
+  return [head, ...body].join("\n");
+}
+
+export function chatMissing(lang: Lang): string {
+  return lang === "en"
+    ? "No match chat to read: the game is not in a battle, or nothing was said yet."
+    : "还没读到对局对话：要么不在战局，要么还没人说话。";
+}
+
+export function chatInstruction(target: string, lang: Lang): string {
+  const label = chatTargetLabel(target, lang);
+  if (lang === "en") {
+    return "Translate the War Thunder match chat below into " + label + ". Keep player names as they are, keep the tone of the original, add no explanation and no summary; pass through lines already in that language. Output one line per message and nothing else.";
+  }
+  return "把下面这些《战争雷霆》对局聊天翻译成" + label + "。玩家名保持原样，口吻贴近原话，不要加解释、不要总结，已经是该语言的直接保留。一条消息一行，只输出译文。";
+}
+
+export function chatDegraded(target: string, lang: Lang): string {
+  const label = chatTargetLabel(target, lang);
+  return lang === "en"
+    ? "(the " + label + " translation needs the model channel; it is off or over budget right now, so only the original is shown)"
+    : "（" + label + "译文要用模型通道，现在关着或额度用完了，所以只给原文）";
+}
+
+/** 代稿：把用户想说的话翻成目标语言，给一行能直接粘进游戏聊天框的文本。 */
+export function chatDraftInstruction(target: string, lang: Lang): string {
+  const label = chatTargetLabel(target, lang);
+  if (lang === "en") {
+    return "Translate the user's message below into " + label + " so it can be pasted into the War Thunder in-game chat. Output one single line, no quotes, no explanation, no greeting around it; keep it short and natural like a real player would type, and keep player names unchanged.";
+  }
+  return "把下面这句用户想发到《战争雷霆》对局聊天里的话翻译成" + label + "。只输出一行可以直接粘贴的文本，不要引号、不要解释、不要额外寒暄；语气像真实玩家打字，玩家名保持原样。";
+}
+
+/** 模型不可用时的短语兜底：只有意图明显对得上才给，否则返回 null。 */
+const PHRASE_BOOK: Array<{ match: RegExp; en: string; zh: string }> = [
+  { match: /打得好|漂亮|nice|good ?shot|well done/i, en: "nice shot!", zh: "打得好！" },
+  { match: /谢谢|感谢|thanks|thank you/i, en: "thanks!", zh: "谢谢！" },
+  { match: /抱歉|不好意思|对不起|sorry/i, en: "sorry!", zh: "抱歉！" },
+  { match: /干得好|赢|gg|good game/i, en: "gg well played", zh: "打得好，这局漂亮" },
+  { match: /撤退|后退|fall ?back|retreat/i, en: "fall back!", zh: "撤退！" },
+  { match: /推|进攻|push|attack/i, en: "push now!", zh: "推进！" },
+  { match: /背后|后面|behind/i, en: "enemy behind us!", zh: "背后有敌人！" },
+  { match: /掩护|cover/i, en: "I'll cover you", zh: "我掩护你" },
+  { match: /注意|小心|careful|watch out/i, en: "watch out!", zh: "小心！" },
+  { match: /一起|集合|group up|together/i, en: "group up!", zh: "集合！" },
+];
+
+/**
+ * 短语表只有中英两版:目标语言是中文时给中文,其余语言统一给英文 ——
+ * 对局里说英文最通用,总比给一句日文罗马音更难懂要好。
+ */
+export function chatDraftFallback(draft: string, target: string): string | null {
+  for (const item of PHRASE_BOOK) {
+    if (item.match.test(draft)) return target === "zh" ? item.zh : item.en;
+  }
+  return null;
+}
+
+/** 代稿回执的尾巴：说明这段话是怎么来的，以及不代发、不碰游戏。 */
+export function chatDraftHint(target: string, degraded: boolean, lang: Lang): string {
+  const label = chatTargetLabel(target, lang);
+  if (lang === "en") {
+    return (degraded ? "(model channel is off or over budget, this is the built-in phrase book)\n" : "") +
+      "Paste it into the in-game chat yourself: the pet only reads telemetry and prints text, it does not send anything, inject input or touch the mouse.";
+  }
+  return (degraded ? "（模型通道关着或额度用完了，这句来自内置短语表）\n" : "") +
+    "自己复制到游戏聊天框发送：桌宠只读遥测、只输出文本，不代发、不注入、不碰鼠标。" +
+    "目标语言：" + label + "。";
+}

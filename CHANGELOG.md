@@ -1,3 +1,17 @@
+# Changelog
+
+## 0.2.0
+
+更名与对局对话能力：
+
+- 显示名改为「war thunder安东星助手」（npm 包名 `cortico-world-warthunder` 不变）。
+- 新增 `wt_chat`：读 8111 的 `/gamechat?lastId=N`（字段 `id` / `msg` / `sender` / `enemy` / `mode`），按游标增量取、进战局清空；默认先给原文再给译文，`action=recent` 只给原文不花额度，`action=compose` 把用户想说的话翻成目标语言。
+- 新增 `wt_say`：把最终文本落到发言栏。默认 `clipboard` 档用 Set-Clipboard 复制，不动游戏输入；`confirm` / `auto` 档改用键盘事件直写（抢前台 → Enter → Unicode 逐字 → Enter），不发鼠标事件、不读内存、不注入进程。
+- 新增四个配置：`chatLines`（12）、`chatTarget`（zh）、`chatSendMode`（clipboard）、`chatSendDelayMs`（180）。
+- 环境段新增 `{{wt.chat}}`，并写明「被叫到才翻译、代稿先把最终文本念给用户确认」。
+- 测试 111 → 141 项：gamechat 解析与增量、对话文案与代稿指令、脚本清洗与输出解析、剪贴板与直写两条落地、translate / recent / compose / 预演四条工具路径。
+
+代码层面沿用上一版的安全边界：遥测只认本机、知识库源过闸、外部文本先洗、四道花费闸、出口脱敏。
 ## 0.1.4
 
 发布元数据对齐：

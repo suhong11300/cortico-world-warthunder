@@ -29,6 +29,14 @@ export interface HudEvent {
   sender: string;
 }
 
+/** 一条对局聊天。/gamechat 的契约是 { id, msg, sender, enemy, mode }，缺字段一律给默认值。 */
+export interface ChatLine {
+  id: number;
+  sender: string;
+  msg: string;
+  enemy: boolean;
+  mode: string;
+}
 export interface HudSnapshot {
   events: HudEvent[];
   damage: HudEvent[];
@@ -223,6 +231,25 @@ export class BattleClient {
     }
     return out;
   }
+
+  /**
+   * 读对局聊天。lastId 传上次见到的最大 id 做增量，传 0 从头拿。
+   *
+   * 聊天内容是别人写的，是可污染的输入：这里只做结构解析与长度/控制字符清洗，
+   * 不做任何「看起来像指令就执行」的判断——那属于上层提示词的事。
+   */
+  async gamechat(lastId: number): Promise<ChatLine[]> {
+    const cursor = Number.isFinite(lastId) ? Math.max(0, Math.trunc(lastId)) : 0;
+    const raw = await this.json('/gamechat?lastId=' + cursor);
+    if (!Array.isArray(raw)) return [];
+    const out: ChatLine[] = [];
+    for (const entry of raw) {
+      const line = toChatLine(entry);
+      if (!line) continue;
+      if (line.id > cursor) out.push(line);
+    }
+    return out;
+  }
 }
 
 function maxId(events: HudEvent[], fallback: number): number {
@@ -409,4 +436,30 @@ export class BattleWatcher {
     const seconds = this.startedAt > 0 ? Math.max(0, Math.round((this.now() - this.startedAt) / 1000)) : 0;
     return { vehicle: this.snapshot.vehicle, kills: this.kills, deaths: this.deaths, seconds };
   }
+}
+
+/** 聊天正文与昵称都可能被人塞控制字符或超长文本，先洗再收。 */
+const MAX_CHAT_MSG = 400;
+const MAX_CHAT_SENDER = 40;
+
+function toChatLine(raw: unknown): ChatLine | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const item = raw as Record<string, unknown>;
+  const id = num(item.id);
+  const msg = cleanChatText(str(item.msg)).slice(0, MAX_CHAT_MSG);
+  if (!msg) return null;
+  return {
+    id: Number.isFinite(id) ? id : 0,
+    sender: cleanChatText(str(item.sender)).slice(0, MAX_CHAT_SENDER),
+    msg,
+    enemy: bool(item.enemy),
+    mode: cleanChatText(str(item.mode)).slice(0, 16) || 'All',
+  };
+}
+
+function cleanChatText(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }

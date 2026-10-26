@@ -1,11 +1,12 @@
-# cortico-world-warthunder · 战争雷霆百科
+# cortico-world-warthunder · war thunder安东星助手
 
-挂在 Coopanion 桌宠上的《战争雷霆》World：一边当本地百科（概念 / 载具 / 玩法），一边读客户端的本地遥测（8111）实时讲解战局、为击毁喝彩、为逆风打气。
+挂在 Coopanion 桌宠上的《战争雷霆》World：一边当本地百科（概念 / 载具 / 玩法），一边读客户端的本地遥测（8111）实时讲解战局、为击毁喝彩、为逆风打气，还能被叫到时翻译对局聊天、代写要发的话。
 
 - 知识库本地落盘、可检索、可挂远程源增量更新；查不到会直说，不凭记忆编。
 - 战局走**客户端自带的本地 HTTP 遥测**，不读内存、不注入、不写游戏文件。
 - 遥测不可用时提供**截图 OCR 兜底**（Windows OCR，默认关闭）。
 - 播报文案三档来源：宿主人格 / 自填 OpenAI 兼容接口 / 纯模板；按日预算与字符上限拦停。
+- 对局聊天走 8111 的 `/gamechat`，被叫到才读；代稿的落地默认**复制到剪贴板**，也可配成用键盘事件直接写进发言栏（不碰鼠标、不读内存）。
 
 ## 为什么需要它
 
@@ -49,6 +50,10 @@
 | kbAutoUpdateHours | 24 | 每隔多少小时检查知识库源；0 表示只手动更新 |
 | visionMode | off | `off` / `probe`（允许截图 OCR 自检） |
 | visionRegion | 空 | 截图区域 `x,y,w,h`；留空整屏 |
+| chatLines | 12 | 一次最多翻译多少条对局聊天（1–40） |
+| chatTarget | zh | 对局对话翻成什么语言：`zh` / `en` / `ja` / `ru` |
+| chatSendMode | clipboard | `clipboard` 复制到剪贴板 / `off` 只出文本 / `confirm` 预演后键盘直写 / `auto` 直接直写 |
+| chatSendDelayMs | 180 | 按 Enter 打开聊天框后等多久再逐字输入 |
 | llmMode | host | `host` 用宿主模型 / `openai` 用兼容接口 / `off` 只用模板 |
 | llmBaseUrl | https://api.deepseek.com | OpenAI 兼容前缀 |
 | llmModel | deepseek-chat | 请求里的 model 字段 |
@@ -74,6 +79,8 @@
 | wt_kb_update | 拉取远程知识库（force=true 可跳过 60 秒节流） |
 | wt_battle_state | 当前战局读数与本局战绩 |
 | wt_commentary | 手动要一句讲解（mode=sitrep / cheer / urge） |
+| wt_chat | 读对局聊天并翻译；`action=recent` 只给原文，`action=compose` 把你要说的话翻成目标语言 |
+| wt_say | 把一句话落到发言栏：默认复制到剪贴板，也可配成键盘直写 |
 | wt_vision_probe | 截图 + Windows OCR，返回识别文本与线索 |
 | wt_budget | 今日用量、计价比、单次上限；reset=true 清零 |
 
@@ -114,6 +121,19 @@
 
 **能力边界**：这是客户端实现、非文档化合同——字段可能随版本变，只在本机可用，也没有鉴权。插件对每个字段都做了容错（缺字段按 0 / 空处理，解析失败当离线），但版本更新后仍建议先看一眼 `wt_status`。
 
+## 对局对话：翻译与代稿
+
+被叫到时读一次 `/gamechat?lastId=N`（契约：`id` / `msg` / `sender` / `enemy` / `mode`），按游标增量取，进战局时清空。
+
+- `wt_chat`（默认 translate）：先给原文（频道 / 我方还是对面 / 玩家名），再把译文附在后面；`action=recent` 只要原文，不花模型额度。
+- `wt_chat action=compose draft=...`：把你要说的话翻成目标语言，给一行可以直接粘贴的文本。
+- `wt_say text=...`：把最终那一行落到发言栏。三种落地方式：
+  - `clipboard`（默认）：用 `Set-Clipboard` 复制，你回游戏 `Ctrl+V` 再回车。不碰游戏输入，最稳。
+  - `confirm`：先预演给你看，再说一次 `confirm=true` 才发。发送靠键盘事件：把游戏窗口抢回前台 → `Enter` 打开输入框 → Unicode 逐字输入 → `Enter` 发出。
+  - `auto`：跳过预演直接发。
+
+边界：不发鼠标事件、不读游戏内存、不 attach 进程、不注入 DLL、不改游戏文件；`confirm` / `auto` 档会短暂把游戏抢到前台，那几百毫秒里你按的键也会进输入框，所以一次发完，别连着调。
+
 ## 视觉兜底
 
 `visionMode=probe` 时，`wt_vision_probe` 会调 Windows 自带 OCR：
@@ -150,10 +170,10 @@
 
 ```bash
 corepack pnpm typecheck
-corepack pnpm test          # 7 个文件 111 项
+corepack pnpm test          # 8 个文件 141 项
 ```
 
-包内自带 `describe.json`（9 工具 / 7 事件 / 1 提示词），官方校验：
+包内自带 `describe.json`（11 工具 / 7 事件 / 1 提示词），官方校验：
 
 ```bash
 cd <Cortina>/state/cortico && corepack pnpm check:extension <包根目录>
@@ -165,6 +185,7 @@ cd <Cortina>/state/cortico && corepack pnpm check:extension <包根目录>
 - 视觉档只做一次性探测，不做连续读屏。
 - 知识库是静态文本 + 远程 JSON，没有爬虫，不抓游戏官网。
 - `llmApiKey` 明文存在 `config.json`，别填主账号密钥。
+- 8311 没有"发送聊天"的接口，所以直写发言栏只能靠键盘事件；游戏改过聊天键位或前台抢不回来时，回到 `clipboard` 档手贴。
 
 ## 配图
 

@@ -2,6 +2,13 @@ import { describe, it, expect } from 'vitest';
 import {
   battleLine,
   behindText,
+  chatBlock,
+  chatDegraded,
+  chatDraftFallback,
+  chatDraftHint,
+  chatDraftInstruction,
+  chatInstruction,
+  chatTargetLabel,
   clip,
   commentaryText,
   deathText,
@@ -142,5 +149,51 @@ describe('人格改写包装', () => {
     expect(brief).toContain('Do not change any number');
     expect(brief).toContain('2 kills');
     expect(brief).toContain('Do not invent');
+  });
+});
+
+describe('对局聊天文案', () => {
+  const lines = [
+    { sender: 'pecusgaming', msg: 'nice shot', enemy: false, mode: 'All' },
+    { sender: 'shino_rs', msg: 'gg', enemy: true, mode: 'Team' },
+  ];
+
+  it('chatBlock 列出条数、阵营、频道与玩家名', () => {
+    const text = chatBlock(lines, 'zh');
+    expect(text).toContain('💬 对局对话（2 条）');
+    expect(text).toContain('[全体/我方] pecusgaming：nice shot');
+    expect(text).toContain('[Team/对面] shino_rs：gg');
+  });
+
+  it('没有对话时给一句提示', () => {
+    expect(chatBlock([], 'zh')).toContain('还没读到对局对话');
+    expect(chatBlock([], 'en')).toContain('No match chat');
+  });
+
+  it('chatInstruction 指明目标语言并禁止加解释', () => {
+    const zh = chatInstruction('en', 'zh');
+    expect(zh).toContain('翻译成英文');
+    expect(zh).toContain('不要加解释');
+    expect(chatInstruction('zh', 'en')).toContain('Simplified Chinese');
+    expect(chatTargetLabel('ru', 'zh')).toBe('俄文');
+  });
+
+  it('chatDraftInstruction 要求一行可直接粘贴', () => {
+    const text = chatDraftInstruction('en', 'zh');
+    expect(text).toContain('只输出一行');
+    expect(text).toContain('不要引号');
+  });
+
+  it('短语表按目标语言给,命中不了返回 null', () => {
+    expect(chatDraftFallback('打得好', 'en')).toContain('nice shot');
+    expect(chatDraftFallback('打得好', 'zh')).toBe('打得好！');
+    expect(chatDraftFallback('撤退', 'en')).toContain('fall back');
+    expect(chatDraftFallback('今天天气不错', 'en')).toBeNull();
+  });
+
+  it('降级说明会点明是短语表', () => {
+    expect(chatDegraded('en', 'zh')).toContain('只给原文');
+    expect(chatDraftHint('en', true, 'zh')).toContain('内置短语表');
+    expect(chatDraftHint('en', false, 'zh')).toContain('不代发');
   });
 });

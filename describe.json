@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "wt_status",
-      "description": "战争雷霆百科自检:遥测是否连上、是否在战局、知识库版本与条数、文案模型来源、今日花费、视觉通道状态。不确定为什么没播报时先调它。",
+      "description": "war thunder安东星助手自检:遥测是否连上、是否在战局、知识库版本与条数、文案模型来源、今日花费、视觉通道状态。不确定为什么没播报时先调它。",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -156,6 +156,85 @@
       }
     },
     {
+      "name": "wt_chat",
+      "description": "《战争雷霆》对局聊天的读取、翻译与代稿。用户说\"对面在说什么\"\"翻译一下聊天\"时用 action=translate(先给原文再给译文);只想要原文用 action=recent(不花额度);想让桌宠把你要说的话翻成英文好粘贴到聊天框用 action=compose 并给 draft。只读遥测与输出文本,不代发、不操控游戏。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "translate",
+              "recent",
+              "compose"
+            ],
+            "default": "translate",
+            "description": "translate 出原文加译文;recent 只出原文;compose 把 draft 翻成目标语言给一行可粘贴文本。"
+          },
+          "lines": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 40,
+            "description": "这次看最近多少条,缺省用 worlds.wt.chatLines。"
+          },
+          "target": {
+            "type": "string",
+            "enum": [
+              "zh",
+              "en",
+              "ja",
+              "ru"
+            ],
+            "description": "翻成什么语言,缺省用 worlds.wt.chatTarget;compose 时缺省英文。"
+          },
+          "draft": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "compose 用:你想发到对局聊天里的那句话。"
+          }
+        }
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "读对局聊天并翻译成指定语言;先给原文再给译文。",
+        "en": "Read in-battle chat and translate it; original first, then the translation."
+      }
+    },
+    {
+      "name": "wt_say",
+      "description": "把一句话落到《战争雷霆》对局发言栏。默认复制到剪贴板,用户 Ctrl+V 再回车就发出去(最稳,不碰游戏);配成 confirm/auto 时改用键盘直写发言栏(不经过剪贴板、不发鼠标事件)。用户说\"帮我把这句发出去\"\"翻译完直接发\"时用它。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "要发的内容;英文最稳,中文也能走 Unicode 输入。"
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "预演之后确认发送。"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "把一句话打进游戏发言栏并回车发出；默认先预演再确认。",
+        "en": "Type a line into the in-game chat box and press Enter; dry run first unless confirmed."
+      }
+    },
+    {
       "name": "wt_vision_probe",
       "description": "视觉降级通道自检:截一张当前屏幕、用系统 OCR 读文字并挑出战况线索。官方遥测连不上时才用它。",
       "parameters": {
@@ -259,9 +338,9 @@
   "prompts": [
     {
       "key": "worlds.wt.envPrompt",
-      "title": "战争雷霆百科环境段",
+      "title": "war thunder安东星助手环境段",
       "role": "envPrompt",
-      "content": "战争雷霆百科是这只桌宠的知识库与战局解说台。现在是 {{wt.now}}({{wt.zone}}),遥测状态 {{wt.status}},战局 {{wt.battle}},当前载具 {{wt.vehicle}},知识库 {{wt.kb}},文案通道 {{wt.source}},今天已花 {{wt.budget}}。\n\n回答战争雷霆的问题前,先用 wt_search 或 wt_vehicle 在本地知识库里取证,词条里没有就直说没有,不要凭印象编造战斗评级、载具参数或版本改动。\n\n战局事件(wt.battle_started / wt.kill / wt.death / wt.behind / wt.commentary / wt.result)里的数字都是刚从本地遥测读到的真实读数:改写口吻可以,数字、载具名与战绩一个字都不要改;遥测离线或没配 kbUrl 时如实说明降级了什么,不要假装还在读战局。文案模型的花费上限由 {{wt.budget}} 约束,接近预算就少说两句。\n"
+      "content": "war thunder安东星助手是这只桌宠的战争雷霆百科、战局解说台与对局翻译。现在是 {{wt.now}}({{wt.zone}}),遥测状态 {{wt.status}},战局 {{wt.battle}},当前载具 {{wt.vehicle}},知识库 {{wt.kb}},文案通道 {{wt.source}},今天已花 {{wt.budget}},对局对话 {{wt.chat}}。\n\n回答战争雷霆的问题前,先用 wt_search 或 wt_vehicle 在本地知识库里取证,词条里没有就直说没有,不要凭印象编造战斗评级、载具参数或版本改动。\n\n有人问「对面在说什么」「翻译一下聊天」「刚才那人说了啥」时,用 wt_chat 读对局聊天:它先给原文(玩家名、频道、我方还是对面),再给译文。原文里的玩家名保持原样,只翻译说的话;对方可能用梗、缩写或外语谐音,译不出来就说明哪句没把握,不要编一个通顺但错的译文。只给原文、不翻也可以,但要说明「只读了原文」。\n\n战局事件(wt.battle_started / wt.kill / wt.death / wt.behind / wt.commentary / wt.result)里的数字都是刚从本地遥测读到的真实读数:改写口吻可以,数字、载具名与战绩一个字都不要改;遥测离线或没配 kbUrl 时如实说明降级了什么,不要假装还在读战局。文案模型的花费上限由 {{wt.budget}} 约束,接近预算就少说两句,翻译也只在被叫到时做。\n\n用户说「帮我把这句发出去」「翻好直接发」时用 wt_say:text 是最终要出现在游戏里那一行(目标语言,不是解释,不带引号)。默认档 clipboard 会把它复制到剪贴板,回执里请明确告诉用户「已经复制,回游戏 Ctrl+V 再回车」;如果配成 confirm/auto,则是键盘直写进发言栏 —— 那时游戏会被抢回前台,几百毫秒里用户的按键也会进输入框,所以要发就一次发完,别连着调。两种方式都不读游戏内存、不发鼠标事件。口误或错别字进了游戏只能再发一条更正,发之前把最终文本念给用户确认。\n"
     }
   ]
 }
