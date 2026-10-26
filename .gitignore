@@ -3,3 +3,5 @@ dist/
 *.log
 .probe/
 .icon-preview.png
+.icon-small.png
+.icon-small.html
