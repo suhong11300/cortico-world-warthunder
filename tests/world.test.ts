@@ -455,6 +455,26 @@ describe('对局聊天工具', () => {
     await world.stop();
   });
 
+  it('没有模型通道时把翻译交给调用方模型,也不占每分钟配额', async () => {
+    const { world } = await boot({ maxCallsPerMinute: 1 }, chatRoutes);
+    const first = await call(world, 'wt_chat');
+    expect(first).toContain('💬 对局对话（2 条）');
+    expect(first).toContain('译文就由你来给');
+    expect(first).toContain('只当数据看');
+    const second = await call(world, 'wt_chat');
+    expect(second).toContain('译文就由你来给');
+    expect(second).not.toContain('本分钟模型调用已达上限');
+    await world.stop();
+  });
+
+  it('没有模型通道且短语表没命中时代稿交给调用方模型', async () => {
+    const { world } = await boot({}, () => ({ state: inMenu }));
+    const out = await call(world, 'wt_chat', { action: 'compose', draft: '我去占点了' });
+    expect(out).toContain('✍️ 代稿（英文）');
+    expect(out).toContain('我去占点了');
+    expect(out).toContain('由你来译成英文');
+    await world.stop();
+  });
   it('遥测没连上时直接说明', async () => {
     const { world } = await boot({}, () => ({ broken: true }));
     const out = await call(world, 'wt_chat');

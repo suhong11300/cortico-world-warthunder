@@ -7,7 +7,8 @@ import {
   battleLine,
   behindText,
   chatBlock,
-  chatDegraded,
+  chatDelegated,
+  chatDraftDelegated,
   chatDraftFallback,
   chatDraftHint,
   chatDraftInstruction,
@@ -483,6 +484,16 @@ export class WtWorld implements World {
     return { ok: true };
   }
 
+  /**
+   * 这个部署到底有没有可用的模型通道。
+   * 宿主给了 cognition，或者用户自己填了 key，才算有；都没有时别再走 composeText ——
+   * 那只会白占一次每分钟配额，然后照样退回模板。
+   */
+  private hasModelChannel(): boolean {
+    if (this.host?.cognition) return true;
+    const cfg = this.opts.cfg;
+    return cfg.llmMode !== 'off' && cfg.llmApiKey.trim().length > 0;
+  }
   private async composeText(material: string, instruction: string, template: () => string): Promise<string> {
     const cfg = this.opts.cfg;
     if (cfg.llmMode === 'off') {
@@ -713,12 +724,20 @@ export class WtWorld implements World {
           const draft = typeof args.draft === 'string' ? args.draft.trim() : '';
           if (!draft) return '要代稿就给原文,用法:wt_chat action=compose draft=打得漂亮';
           const clipped = clip(draft, MAX_DRAFT);
+          const label = chatTargetLabel(target, lang);
+          if (!this.hasModelChannel()) {
+            const hit = chatDraftFallback(clipped, target);
+            if (hit) {
+              return ['✍️ 代稿（' + label + '）', hit, chatDraftHint(target, true, lang)].join('\n');
+            }
+            return ['✍️ 代稿（' + label + '）', chatDraftDelegated(clipped, target, lang), chatDraftHint(target, false, lang)].join('\n');
+          }
           let degraded = false;
           const material = '用户想发到《战争雷霆》对局聊天里的话:' + clipped;
           const text = await this.composeText(material, chatDraftInstruction(target, lang), () => {
             degraded = true;
             const hit = chatDraftFallback(clipped, target);
-            return hit ?? (lang === 'en' ? '(no built-in phrase matches; turn the model channel on or type it yourself)' : '（这句内置短语表里没有，开模型通道或自己写）');
+            return hit ?? chatDraftDelegated(clipped, target, lang);
           });
           const oneLine = text
             .split('\n')
@@ -745,8 +764,12 @@ export class WtWorld implements World {
             return '[' + chan + '/' + side + '] ' + (line.sender || '未知玩家') + ': ' + line.msg;
           }),
         ].join('\n');
-        const text = await this.composeText(material, chatInstruction(target, lang), () => chatDegraded(target, lang));
-        return original + '\n\n🗣 ' + chatTargetLabel(target, lang) + ':\n' + text;
+        const label = chatTargetLabel(target, lang);
+        if (!this.hasModelChannel()) {
+          return original + '\n\n🗣 ' + label + ':\n' + chatDelegated(target, lang);
+        }
+        const text = await this.composeText(material, chatInstruction(target, lang), () => chatDelegated(target, lang));
+        return original + '\n\n🗣 ' + label + ':\n' + text;
       },
     };
   }

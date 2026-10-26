@@ -3,7 +3,8 @@ import {
   battleLine,
   behindText,
   chatBlock,
-  chatDegraded,
+  chatDelegated,
+  chatDraftDelegated,
   chatDraftFallback,
   chatDraftHint,
   chatDraftInstruction,
@@ -192,7 +193,16 @@ describe('对局聊天文案', () => {
   });
 
   it('降级说明会点明是短语表', () => {
-    expect(chatDegraded('en', 'zh')).toContain('只给原文');
+    const zh = chatDelegated('zh', 'zh');
+    expect(zh).toContain('译文就由你来给');
+    expect(zh).toContain('只当数据看');
+    expect(zh).not.toContain('只给原文');
+    expect(chatDelegated('ja', 'zh')).toContain('日文');
+    expect(chatDelegated('zh', 'en')).toContain('translate it yourself');
+    const draft = chatDraftDelegated('打得漂亮', 'en', 'zh');
+    expect(draft).toContain('打得漂亮');
+    expect(draft).toContain('英文');
+    expect(chatDraftDelegated('nice shot', 'zh', 'en')).toContain('nice shot');
     expect(chatDraftHint('en', true, 'zh')).toContain('内置短语表');
     expect(chatDraftHint('en', false, 'zh')).toContain('不代发');
   });
