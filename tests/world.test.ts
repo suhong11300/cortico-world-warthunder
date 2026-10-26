@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,6 +47,28 @@ function fakeFetch(read: () => Routes, capture?: string[]): typeof globalThis.fe
   }) as unknown as typeof globalThis.fetch;
 }
 
+/** 假 spawn:记录调用,可选在 close 前用 args 造出脚本本该产出的文件。 */
+type SpawnPlan = { out?: string; err?: string; code?: number; onSpawn?: (args: string[]) => void };
+function fakeSpawn(plan: SpawnPlan) {
+  const calls: Array<{ cmd: string; args: string[] }> = [];
+  const impl = ((cmd: string, args: string[]) => {
+    const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; kill: () => void };
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    child.stdout = stdout;
+    child.stderr = stderr;
+    child.kill = () => undefined;
+    calls.push({ cmd, args });
+    setImmediate(() => {
+      if (plan.onSpawn) plan.onSpawn(args);
+      if (plan.out) stdout.emit('data', plan.out);
+      if (plan.err) stderr.emit('data', plan.err);
+      child.emit('close', plan.code ?? 0);
+    });
+    return child;
+  }) as unknown as typeof import('node:child_process').spawn;
+  return { impl, calls };
+}
 const inBattle = { valid: true, map_valid: true, vehicle_type: 'P-51D-30', game_mode: 'domination', army: 'usa' };
 const inMenu = { valid: true, map_valid: false, vehicle_type: '', game_mode: '', army: '' };
 const flying = { valid: true, speed: 480, altitude: 2100, type: 'P-51D-30' };
@@ -484,25 +506,6 @@ describe('对局聊天工具', () => {
 });
 
 describe('发言落地', () => {
-  function fakeSpawn(plan: { out?: string; err?: string; code?: number }) {
-    const calls: Array<{ cmd: string; args: string[] }> = [];
-    const impl = ((cmd: string, args: string[]) => {
-      const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; kill: () => void };
-      const stdout = new EventEmitter();
-      const stderr = new EventEmitter();
-      child.stdout = stdout;
-      child.stderr = stderr;
-      child.kill = () => undefined;
-      calls.push({ cmd, args });
-      setImmediate(() => {
-        if (plan.out) stdout.emit('data', plan.out);
-        if (plan.err) stderr.emit('data', plan.err);
-        child.emit('close', plan.code ?? 0);
-      });
-      return child;
-    }) as unknown as typeof import('node:child_process').spawn;
-    return { impl, calls };
-  }
 
   it('默认档是剪贴板,不碰游戏输入', () => {
     expect(WT_DEFAULTS.chatSendMode).toBe('clipboard');
@@ -547,6 +550,97 @@ describe('发言落地', () => {
     const out = await call(world, 'wt_say', {});
     expect(out).toContain('wt_say text=');
     expect(fake.calls.length).toBe(0);
+    await world.stop();
+  });
+});
+
+describe('隐私与副作用闸', () => {
+  const chatOne = (): Routes => ({
+    state: inMenu,
+    chat: [{ id: 70, msg: 'nice shot', sender: 'pecusgaming', enemy: false, mode: 'All' }],
+  });
+
+  /** 假 spawn 里造出脚本本该产出的两个文件:截图与识别文本。 */
+  function visionSpawn(outText: string, shots: string[]) {
+    return fakeSpawn({
+      out: 'VISION_OK 2',
+      onSpawn: (args) => {
+        const at = (flag: string): number => args.indexOf(flag);
+        const png = String(args[at('-Out') + 1] ?? '');
+        const txt = String(args[at('-TextOut') + 1] ?? '');
+        writeFileSync(png, 'png');
+        writeFileSync(txt, outText);
+        shots.push(png);
+      },
+    });
+  }
+
+  it('视觉探测默认删掉整屏截图,只留识别文本', async () => {
+    const shots: string[] = [];
+    const fake = visionSpawn('击毁 T-34\n胜利', shots);
+    const { world } = await boot({ visionMode: 'probe' }, () => ({ state: inMenu }), undefined, fake.impl);
+    const out = await call(world, 'wt_vision_probe');
+    expect(out).toContain('截图已删');
+    expect(out).toContain('击毁');
+    expect(existsSync(shots[0])).toBe(false);
+    await world.stop();
+  });
+
+  it('visionKeepShot 打开时才保留截图', async () => {
+    const shots: string[] = [];
+    const fake = visionSpawn('胜利', shots);
+    const { world } = await boot(
+      { visionMode: 'probe', visionKeepShot: true },
+      () => ({ state: inMenu }),
+      undefined,
+      fake.impl,
+    );
+    const out = await call(world, 'wt_vision_probe');
+    expect(out).toContain('截图:');
+    expect(existsSync(shots[0])).toBe(true);
+    await world.stop();
+  });
+
+  it('预演与确认必须是同一句,换内容就不发', async () => {
+    const fake = fakeSpawn({ out: 'WINDOW 9 aces.exe\nSENT 9' });
+    const { world } = await boot({ chatSendMode: 'confirm' }, () => ({ state: inMenu }), undefined, fake.impl);
+    await call(world, 'wt_say', { text: 'push now!' });
+    const mismatched = await call(world, 'wt_say', { text: 'go go go', confirm: true });
+    expect(mismatched).toContain('不一致');
+    expect(fake.calls.length).toBe(0);
+    await call(world, 'wt_say', { text: 'push now!' });
+    const sent = await call(world, 'wt_say', { text: 'push now!', confirm: true });
+    expect(sent).toContain('已写进发言栏');
+    expect(fake.calls.length).toBe(1);
+    await world.stop();
+  });
+
+  it('一分钟内直写超过三次就拦住', async () => {
+    const fake = fakeSpawn({ out: 'WINDOW 9 aces.exe\nSENT 2' });
+    const { world } = await boot({ chatSendMode: 'auto' }, () => ({ state: inMenu }), undefined, fake.impl);
+    const outs: string[] = [];
+    for (let i = 0; i < 4; i += 1) outs.push(await call(world, 'wt_say', { text: 'gg' }));
+    expect(outs[0]).toContain('已写进发言栏');
+    expect(outs[3]).toContain('上限 3 次');
+    expect(fake.calls.length).toBe(3);
+    await world.stop();
+  });
+
+  it('同一批聊天一分钟内复用译文,不再花额度', async () => {
+    let used = 0;
+    const { world, host } = await boot({}, chatOne);
+    host.cognition = {
+      request: async () => {
+        used += 1;
+        return { text: '打得好' };
+      },
+    };
+    const first = await call(world, 'wt_chat');
+    const second = await call(world, 'wt_chat');
+    expect(first).toContain('打得好');
+    expect(second).toContain('打得好');
+    expect(second).toContain('复用上次译文');
+    expect(used).toBe(1);
     await world.stop();
   });
 });

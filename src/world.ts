@@ -1,3 +1,4 @@
+import { rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { ToolDef, TriggerMode, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
@@ -45,6 +46,13 @@ const CHAT_BUFFER = 60;
 const MAX_DRAFT = 300;
 /** 游戏发言栏能塞下的长度;超过这条就不是对局里能说的话了。 */
 const MAX_OUTGOING = 200;
+/** 一分钟内最多直写几次发言栏;聊天刷屏是别人能看见的后果,得单独限量。 */
+const MAX_SAY_PER_MINUTE = 3;
+const SAY_WINDOW_MS = 60_000;
+/** 预演与确认之间最多隔多久,且文本必须一字不差。 */
+const SAY_DRAFT_TTL_MS = 120_000;
+/** 同一批聊天的译文复用窗口;同一批反复呼唤不该反复花额度。 */
+const CHAT_CACHE_MS = 60_000;
 /** 每天最多手动清零几次账本;清零是绕过预算的唯一手段,得留痕并限量。 */
 const MAX_RESETS_PER_DAY = 3;
 /** 模型调用的滑动窗口与配额都在这里定,配置只能在这个范围内调。 */
@@ -227,6 +235,12 @@ export class WtWorld implements World {
   /** 读过的对局聊天,进战局时清空(新一局的 id 会从头开始)。 */
   private chatHistory: ChatLine[] = [];
   private chatCursor = 0;
+  /** 直写发言栏的时间戳;和模型调用分开计,因为它是别人能看见的副作用。 */
+  private sayCalls: number[] = [];
+  /** 预演过的文本;confirm 时必须一字不差,防止预演 A 实际发 B。 */
+  private sayDraft: { text: string; at: number } | null = null;
+  /** 同一批聊天的译文缓存,省掉重复呼唤的模型调用。 */
+  private chatCache: { key: string; text: string; at: number } | null = null;
 
   constructor(opts: WtWorldOptions) {
     this.opts = opts;
@@ -494,7 +508,7 @@ export class WtWorld implements World {
     const cfg = this.opts.cfg;
     return cfg.llmMode !== 'off' && cfg.llmApiKey.trim().length > 0;
   }
-  private async composeText(material: string, instruction: string, template: () => string): Promise<string> {
+  private async composeText(material: string, instruction: string, template: () => string, maxChars?: number): Promise<string> {
     const cfg = this.opts.cfg;
     if (cfg.llmMode === 'off') {
       this.lastLlmNote = '文案模型已关闭';
@@ -512,7 +526,7 @@ export class WtWorld implements World {
       material,
       instruction,
       template,
-      maxInputChars: clamp(cfg.maxInputChars, 200, 8000),
+      maxInputChars: clamp(maxChars ?? cfg.maxInputChars, 200, 8000),
       maxOutputTokens: clamp(cfg.maxOutputTokens, 32, 1024),
       dailyBudgetYuan: Math.max(0, cfg.dailyBudgetYuan),
       maxCallsPerDay: clamp(cfg.maxCallsPerDay, 1, 5000),
@@ -765,10 +779,28 @@ export class WtWorld implements World {
           }),
         ].join('\n');
         const label = chatTargetLabel(target, lang);
+        // 同一批聊天反复呼唤不该反复花额度:按「目标语言 + 条数 + 最后一条 id」做一分钟缓存。
+        const cacheKey = target + '|' + lang + '|' + lines.length + '|' + String(lines[lines.length - 1]?.id ?? 0);
+        const cached = this.chatCache;
+        if (
+          this.hasModelChannel() &&
+          cached !== null &&
+          cached.key === cacheKey &&
+          this.nowMs() - cached.at < CHAT_CACHE_MS
+        ) {
+          return original + '\n\n🗣 ' + label + ':\n' + cached.text + '\n(同一批聊天一分钟内复用上次译文,没再花额度)';
+        }
         if (!this.hasModelChannel()) {
           return original + '\n\n🗣 ' + label + ':\n' + chatDelegated(target, lang);
         }
-        const text = await this.composeText(material, chatInstruction(target, lang), () => chatDelegated(target, lang));
+        // 聊天比播报长得多,单独给预算;用播报的 1200 字符会把后面的条目截掉,用户重试反而更费。
+        const text = await this.composeText(
+          material,
+          chatInstruction(target, lang),
+          () => chatDelegated(target, lang),
+          clamp(cfg.chatMaxInputChars, 200, 8000),
+        );
+        this.chatCache = { key: cacheKey, text, at: this.nowMs() };
         return original + '\n\n🗣 ' + label + ':\n' + text;
       },
     };
@@ -804,6 +836,8 @@ export class WtWorld implements World {
           ].join('\n');
         }
         if (cfg.chatSendMode === 'confirm' && args.confirm !== true) {
+          // 记住这次预演的原文;下一次 confirm 必须一字不差,防止「预演 A、真发 B」。
+          this.sayDraft = { text, at: this.nowMs() };
           return [
             '📝 预演(还没发):',
             '「' + text + '」',
@@ -811,6 +845,26 @@ export class WtWorld implements World {
             '发送方式:把游戏窗口抢回前台 → Enter 打开输入框 → 逐字输入 → Enter 发出;不走剪贴板,不发鼠标事件。',
           ].join('\n');
         }
+        if (cfg.chatSendMode === 'confirm') {
+          const draft = this.sayDraft;
+          this.sayDraft = null;
+          if (!draft || draft.text !== text || this.nowMs() - draft.at > SAY_DRAFT_TTL_MS) {
+            return [
+              '⚠️ 要发的内容和刚才预演的不一致(或预演已经超过 2 分钟),这次不发。',
+              '先不带 confirm 调一次看文本,再带 confirm=true 发同一句 —— 这一步就是防「预演的是 A、真发的是 B」。',
+            ].join('\n');
+          }
+        }
+        // 直写是别人能看见的副作用:聊天刷屏会被队友举报,所以单独限速,剪贴板不限。
+        const nowMs = this.nowMs();
+        this.sayCalls = this.sayCalls.filter((at) => nowMs - at < SAY_WINDOW_MS);
+        if (this.sayCalls.length >= MAX_SAY_PER_MINUTE) {
+          return [
+            '⚠️ 一分钟内已经直写 ' + this.sayCalls.length + ' 次(上限 ' + MAX_SAY_PER_MINUTE + ' 次),先停一下。',
+            '确实还要说,就用剪贴板那条路:改成 clipboard 档复制,或自己粘 —— 复制不限速。',
+          ].join('\n');
+        }
+        this.sayCalls.push(nowMs);
         const sent = await sendToGame({
           dataDir: this.opts.dataDir,
           text,
@@ -840,10 +894,24 @@ export class WtWorld implements World {
         const parsed = parseRegion(argRegion || cfg.visionRegion.trim());
         if ('error' in parsed) return '视觉探测没启动:' + parsed.error;
         const region = parsed.region;
-        const result = await probeVision({ dataDir: this.opts.dataDir, region });
+        const result = await probeVision({
+          dataDir: this.opts.dataDir,
+          region,
+          ...(this.opts.spawnImpl ? { spawnImpl: this.opts.spawnImpl } : {}),
+        });
         if (!result.ok) return '视觉探测失败:' + (result.error ?? '未知原因');
         const hints = extractVisionHints(result.text).slice(0, MAX_VISION_HINTS);
-        const lines = ['🖼 视觉探测完成', '耗时 ' + result.ms + ' ms · 识别 ' + result.lines + ' 行', '截图:' + result.pngPath];
+        // 整屏截图里可能有别的窗口内容,默认用完就删,只留识别文本。
+        let shotLine = '截图:' + result.pngPath;
+        if (cfg.visionKeepShot !== true) {
+          try {
+            rmSync(result.pngPath, { force: true });
+            shotLine = '截图已删(整屏截图含别的窗口内容;要留就把 worlds.wt.visionKeepShot 打开)';
+          } catch {
+            shotLine = '截图没删掉:' + result.pngPath;
+          }
+        }
+        const lines = ['🖼 视觉探测完成', '耗时 ' + result.ms + ' ms · 识别 ' + result.lines + ' 行', shotLine];
         if (result.text.trim()) lines.push('识别文本(前 400 字):' + clip(result.text, 400));
         else lines.push('画面里没识别出文字(窗口被遮挡或分辨率太低)。');
         if (hints.length > 0) lines.push('线索:' + hints.map((hint) => '[' + hint.kind + '] ' + clip(hint.text, 30)).join(' · '));

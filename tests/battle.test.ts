@@ -195,7 +195,7 @@ describe('战局状态机', () => {
     expect(watcher.tally.kills).toBe(0);
   });
 
-  it('refresh 更新读数但不产事件', async () => {
+  it('refresh 更新读数并同步在局标志,但不产事件', async () => {
     const routes: Routes = {
       state: inBattle,
       indicators: { valid: true, speed: 512, altitude: 3300, type: 'P-51D-30' },
@@ -207,7 +207,9 @@ describe('战局状态机', () => {
     expect(snapshot.speed).toBe(512);
     expect(snapshot.enemies).toBe(1);
     expect(snapshot.allies).toBe(1);
-    expect(watcher.inBattleNow).toBe(false);
+    // refresh 只读数、不推事件;但状态标志要跟着同步,否则 wt_battle_state 会在局里报「不在战局」。
+    expect(watcher.inBattleNow).toBe(true);
+    expect(watcher.tally.kills).toBe(0);
   });
 });
 

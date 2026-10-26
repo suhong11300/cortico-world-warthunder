@@ -21,10 +21,14 @@ export interface WtConfigSection {
   visionMode: 'off' | 'probe';
   /** 截图区域 "x,y,w,h",留空表示整屏。 */
   visionRegion: string;
+  /** 截图是否留在本地。默认不留:整屏截图里可能有别的窗口内容。 */
+  visionKeepShot: boolean;
   /** 一次最多翻译多少条对局对话。 */
   chatLines: number;
   /** 翻译目标语言:zh / en / ja / ru。 */
   chatTarget: string;
+  /** 翻译聊天时单独给模型的字符预算,比播报大;仍受每日 token 上限约束。 */
+  chatMaxInputChars: number;
   /** 发言的落地方式:clipboard 复制到剪贴板(最稳),off 只出文本,confirm 预演后直写发言栏,auto 直接直写。 */
   chatSendMode: 'off' | 'clipboard' | 'confirm' | 'auto';
   /** Enter 打开输入框后等多久再打字(毫秒)。 */
@@ -66,9 +70,11 @@ export const WT_DEFAULTS: WtConfigSection = {
   kbAllowPrivate: false,
   visionMode: 'off',
   visionRegion: '',
+  visionKeepShot: false,
   chatLines: 12,
   chatTarget: 'zh',
   chatSendMode: 'clipboard',
+  chatMaxInputChars: 4000,
   chatSendDelayMs: 180,
   llmMode: 'host',
   llmBaseUrl: 'https://api.deepseek.com',
@@ -101,11 +107,13 @@ const ENTRIES: Entry[] = [
   { key: 'worlds.wt.kbUrl', title: '知识库源', description: '一个返回 {version, entries} 的 JSON 地址;留空则只用内置词条。', prop: { type: 'string' } },
   { key: 'worlds.wt.kbAllowPrivate', title: '允许内网知识库源', description: '关着时知识库源只能是公网 http(s);要连本机自建服务才打开。云元数据地址永远拒绝。', prop: { type: 'boolean' } },
   { key: 'worlds.wt.kbAutoUpdateHours', title: '自动更新(小时)', description: '开机后每隔多少小时检查一次知识库源;0 表示只在手动调用时更新。', prop: { type: 'number' } },
+  { key: 'worlds.wt.visionKeepShot', title: '保留截图', description: '默认关:OCR 用完就把整屏截图删掉,只留识别文本。打开后会一直留在 data/wt/ 下,方便自己回看。', prop: { type: 'boolean' } },
   { key: 'worlds.wt.visionMode', title: '视觉降级', description: 'off 关闭;probe 允许截图与 OCR 自检,用于官方遥测不可用时。', prop: { type: 'string', enum: ['off', 'probe'] } },
   { key: 'worlds.wt.chatLines', title: '对话翻译条数', description: '一次最多取多少条对局聊天交给模型翻译;越多越贵,12 条左右够看清上下文。', prop: { type: 'number', minimum: 1, maximum: 40 } },
   { key: 'worlds.wt.chatSendMode', title: '发言方式', description: 'clipboard 复制到剪贴板,自己 Ctrl+V 再回车(最稳,不碰游戏);off 只出文本;confirm 先预演、再确认才用键盘直写发言栏;auto 直接直写。', prop: { type: 'string', enum: ['off', 'clipboard', 'confirm', 'auto'] } },
   { key: 'worlds.wt.chatSendDelayMs', title: '发送间隔(毫秒)', description: '按 Enter 打开聊天框后等多久再逐字输入;游戏卡顿时调大。', prop: { type: 'number', minimum: 60, maximum: 2000 } },
   { key: 'worlds.wt.chatTarget', title: '翻译成', description: '对局对话要翻成的语言;玩家名始终保持原文。', prop: { type: 'string', enum: ['zh', 'en', 'ja', 'ru'] } },
+  { key: 'worlds.wt.chatMaxInputChars', title: '翻译输入上限(字符)', description: '翻译对局聊天时单独给模型的字符预算。播报仍用「输入上限」那一项;两边都受每日 token 上限约束。', prop: { type: 'number', minimum: 200, maximum: 8000 } },
   { key: 'worlds.wt.visionRegion', title: '截图区域', description: '形如 "x,y,w,h";留空表示整屏。缩到记分板或击杀提示能显著提速。', prop: { type: 'string' } },
   { key: 'worlds.wt.llmMode', title: '文案模型', description: 'host 用宿主当前模型;openai 用下面的兼容接口;off 只用模板文案。', prop: { type: 'string', enum: ['host', 'openai', 'off'] } },
   { key: 'worlds.wt.llmBaseUrl', title: '接口地址', description: 'OpenAI 兼容的 /v1 前缀地址,例如 https://api.deepseek.com。', prop: { type: 'string' } },

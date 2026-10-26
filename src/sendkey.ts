@@ -9,13 +9,13 @@
  * 打字那几百毫秒里玩家自己按的键会一起进聊天框,所以默认关闭、并且要显式确认才发。
  */
 import { spawn as spawnChild } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-/** 落盘用的 PowerShell 5.1 脚本;纯 ASCII,中文正文走 base64 参数。 */
+/** 落盘用的 PowerShell 5.1 脚本;纯 ASCII,中文正文走临时文件 + UTF8 读入。 */
 export const SEND_SCRIPT = [
   "param(",
-  "  [Parameter(Mandatory=$true)][string]$TextB64,",
+  "  [Parameter(Mandatory=$true)][string]$TextFile,",
   "  [int]$DelayMs = 180,",
   "  [string]$ProcessName = \"aces.exe\",",
   "  [switch]$DryRun",
@@ -111,7 +111,8 @@ export const SEND_SCRIPT = [
   "}",
   "",
   "try {",
-  "  $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($TextB64))",
+  "  # Text comes from a file: command-line arguments are visible to other processes.",
+  "  $text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)",
   "} catch {",
   "  Write-Output \"BAD_TEXT\"",
   "  exit 4",
@@ -148,6 +149,11 @@ export const SEND_SCRIPT = [
 /** 脚本落在 <dataDir>/wt/sendkey.ps1；每次调用覆盖写，避免旧版本残留。 */
 export function sendScriptPath(dataDir: string): string {
   return join(dataDir, 'wt', 'sendkey.ps1');
+}
+
+/** 待发文本的临时落点:发完即删,不进命令行也不长期留存。 */
+export function outboxPath(dataDir: string): string {
+  return join(dataDir, 'wt', 'outbox.txt');
 }
 
 export function ensureSendScript(dataDir: string): string {
@@ -221,6 +227,15 @@ export async function sendToGame(opts: SendToGameOptions): Promise<SendResult> {
     return { ok: false, sent: 0, error: '发送脚本落盘失败：' + describeSendError(error), raw: '' };
   }
   const runner = opts.spawnImpl ?? spawnChild;
+  // 文本先落成临时文件再让脚本读:放进命令行的话,同机任何进程都能从
+  // Win32_Process.CommandLine 里读到这段聊天草稿。
+  const outbox = outboxPath(opts.dataDir);
+  try {
+    mkdirSync(dirname(outbox), { recursive: true });
+    writeFileSync(outbox, text, 'utf8');
+  } catch (error) {
+    return { ok: false, sent: 0, error: '写临时文本失败：' + describeSendError(error), raw: '' };
+  }
   const args = [
     '-NoProfile',
     '-NonInteractive',
@@ -228,8 +243,8 @@ export async function sendToGame(opts: SendToGameOptions): Promise<SendResult> {
     'Bypass',
     '-File',
     script,
-    '-TextB64',
-    Buffer.from(text, 'utf8').toString('base64'),
+    '-TextFile',
+    outbox,
     '-DelayMs',
     String(Math.max(60, Math.trunc(opts.delayMs ?? 180))),
     '-ProcessName',
@@ -245,6 +260,7 @@ export async function sendToGame(opts: SendToGameOptions): Promise<SendResult> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      try { rmSync(outbox, { force: true }); } catch { /* 删不掉也不影响结果 */ }
       resolve(result);
     };
     const timer = setTimeout(() => {
@@ -277,7 +293,8 @@ function describeSendError(error: unknown): string {
  * 把文本放进 Windows 剪贴板。
  *
  * 比键盘直写稳:不抢前台、不碰游戏输入、出错也只是没复制上。中文必须走
- * base64 → Set-Clipboard,不要用 clip.exe(它按 OEM 代码页读,中文会变乱码)。
+ * 文本走临时文件 + UTF8 读入再 Set-Clipboard,不要用 clip.exe(它按 OEM 代码页读,中文会变乱码),
+ * 也不要把正文塞进 -Command 命令行(同机进程能看到)。
  */
 export async function copyToClipboard(opts: {
   text: string;
@@ -286,8 +303,14 @@ export async function copyToClipboard(opts: {
 }): Promise<{ ok: boolean; error?: string }> {
   if (process.platform !== 'win32') return { ok: false, error: '剪贴板方案只支持 Windows。' };
   if (!opts.text.trim()) return { ok: false, error: '要复制的文本是空的。' };
-  const b64 = Buffer.from(opts.text, 'utf8').toString('base64');
-  const script = "$t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')); Set-Clipboard -Value $t; Write-Output CLIP_OK";
+  const dataFile = join(process.env.TEMP ?? '.', 'wt-clipboard-' + Date.now().toString(36) + '.txt');
+  try {
+    writeFileSync(dataFile, opts.text, 'utf8');
+  } catch (error) {
+    return { ok: false, error: '写临时文件失败：' + describeSendError(error) };
+  }
+  const quoted = dataFile.replace(/'/g, "''");
+  const script = "$t=[System.IO.File]::ReadAllText('" + quoted + "', [System.Text.Encoding]::UTF8); Set-Clipboard -Value $t; Write-Output CLIP_OK";
   const runner = opts.spawnImpl ?? spawnChild;
   return await new Promise((resolve) => {
     const child = runner('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -298,6 +321,7 @@ export async function copyToClipboard(opts: {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      try { rmSync(dataFile, { force: true }); } catch { /* 删不掉也不影响结果 */ }
       resolve(result);
     };
     const timer = setTimeout(() => {

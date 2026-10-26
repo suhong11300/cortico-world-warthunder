@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cleanOutgoing, copyToClipboard, ensureSendScript, parseSendOutput, sendScriptPath, sendToGame } from '../src/sendkey.ts';
@@ -79,13 +79,19 @@ describe('PowerShell 脚本', () => {
 });
 
 describe('剪贴板落地', () => {
-  it('Set-Clipboard 成功时返回 ok,并把 base64 传进命令行', async () => {
+  it('Set-Clipboard 成功时返回 ok,正文走临时文件而不进命令行', async () => {
     const dir = scratch();
     const fake = fakeSpawn({ out: 'CLIP_OK' });
     const result = await copyToClipboard({ text: '打得好', spawnImpl: fake.impl });
     expect(result.ok).toBe(true);
     expect(fake.calls[0].cmd).toBe('powershell.exe');
-    expect(fake.calls[0].args.join(' ')).toContain(Buffer.from('打得好', 'utf8').toString('base64'));
+    const joined = fake.calls[0].args.join(' ');
+    expect(joined).toContain('ReadAllText');
+    // 正文不上命令行:同机任何进程都能读到别人的 CommandLine。
+    expect(joined).not.toContain('打得好');
+    const matched = joined.match(/ReadAllText\('([^']+)'/);
+    expect(matched).not.toBe(null);
+    expect(existsSync(String(matched?.[1] ?? ''))).toBe(false);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -111,7 +117,8 @@ describe('发言栏直写', () => {
     const result = await sendToGame({ dataDir: dir, text: 'gg wp', spawnImpl: fake.impl });
     expect(result.ok).toBe(true);
     expect(result.sent).toBe(5);
-    expect(fake.calls[0].args).toContain('-TextB64');
+    expect(fake.calls[0].args).toContain('-TextFile');
+    expect(fake.calls[0].args.join(' ')).not.toContain('gg wp');
     rmSync(dir, { recursive: true, force: true });
   });
 
