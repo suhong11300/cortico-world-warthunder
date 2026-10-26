@@ -890,7 +890,9 @@ export class WtWorld implements World {
     const cfg = this.opts.cfg;
     if (cfg.llmMode === 'off') return 'off(只用模板文案)';
     if (cfg.llmMode === 'openai') return 'openai(' + (scrubUrl(cfg.llmBaseUrl) || '未填地址') + ' · ' + (cfg.llmModel || '未填模型') + ')';
-    return this.host?.cognition ? 'host(宿主模型)' : 'host(宿主没提供 cognition,会退模板)';
+    if (this.host?.cognition) return 'host(宿主模型)';
+    if (cfg.llmApiKey.trim()) return 'host + 自填 key(' + cfg.llmModel + ')';
+    return 'host(宿主没提供 cognition 也没填 key:播报走模板,翻译交给对话自己)';
   }
 
   private reportStatus(): string {
