@@ -34,6 +34,8 @@ function baseOpts(patch: Partial<ComposeOptions> = {}): ComposeOptions {
     maxInputChars: 1200,
     maxOutputTokens: 160,
     dailyBudgetYuan: 1,
+    maxCallsPerDay: 200,
+    maxTokensPerDay: 60000,
     price,
     apiKey: '',
     baseUrl: 'https://api.deepseek.com',
@@ -67,14 +69,14 @@ describe('计费与端点', () => {
 
   it('账本按天隔离:换日就归零', () => {
     expect(readSpend(dir, today).yuan).toBe(0);
-    writeSpend(dir, { date: today, inTokens: 100, outTokens: 50, yuan: 0.5, calls: 2, blocked: 0 });
+    writeSpend(dir, { date: today, inTokens: 100, outTokens: 50, yuan: 0.5, calls: 2, blocked: 0, resets: 0 });
     expect(readSpend(dir, today).yuan).toBeCloseTo(0.5);
     expect(readSpend(dir, '2026-10-28').yuan).toBe(0);
     expect(readSpend(dir, '2026-10-28').calls).toBe(0);
   });
 
   it('chargeSpend 按百万 token 单价累加', () => {
-    const book = chargeSpend({ date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 0, blocked: 0 }, 1_000_000, 500_000, price);
+    const book = chargeSpend({ date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 0, blocked: 0, resets: 0 }, 1_000_000, 500_000, price);
     expect(book.inTokens).toBe(1_000_000);
     expect(book.outTokens).toBe(500_000);
     expect(book.yuan).toBeCloseTo(2);
@@ -92,7 +94,7 @@ describe('compose 的降级顺序', () => {
   });
 
   it('预算用完就不再调模型,blocked 计数增加', async () => {
-    writeSpend(dir, { date: today, inTokens: 0, outTokens: 0, yuan: 1, calls: 1, blocked: 0 });
+    writeSpend(dir, { date: today, inTokens: 0, outTokens: 0, yuan: 1, calls: 1, blocked: 0, resets: 0 });
     const result = await compose(baseOpts({ mode: 'host', dailyBudgetYuan: 1 }));
     expect(result.source).toBe('template');
     expect(result.reason).toContain('预算');
@@ -170,5 +172,62 @@ describe('compose 的降级顺序', () => {
   it('describeError 对非 Error 也给出字符串', () => {
     expect(describeError(new Error('boom'))).toBe('boom');
     expect(describeError('raw')).toBe('raw');
+  });
+});
+
+describe('配额闸与脱敏', () => {
+  it('调用次数到上限就退模板:计价填 0 时这条是唯一还准的闸', async () => {
+    // 计价全 0 时 yuan 永远是 0,金额闸不会触发;次数闸必须兜住这条路。
+    writeSpend(dir, { date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 3, blocked: 0, resets: 0 });
+    let called = false;
+    const result = await compose(baseOpts({
+      mode: 'host',
+      price: { inPerM: 0, outPerM: 0 },
+      maxCallsPerDay: 3,
+      cognition: { request: async () => { called = true; return { text: '不该被调用' }; } },
+    }));
+    expect(called).toBe(false);
+    expect(result.source).toBe('template');
+    expect(result.reason).toContain('调用已达上限');
+  });
+
+  it('token 总量到上限也退模板', async () => {
+    writeSpend(dir, { date: today, inTokens: 60_000, outTokens: 0, yuan: 0.06, calls: 1, blocked: 0, resets: 0 });
+    const result = await compose(baseOpts({ mode: 'host', maxTokensPerDay: 60_000 }));
+    expect(result.source).toBe('template');
+    expect(result.reason).toContain('token');
+  });
+
+  it('dailyBudgetYuan=0 表示不按金额限,只看次数与 token', async () => {
+    const result = await compose(baseOpts({
+      mode: 'host',
+      dailyBudgetYuan: 0,
+      cognition: { request: async () => ({ text: '照样能说' }) },
+    }));
+    expect(result.source).toBe('host');
+    expect(result.text).toBe('照样能说');
+  });
+
+  it('账本里的清零次数会被读回来,用于限制绕过', () => {
+    writeSpend(dir, { date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 0, blocked: 0, resets: 2 });
+    expect(readSpend(dir, today).resets).toBe(2);
+  });
+
+  it('接口回显里带密钥时 reason 会被脱敏', async () => {
+    const fetchImpl = (async () => ({
+      ok: false,
+      status: 401,
+      text: async () => 'bad key: Bearer sk-abcdefgh12345678 与 token=deadbeefdeadbeef',
+      json: async () => ({}),
+    })) as unknown as typeof globalThis.fetch;
+    const result = await compose(baseOpts({
+      mode: 'openai',
+      apiKey: 'sk-abcdefgh12345678',
+      fetchImpl,
+    }));
+    expect(result.source).toBe('template');
+    expect(result.reason).not.toContain('abcdefgh12345678');
+    expect(result.reason).toContain('***');
+    expect(result.reason).toContain('401');
   });
 });

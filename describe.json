@@ -187,6 +187,11 @@
           "reset": {
             "type": "boolean",
             "default": false
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "准备清零时必须一起传 true;防止一次误调就把预算绕过去。"
           }
         }
       },

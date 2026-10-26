@@ -19,9 +19,10 @@ interface Routes {
 }
 
 /** 8111 的假服务:按 lastEvt / lastDmg 真过滤,和真接口语义一致。 */
-function fakeFetch(read: () => Routes): typeof globalThis.fetch {
+function fakeFetch(read: () => Routes, capture?: string[]): typeof globalThis.fetch {
   return (async (input: unknown) => {
     const url = String(input);
+    if (capture) capture.push(url);
     const routes = read();
     if (routes.broken) return { ok: false, status: 500, text: async () => 'boom' };
     let body: unknown = {};
@@ -61,17 +62,17 @@ interface Rig {
   cfg: WtConfigSection;
 }
 
-function rig(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({})): Rig {
+function rig(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({}), capture?: string[]): Rig {
   const dataDir = mkdtempSync(join(tmpdir(), 'wt-data-'));
   dirs.push(dataDir);
   const cfg: WtConfigSection = { ...WT_DEFAULTS, ...patch };
-  const world = new WtWorld({ cfg, timezone: 'Asia/Shanghai', dataDir, now: () => 100_000, fetchImpl: fakeFetch(read) });
+  const world = new WtWorld({ cfg, timezone: 'Asia/Shanghai', dataDir, now: () => 100_000, fetchImpl: fakeFetch(read, capture) });
   const host = new FakeHost() as Rig['host'];
   return { world, host, cfg };
 }
 
-async function boot(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({})): Promise<Rig> {
-  const rigged = rig(patch, read);
+async function boot(patch: Partial<WtConfigSection> = {}, read: () => Routes = () => ({}), capture?: string[]): Promise<Rig> {
+  const rigged = rig(patch, read, capture);
   await rigged.world.start(rigged.host);
   return rigged;
 }
@@ -292,5 +293,62 @@ describe('工具', () => {
     expect(text).toContain('已推送到对话');
     expect(host.events.at(-1)?.type).toBe('wt.commentary');
     await world.stop();
+  });
+});
+
+describe('滥用面的闸', () => {
+  it('一次轮询里击毁成堆,也只逐条开口三次,战绩照实累加', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
+    const { world, host } = await boot({}, () => routes);
+    await pollOnce(world);
+    routes.hud = {
+      events: [],
+      damage: [1, 2, 3, 4, 5, 6].map((id) => ({ id, msg: 'destroyed T-34' })),
+    };
+    await pollOnce(world);
+    const kills = host.events.filter((event) => event.type === 'wt.kill');
+    expect(kills).toHaveLength(3);
+    expect(await call(world, 'wt_battle_state')).toContain('本局:6 杀');
+  });
+
+  it('清零账本要先确认,而且一天最多三次', async () => {
+    const { world } = await boot();
+    expect(await call(world, 'wt_budget', { reset: true })).toContain('要先确认');
+    expect(await call(world, 'wt_budget')).toContain('今日清零账本 0 次');
+    for (let i = 1; i <= 3; i += 1) {
+      expect(await call(world, 'wt_budget', { reset: true, confirm: true })).toContain('第 ' + i + ' 次');
+    }
+    const last = await call(world, 'wt_budget', { reset: true, confirm: true });
+    expect(last).toContain('不再清零');
+    expect(await call(world, 'wt_budget')).toContain('今日清零账本 3 次');
+  });
+
+  it('遥测地址不是本机时回落到 127.0.0.1,请求不会打到别处', async () => {
+    const seen: string[] = [];
+    const { world } = await boot({ gameHost: '198.51.100.7' }, () => ({ state: inMenu }), seen);
+    await pollOnce(world);
+    expect(seen.length).toBeGreaterThan(0);
+    for (const url of seen) expect(url.startsWith('http://127.0.0.1:8111')).toBe(true);
+    expect(await call(world, 'wt_status')).toContain('已回落到 127.0.0.1');
+  });
+
+  it('知识库源指向云元数据时直接拒绝,一个请求都不发', async () => {
+    const seen: string[] = [];
+    const { world } = await boot({ kbUrl: 'http://169.254.169.254/latest/meta-data/' }, () => ({}), seen);
+    const text = await call(world, 'wt_kb_update');
+    expect(text).toContain('云元数据');
+    expect(seen.filter((url) => url.includes('169.254.169.254'))).toHaveLength(0);
+  });
+
+  it('每分钟调用上限会拦住第二句,并说明几秒后再试', async () => {
+    let used = 0;
+    const { world, host } = await boot({ maxCallsPerMinute: 1 }, () => ({ state: inBattle, indicators: flying }));
+    host.cognition = { request: async () => { used += 1; return { text: '第一句用模型说的' }; } };
+    const first = await call(world, 'wt_commentary');
+    expect(first).toContain('第一句用模型说的');
+    const second = await call(world, 'wt_commentary');
+    expect(second).not.toContain('第一句用模型说的');
+    expect(used).toBe(1);
+    expect(await call(world, 'wt_status')).toContain('本分钟模型调用已达上限 1 次');
   });
 });

@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { assertFetchableUrl } from './guard.ts';
 import { join } from 'node:path';
 import { KB_SEED, KB_SEED_VERSION } from './kb-seed.ts';
 import type { KbEntry, KbKind } from './kb-types.ts';
@@ -181,21 +182,41 @@ export function findVehicle(entries: KbEntry[], name: string): KbEntry | null {
   return null;
 }
 
-function asStringList(value: unknown): string[] | undefined {
+/**
+ * 清洗一段外部文本。
+ *
+ * 知识库源是别人给的 JSON,词条正文会原样进工具回执、进而进模型上下文:
+ * 控制字符会打乱排版,零宽字符能让"看不见的指令"藏在搜索结果里,超长正文会撑爆输入预算。
+ * 统一在这里去控制字符、压平空白、截断长度。
+ */
+export function cleanText(value: string, maxLength: number): string {
+  const flat = value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return flat.length > maxLength ? flat.slice(0, maxLength) : flat;
+}
+
+function asStringList(value: unknown, maxLength = 40): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const out = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim());
+  const out = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => cleanText(item, maxLength))
+    .filter((item) => item.length > 0);
   return out.length > 0 ? out : undefined;
 }
 
-function asOptionalString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+function asOptionalString(value: unknown, maxLength = 200): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = cleanText(value, maxLength);
+  return clean.length > 0 ? clean : undefined;
 }
 
 /** 校验远程载荷;不合法只跳过单条,整体形状错了才抛。 */
 export function parseRemoteKb(payload: unknown): RemoteKb {
   if (typeof payload !== 'object' || payload === null) throw new Error('知识库载荷不是对象');
   const record = payload as Record<string, unknown>;
-  const version = asOptionalString(record.version);
+  const version = asOptionalString(record.version, 40);
   if (!version) throw new Error('知识库载荷缺少 version');
   const rawEntries = record.entries;
   if (!Array.isArray(rawEntries)) throw new Error('知识库载荷缺少 entries 数组');
@@ -208,24 +229,24 @@ export function parseRemoteKb(payload: unknown): RemoteKb {
       continue;
     }
     const item = raw as Record<string, unknown>;
-    const id = asOptionalString(item.id);
-    const name = asOptionalString(item.name);
-    const summary = asOptionalString(item.summary);
-    const kind = asOptionalString(item.kind);
+    const id = asOptionalString(item.id, 80);
+    const name = asOptionalString(item.name, 80);
+    const summary = asOptionalString(item.summary, 600);
+    const kind = asOptionalString(item.kind, 16);
     if (!id || !name || !summary || !kind || !KINDS.includes(kind as KbKind)) {
       skipped += 1;
       continue;
     }
     const entry: KbEntry = { id, kind: kind as KbKind, name, summary };
-    const aliases = asStringList(item.aliases);
-    if (aliases) entry.aliases = aliases;
-    const tags = asStringList(item.tags);
-    if (tags) entry.tags = tags;
-    const br = asOptionalString(item.br);
+    const aliases = asStringList(item.aliases, 40);
+    if (aliases) entry.aliases = aliases.slice(0, 8);
+    const tags = asStringList(item.tags, 24);
+    if (tags) entry.tags = tags.slice(0, 8);
+    const br = asOptionalString(item.br, 32);
     if (br) entry.br = br;
-    const nation = asOptionalString(item.nation);
+    const nation = asOptionalString(item.nation, 32);
     if (nation) entry.nation = nation;
-    const category = asOptionalString(item.category);
+    const category = asOptionalString(item.category, 40);
     if (category) entry.category = category;
     entries.push(entry);
   }
@@ -241,8 +262,9 @@ export interface FetchKbOptions {
 /** 拉远程知识库;响应体上限 2MB,超时默认 15 秒。 */
 export async function fetchRemoteKb(url: string, opts: FetchKbOptions = {}): Promise<RemoteKb> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
-  const target = url.trim();
-  if (!target) throw new Error('没有配置知识库源');
+  if (!url.trim()) throw new Error('没有配置知识库源');
+  // 私网放不放由调用方(worlds.wt.kbAllowPrivate)决定,这里只保证协议安全、永不碰云元数据。
+  const target = assertFetchableUrl(url, { allowPrivate: true });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 15000);
   try {

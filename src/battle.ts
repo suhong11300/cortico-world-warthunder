@@ -108,6 +108,15 @@ function toHudEvent(raw: unknown): HudEvent | null {
 
 /** 击毁类关键字:不同版本的消息措辞不一样,统一用包含匹配兜一层。 */
 const KILL_WORDS = ['destroyed', 'killed', 'shot down', 'burned', 'shattered', '击毁', '击落'];
+/**
+ * 一次轮询里最多为几条击毁各推一个事件。
+ *
+ * 客户端暂停恢复或长局积压时,hudmsg 可能一口气吐出几十条,每条都要走一次模型:
+ * 一次风暴就能把一天的额度烧完。所以超出的只累加战绩,不再逐条开口。
+ */
+const MAX_KILL_EVENTS = 3;
+/** 全战场播报里最多取几条当素材。 */
+const MAX_HUD_EVENTS = 12;
 const EVENT_WORDS = ['captured', 'lost', 'destroyed', 'killed', 'shot down'];
 
 function looksLikeKill(text: string): boolean {
@@ -351,11 +360,16 @@ export class BattleWatcher {
 
     await this.refreshSnapshot(state);
 
+    let killPushed = 0;
     for (const hit of hud.damage) {
       if (!looksLikeKill(hit.msg + ' ' + hit.type)) continue;
+      // 战绩永远照实累加,限的只是"逐条开口"这件事。
       this.kills += 1;
       this.streak += 1;
       if (this.streak > this.bestStreak) this.bestStreak = this.streak;
+      if (this.behindRaised && this.kills >= this.deaths) this.behindRaised = false;
+      if (killPushed >= MAX_KILL_EVENTS) continue;
+      killPushed += 1;
       out.push({
         kind: 'kill',
         total: this.kills,
@@ -363,7 +377,6 @@ export class BattleWatcher {
         detail: (hit.msg || hit.type || '').trim(),
         snapshot: this.snapshot,
       });
-      if (this.behindRaised && this.kills >= this.deaths) this.behindRaised = false;
     }
 
     const ind = await this.client.indicators();
@@ -378,11 +391,14 @@ export class BattleWatcher {
       }
     }
 
+    let hudPushed = 0;
     for (const event of hud.events) {
+      if (hudPushed >= MAX_HUD_EVENTS) break;
       const text = (event.msg || event.type || '').trim();
       if (!text) continue;
       const lower = text.toLowerCase();
       if (!EVENT_WORDS.some((word) => lower.includes(word))) continue;
+      hudPushed += 1;
       out.push({ kind: 'hud', detail: text });
     }
 

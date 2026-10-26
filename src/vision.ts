@@ -1,4 +1,5 @@
 import { spawn as spawnChild } from 'node:child_process';
+import { parseRegion } from './guard.ts';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -79,7 +80,10 @@ export async function probeVision(opts: VisionProbeOptions): Promise<VisionResul
 
   const runner = opts.spawnImpl ?? spawnChild;
   const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Out', pngPath, '-TextOut', textPath];
-  const region = (opts.region ?? '').trim();
+  // 第二道校验:即使调用方漏了,脏区域也不会进 PowerShell 参数。
+  const parsedRegion = parseRegion(opts.region ?? '');
+  if ('error' in parsedRegion) return { ...base, ms: 0, error: parsedRegion.error };
+  const region = parsedRegion.region;
   if (region) args.push('-Region', region);
 
   const outcome = await new Promise<{ code: number | null; stderr: string }>((resolve) => {

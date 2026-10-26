@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { personaWrap, type Lang } from './copy.ts';
+import { redactSecret } from './guard.ts';
 
 /** 文案生成的三档:宿主模型 / 自填的 OpenAI 兼容接口 / 只用模板。 */
 export type LlmMode = 'host' | 'openai' | 'off';
@@ -16,6 +17,8 @@ export interface SpendBook {
   calls: number;
   /** 被预算或上限挡下来的次数,用来解释"为什么这条是模板"。 */
   blocked: number;
+  /** 当天手动清零账本的次数;用来限制"清零绕过预算"这条路。 */
+  resets: number;
 }
 
 export interface PriceTable {
@@ -38,6 +41,10 @@ export interface ComposeOptions {
   maxInputChars: number;
   maxOutputTokens: number;
   dailyBudgetYuan: number;
+  /** 每日模型调用次数上限;0 表示不限。 */
+  maxCallsPerDay: number;
+  /** 每日输入+输出 token 总量上限;0 表示不限。 */
+  maxTokensPerDay: number;
   price: PriceTable;
   apiKey: string;
   baseUrl: string;
@@ -76,7 +83,7 @@ export function spendPath(dataDir: string): string {
 }
 
 function emptyBook(today: string): SpendBook {
-  return { date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 0, blocked: 0 };
+  return { date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 0, blocked: 0, resets: 0 };
 }
 
 export function readSpend(dataDir: string, today: string): SpendBook {
@@ -103,6 +110,7 @@ export function readSpend(dataDir: string, today: string): SpendBook {
     yuan: num(item.yuan),
     calls: num(item.calls),
     blocked: num(item.blocked),
+    resets: num(item.resets),
   };
 }
 
@@ -127,6 +135,7 @@ export function chargeSpend(book: SpendBook, inTokens: number, outTokens: number
     yuan: Math.round((book.yuan + cost) * 1e6) / 1e6,
     calls: book.calls + 1,
     blocked: book.blocked,
+    resets: book.resets,
   };
 }
 
@@ -185,7 +194,7 @@ async function callOpenAi(opts: ComposeOptions, brief: string): Promise<{ text: 
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new Error('接口返回 HTTP ' + res.status + (detail ? '：' + detail.slice(0, 120) : ''));
+      throw new Error('接口返回 HTTP ' + res.status + (detail ? '：' + redactSecret(detail.slice(0, 120)) : ''));
     }
     const raw: unknown = await res.json();
     const parsed = readReply(raw);
@@ -209,10 +218,21 @@ export async function compose(opts: ComposeOptions): Promise<ComposeResult> {
   if (opts.mode === 'off') {
     return { text: template, source: 'template', reason: '文案模型已关闭', spent: book };
   }
-  if (book.yuan >= opts.dailyBudgetYuan) {
+  // 三道闸并列:金额、调用次数、token 总量。
+  // 只按金额判是不行的——计价填 0 时 yuan 恒为 0,预算永远不触发,次数与 token 闸兜住这条路。
+  const usedTokens = book.inTokens + book.outTokens;
+  const overBudget = opts.dailyBudgetYuan > 0 && book.yuan >= opts.dailyBudgetYuan;
+  const overCalls = opts.maxCallsPerDay > 0 && book.calls >= opts.maxCallsPerDay;
+  const overTokens = opts.maxTokensPerDay > 0 && usedTokens >= opts.maxTokensPerDay;
+  if (overBudget || overCalls || overTokens) {
     const blocked: SpendBook = { ...book, blocked: book.blocked + 1 };
     writeSpend(opts.dataDir, blocked);
-    return { text: template, source: 'template', reason: '今日预算 ' + opts.dailyBudgetYuan + ' 元已用完', spent: blocked };
+    const why = overBudget
+      ? '今日预算 ' + opts.dailyBudgetYuan + ' 元已用完'
+      : overCalls
+        ? '今日模型调用已达上限 ' + opts.maxCallsPerDay + ' 次'
+        : '今日 token 用量已达上限 ' + opts.maxTokensPerDay;
+    return { text: template, source: 'template', reason: why, spent: blocked };
   }
 
   const material = opts.material.slice(0, Math.max(200, Math.trunc(opts.maxInputChars)));
@@ -253,7 +273,7 @@ export async function compose(opts: ComposeOptions): Promise<ComposeResult> {
   }
 
   if (opts.mode === 'openai' && !opts.apiKey.trim()) lastError = lastError || '接口密钥没填';
-  return { text: template, source: 'template', reason: lastError || '没有可用的模型通道', spent: book };
+  return { text: template, source: 'template', reason: redactSecret(lastError) || '没有可用的模型通道', spent: book };
 }
 
 export function describeError(error: unknown): string {
