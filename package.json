@@ -1,10 +1,10 @@
 {
   "name": "cortico-world-warthunder",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "在对话中提供战争雷霆的本地百科与战局播报。知识库覆盖概念、载具与玩法，可检索、可更新；读取本机 8111 遥测讲解战局、为击毁喝彩、为逆风打气；遥测不可用时可用截图 OCR 兜底；文案可按设定人格改写，模型与花费可配置。",
   "license": "MIT",
-  "author": "苏鸿与维基",
+  "author": "苏鸿与维基 (suhong11300)",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/suhong11300/cortico-world-warthunder.git"
@@ -63,6 +63,7 @@
     "screenshots/*.png",
     "README.md",
     "CHANGELOG.md",
+    "LICENSE",
     "describe.json"
   ],
   "scripts": {
