@@ -1,4 +1,9 @@
-# cortico-world-warthunder · war thunder安东星助手
+# war thunder安东星助手 · cortico-world-warthunder
+
+[![npm](https://img.shields.io/npm/v/cortico-world-warthunder?label=npm&color=cb3837)](https://www.npmjs.com/package/cortico-world-warthunder)
+[![license](https://img.shields.io/npm/l/cortico-world-warthunder?color=blue)](./LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A5%2022-43853d)](https://nodejs.org)
+[![world api](https://img.shields.io/badge/cortico%20world%20api-6-8b5cf6)](https://github.com/Pal-AI-Lab/cortico)
 
 > 状态：实验性。遥测来自客户端实现、非文档化合同；文案与战绩都按「能核对」设计，但尚未经过长时间实战验收。
 
@@ -9,6 +14,33 @@
 - 遥测不可用时提供**截图 OCR 兜底**（Windows OCR，默认关闭）。
 - 播报文案三档来源：宿主人格 / 自填 OpenAI 兼容接口 / 纯模板；按日预算与字符上限拦停。
 - 对局聊天走 8111 的 `/gamechat`，被叫到才读；代稿的落地默认**复制到剪贴板**，也可配成用键盘事件直接写进发言栏（不碰鼠标、不读内存）。
+
+![战局播报](screenshots/brief.png)
+
+![对局翻译](screenshots/chat.png)
+
+*四张示意图依次是战局播报、知识库、对局翻译与花费面板，文案取自真实调用回执。*
+
+*Cortico World · `kind: world` · `api: 6` · `tags: game / companion / internet / external-setup / experimental / high-cost / injection-risk / computer-use` · MIT · 170 项单测通过、契约校验通过*
+
+## 目录
+
+- [为什么需要它](#为什么需要它)
+- [安装](#安装)
+- [配置](#配置)
+- [工具](#工具)
+- [事件](#事件)
+- [知识库](#知识库)
+- [战局遥测](#战局遥测)
+- [对局对话与代稿](#对局对话与代稿)
+- [视觉兜底](#视觉兜底)
+- [文案与花费](#文案与花费)
+- [滥用与安全边界](#滥用与安全边界)
+- [验证](#验证)
+- [限制](#限制)
+- [配图](#配图)
+- [开发排障附录](#开发排障附录)
+- [许可](#许可)
 
 ## 为什么需要它
 
@@ -133,7 +165,7 @@ WebUI 端口以宿主配置里的 `web.port` 为准（默认 17788），不要�
 
 **能力边界**：这是客户端实现、非文档化合同——字段可能随版本变，只在本机可用，也没有鉴权。插件对每个字段都做了容错（缺字段按 0 / 空处理，解析失败当离线），但版本更新后仍建议先看一眼 `wt_status`。
 
-## 对局对话：翻译与代稿
+## 对局对话与代稿
 
 被叫到时读一次 `/gamechat?lastId=N`（契约：`id` / `msg` / `sender` / `enemy` / `mode`），按游标增量取，进战局时清空。
 
@@ -206,7 +238,13 @@ cd <Cortina>/state/cortico && corepack pnpm check:extension <包根目录>
 
 ## 配图
 
-`icon.svg` 以官方徽标为基底（内嵌 256×256 官方图标，外套深色圆角底、暖色辉光、双环与四向刻度）；`screenshots/*.png` 四张依次是战局播报、知识库、对局翻译、花费面板，文案取自真实调用回执。
+`icon.svg` 以官方徽标为基底（内嵌 256×256 官方图标，外套深色圆角底、暖色辉光、双环与四向刻度）。
+
+![知识库](screenshots/kb.png)
+
+![花费面板](screenshots/budget.png)
+
+截图放在包内 `screenshots/`，同时写进 `package.json` 的 `cortico.screenshots`，随包发布。
 
 ## 开发排障附录
 
