@@ -166,6 +166,11 @@ export interface BattleWatcherOptions {
 
 /** 同一次击毁可能连着吐多条播报，这个窗口内同发起者+同目标只算一次。 */
 const KILL_DEDUPE_MS = 8000;
+/**
+ * 同一次阵亡会同时出现在 indicators 的边沿与 damage feed 里，这个窗口内只认先到的一路。
+ * 取与击毁去重同一个量级：两路都是 1500ms 一拉，两拍内必然都到齐。
+ */
+const DEATH_VIA_FEED_WINDOW_MS = KILL_DEDUPE_MS;
 
 function num(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -522,29 +527,46 @@ export interface SelfKillHit {
   occurrence: number;
 }
 
+/** 一次"自己被打掉"的命中,幂等键带 d: 前缀,与击杀分开计数。 */
+export interface SelfDeathHit {
+  /** 幂等键:d:发起者>目标#第几次。全量重放多少轮都只会入账一次。 */
+  key: string;
+  /** 原始播报正文。 */
+  detail: string;
+  /** 打掉我的那个人的昵称(已去掉尾部的载具括号)。 */
+  killer: string;
+  /** 这次阵亡在 feed 里最大的那条 id。 */
+  id: number;
+  /** 在本轮 feed 范围内,同一对玩家之间的第几次。 */
+  occurrence: number;
+}
+
+/** 去重后的一条击毁播报:发起者>目标 已归组,occurrence 是这对玩家的第几次。 */
+interface KillRow {
+  detail: string;
+  line: KillLine;
+  pair: string;
+  id: number;
+  occurrence: number;
+}
+
 /**
- * 从全量 damage feed 里挑出"自己的击杀"。
- *
- * 纯函数:不读时钟、不改状态,只按基线 id 过滤后按 id 升序判定。调用方拿 key 做幂等
- * 去重即可 —— 这正是把增量游标换成"每轮全量重算"之后仍然不会重复计数的关键。
+ * 把全量 damage feed 收成去重后的击毁行。
  *
  * 同一次击毁会连着吐多条播报(击毁 / 起火 / 首杀),这里按 发起者>目标 归组:组内
  * time 相差不到 KILL_DEDUPE_MS 或 id 相差不超过 KILL_DEDUPE_ID 就算同一条。time
  * 缺失(部分服务端、以及全部测试夹具)时自动退化为纯 id 邻近判断。
  */
-export function computeSelfKills(
-  damage: HudEvent[],
-  opts: { afterId: number; playerName: string },
-): SelfKillHit[] {
-  const hits: SelfKillHit[] = [];
+function collectKillRows(damage: HudEvent[], afterId: number): KillRow[] {
+  const rows: KillRow[] = [];
   const anchor = new Map<string, { time: number; id: number }>();
   const occurrence = new Map<string, number>();
-  const ordered = damage.filter((event) => event.id > opts.afterId).sort((a, b) => a.id - b.id);
+  const ordered = damage.filter((event) => event.id > afterId).sort((a, b) => a.id - b.id);
   for (const event of ordered) {
     const detail = (event.msg || event.type || '').trim();
     if (!looksLikeKill(detail)) continue;
     const line = parseKillLine(detail);
-    if (!line || !isSelfKill(line, opts.playerName)) continue;
+    if (!line) continue;
     const pair = normalizePlayerName(line.killer) + '>' + normalizePlayerName(line.victim);
     const prev = anchor.get(pair);
     if (prev) {
@@ -559,7 +581,62 @@ export function computeSelfKills(
     anchor.set(pair, { time: event.time, id: event.id });
     const seq = (occurrence.get(pair) ?? 0) + 1;
     occurrence.set(pair, seq);
-    hits.push({ key: pair + '#' + seq, detail, victim: line.victim, id: event.id, occurrence: seq });
+    rows.push({ detail, line, pair, id: event.id, occurrence: seq });
+  }
+  return rows;
+}
+
+/**
+ * 从全量 damage feed 里挑出"自己的击杀"。
+ *
+ * 纯函数:不读时钟、不改状态,只按基线 id 过滤后按 id 升序判定。调用方拿 key 做幂等
+ * 去重即可 —— 这正是把增量游标换成"每轮全量重算"之后仍然不会重复计数的关键。
+ */
+export function computeSelfKills(
+  damage: HudEvent[],
+  opts: { afterId: number; playerName: string },
+): SelfKillHit[] {
+  return collectKillRows(damage, opts.afterId)
+    .filter((row) => isSelfKill(row.line, opts.playerName))
+    .map((row) => ({
+      key: row.pair + '#' + row.occurrence,
+      detail: row.detail,
+      victim: row.line.victim,
+      id: row.id,
+      occurrence: row.occurrence,
+    }));
+}
+
+/** 受害者是不是我(按归一化后的昵称做包含匹配)。 */
+export function isSelfDeath(line: KillLine, playerName: string): boolean {
+  const me = normalizePlayerName(playerName);
+  if (!me) return false;
+  return normalizePlayerName(line.victim).includes(me);
+}
+
+/**
+ * 从全量 damage feed 里挑出"自己被打掉"。
+ *
+ * 与 computeSelfKills 同一套路:每轮全量重算 + 幂等键去重,所以重连、换局、游戏重启
+ * 都不会把阵亡数算丢或算重。键带 d: 前缀,与击杀键互不干扰。
+ *
+ * 自己把自己打掉(极罕见)只算击杀,这里跳过,免得一条播报两边各加一。
+ */
+export function computeSelfDeaths(
+  damage: HudEvent[],
+  opts: { afterId: number; playerName: string },
+): SelfDeathHit[] {
+  const hits: SelfDeathHit[] = [];
+  for (const row of collectKillRows(damage, opts.afterId)) {
+    if (!isSelfDeath(row.line, opts.playerName)) continue;
+    if (isSelfKill(row.line, opts.playerName)) continue;
+    hits.push({
+      key: 'd:' + row.pair + '#' + row.occurrence,
+      detail: row.detail,
+      killer: row.line.killer,
+      id: row.id,
+      occurrence: row.occurrence,
+    });
   }
   return hits;
 }
@@ -616,12 +693,16 @@ export class BattleWatcher {
   private readonly countedKills = new Set<string>();
   /** 已经开口过的全战场播报 id，全量重放时不重复播。 */
   private readonly seenHud = new Set<number>();
+  /** 已经入账的阵亡幂等键（d:发起者>目标#第几次）。 */
+  private readonly countedDeaths = new Set<string>();
   private kills = 0;
   private deaths = 0;
   private streak = 0;
   private bestStreak = 0;
   private startedAt = 0;
   private lastDeathAt = 0;
+  /** indicators 那一路最近一次计到阵亡的时刻，用来让 feed 认领时不重复累加。 */
+  private lastIndicatorDeathAt = 0;
   private behindRaised = false;
   private snapshot: BattleSnapshot = { vehicle: '', mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
 
@@ -656,6 +737,17 @@ export class BattleWatcher {
     return { kills: this.kills, deaths: this.deaths, bestStreak: this.bestStreak };
   }
 
+  /** 记一次阵亡：累加、断连胜、落后两杀以上喊一句逆风。两路共用，口径只有一处。 */
+  private applyDeath(out: BattleEvent[]): void {
+    this.deaths += 1;
+    this.streak = 0;
+    out.push({ kind: 'death', total: this.deaths, snapshot: this.snapshot });
+    if (!this.behindRaised && this.deaths >= this.kills + 2) {
+      this.behindRaised = true;
+      out.push({ kind: 'behind', kills: this.kills, deaths: this.deaths, snapshot: this.snapshot });
+    }
+  }
+
   private resetBattle(vehicle: string): void {
     this.kills = 0;
     this.deaths = 0;
@@ -664,8 +756,10 @@ export class BattleWatcher {
     this.behindRaised = false;
     this.startedAt = this.now();
     this.lastDeathAt = 0;
+    this.lastIndicatorDeathAt = 0;
     this.aliveArmed = false;
     this.countedKills.clear();
+    this.countedDeaths.clear();
     this.seenHud.clear();
     this.baselineDmgId = -1;
     this.baselineEvtId = -1;
@@ -809,21 +903,30 @@ export class BattleWatcher {
       });
     }
 
+    // 阵亡同样从全量 feed 重算：重启/重生那一下 indicators 的边沿还没武装好，只靠它必漏，
+    // 而且漏一次这一局就永远对不上。这里按 victim=我 数，幂等键去重，重连换局都自愈。
+    for (const hit of computeSelfDeaths(hud.damage, { afterId: this.baselineDmgId, playerName: this.playerName })) {
+      if (this.countedDeaths.has(hit.key)) continue;
+      this.countedDeaths.add(hit.key);
+      // 这一拍 indicators 可能已经把同一次阵亡数过，那就不再重复累加。
+      if (this.now() - this.lastIndicatorDeathAt < DEATH_VIA_FEED_WINDOW_MS) continue;
+      // feed 已经认领这一条，indicators 这边接下来失效的那一拍直接吞掉。
+      this.aliveArmed = false;
+      this.lastDeathAt = this.now();
+      this.applyDeath(out);
+    }
+
     const ind = await this.client.indicators();
     if (ind && ind.known) {
       if (ind.valid) {
         // 看到一次有效存活：武装边沿，下一次失效才算阵亡。
         this.aliveArmed = true;
       } else if (this.aliveArmed && this.now() - this.lastDeathAt >= DEATH_DEBOUNCE_MS) {
+        // feed 里那一条还没到或压根没有（坠机、撞地），由 indicators 兜底计一次。
         this.aliveArmed = false;
-        this.deaths += 1;
-        this.streak = 0;
+        this.lastIndicatorDeathAt = this.now();
         this.lastDeathAt = this.now();
-        out.push({ kind: 'death', total: this.deaths, snapshot: this.snapshot });
-        if (!this.behindRaised && this.deaths >= this.kills + 2) {
-          this.behindRaised = true;
-          out.push({ kind: 'behind', kills: this.kills, deaths: this.deaths, snapshot: this.snapshot });
-        }
+        this.applyDeath(out);
       }
     }
 

@@ -5,3 +5,4 @@ dist/
 .icon-preview.png
 .icon-small.png
 .icon-small.html
+.tmp-sync/
