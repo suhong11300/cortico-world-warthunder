@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { assertFetchableUrl } from './guard.ts';
+import { fetchGuarded } from './guard.ts';
 import { join } from 'node:path';
 import { KB_SEED, KB_SEED_VERSION } from './kb-seed.ts';
 import type { KbEntry, KbKind } from './kb-types.ts';
@@ -257,21 +257,64 @@ export function parseRemoteKb(payload: unknown): RemoteKb {
 export interface FetchKbOptions {
   fetchImpl?: typeof globalThis.fetch;
   timeoutMs?: number;
+  /** 由调用方(worlds.wt.kbAllowPrivate)决定;关着时只能取公网 http(s)。 */
+  allowPrivate?: boolean;
 }
 
-/** 拉远程知识库;响应体上限 2MB,超时默认 15 秒。 */
+/**
+ * 读响应体并累计"真实字节数"。
+ *
+ * 之前是把整段 text 读进来再比长度——`text.length` 是 UTF-16 码元数，不是字节数，
+ * 一段 2.5MB 的 ASCII 只有 90 万字符，限额形同不存在；而且读完才判，脏数据已经进内存。
+ * 现在边读边累加字节，超限立刻中止。
+ */
+async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
+  const body = (res as unknown as { body?: { getReader?: () => ReadableStreamDefaultReader<Uint8Array> } }).body;
+  const reader = body && typeof body.getReader === 'function' ? body.getReader() : null;
+  if (!reader) {
+    const text = await res.text();
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes > maxBytes) throw new Error('知识库源响应体超过 2MB 上限(实际 ' + bytes + ' 字节)');
+    return text;
+  }
+  const decoder = new TextDecoder();
+  let total = 0;
+  let out = '';
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    const bytes = chunk.value ?? new Uint8Array();
+    total += bytes.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // 中止失败不影响结论。
+      }
+      throw new Error('知识库源响应体超过 2MB 上限(已读 ' + total + ' 字节)');
+    }
+    out += decoder.decode(bytes, { stream: true });
+  }
+  out += decoder.decode();
+  return out;
+}
+
+/** 拉远程知识库;响应体上限 2MB(按真实字节),超时默认 15 秒。 */
 export async function fetchRemoteKb(url: string, opts: FetchKbOptions = {}): Promise<RemoteKb> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   if (!url.trim()) throw new Error('没有配置知识库源');
-  // 私网放不放由调用方(worlds.wt.kbAllowPrivate)决定,这里只保证协议安全、永不碰云元数据。
-  const target = assertFetchableUrl(url, { allowPrivate: true });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 15000);
   try {
-    const res = await fetchImpl(target, { signal: controller.signal, headers: { accept: 'application/json' } });
+    // 走带闸门的 fetch:每一跳重定向都重新校验协议、私网与 DNS 解析结果。
+    const res = await fetchGuarded(url, {
+      ...(opts.allowPrivate === true ? { allowPrivate: true } : {}),
+      fetchImpl,
+      signal: controller.signal,
+      headers: { accept: 'application/json' },
+    });
     if (!res.ok) throw new Error('知识库源返回 HTTP ' + res.status);
-    const text = await res.text();
-    if (text.length > KB_MAX_BYTES) throw new Error('知识库源响应体超过 2MB 上限');
+    const text = await readBodyCapped(res, KB_MAX_BYTES);
     let payload: unknown;
     try {
       payload = JSON.parse(text);

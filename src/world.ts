@@ -1,4 +1,3 @@
-import { rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { ToolDef, TriggerMode, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
@@ -28,7 +27,7 @@ import {
 } from './copy.ts';
 import { fetchRemoteKb, findVehicle, kbCounts, kbPath, loadKb, readKbFile, searchKb, writeKbFile, type KbView } from './kb.ts';
 import { compose, describeError, readSpend, writeSpend } from './llm.ts';
-import { extractVisionHints, probeVision } from './vision.ts';
+import { discardVisionRun, extractVisionHints, probeVision } from './vision.ts';
 import { cleanOutgoing, copyToClipboard, sendToGame } from './sendkey.ts';
 import { assertFetchableUrl, assertLocalHost, parseRegion, redactSecret, scrubUrl } from './guard.ts';
 
@@ -44,6 +43,10 @@ const MAX_VISION_HINTS = 6;
 const CHAT_BUFFER = 60;
 /** 代稿的原文上限;再长就不像对局里能说的话了。 */
 const MAX_DRAFT = 300;
+/** 文案队列上限:模型整场不可用时不能让旧事件无限堆积,补播会变成刷屏。 */
+const MAX_DRAFT_QUEUE = 12;
+/** 知识库自动更新的检查节流:配置是 x-hot 的,进程开一整天也要按小时更新。 */
+const KB_CHECK_MS = 10 * 60_000;
 /** 游戏发言栏能塞下的长度;超过这条就不是对局里能说的话了。 */
 const MAX_OUTGOING = 200;
 /** 一分钟内最多直写几次发言栏;聊天刷屏是别人能看见的后果,得单独限量。 */
@@ -129,7 +132,7 @@ export const WT_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   },
   {
     name: 'wt_battle_state',
-    description: '主动读一次当前战局:是否在战局、载具、速度高度、附近敌我数量与本局战绩。',
+    description: '主动读一次当前战局:是否在战局、载具、速度高度、地图可见敌我数量与本局战绩。',
     tags: ['read', 'snapshot'],
     parameters: { type: 'object', additionalProperties: false, properties: {} },
   },
@@ -164,14 +167,18 @@ export const WT_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'wt_say',
     description:
-      '把一句话落到《战争雷霆》对局发言栏。默认复制到剪贴板,用户 Ctrl+V 再回车就发出去(最稳,不碰游戏);配成 confirm/auto 时改用键盘直写发言栏(不经过剪贴板、不发鼠标事件)。用户说"帮我把这句发出去""翻译完直接发"时用它。',
+      '把一句话落到《战争雷霆》对局发言栏。默认复制到剪贴板,用户 Ctrl+V 再回车就发出去(最稳,不碰游戏);配成 confirm/auto 时改用键盘直写发言栏(不经过剪贴板、不发鼠标事件)。用户说"帮我把这句发出去""翻译完直接发"时用它。回执只代表按键送到了窗口,不代表服务器收下了。',
     tags: ['act'],
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         text: { type: 'string', minLength: 1, maxLength: 200, description: '要发的内容;英文最稳,中文也能走 Unicode 输入。' },
-        confirm: { type: 'boolean', default: false, description: '预演之后确认发送。' },
+        confirm: {
+          type: 'boolean',
+          default: false,
+          description: '预演之后确认发送。这是工具入参,不是授权:只有用户明确说过"发出去"才传 true。',
+        },
       },
       required: ['text'],
     },
@@ -220,6 +227,12 @@ export class WtWorld implements World {
   private watcher: BattleWatcher | null = null;
   private clientKey = '';
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  /** 采样产生的待生成事件;与采样分开,模型慢不拖住下一次轮询。 */
+  private eventQueue: BattleEvent[] = [];
+  private draftBusy = false;
+  private commentaryTimerMs = 0;
+  private kbCheckAt = 0;
+  private kbFetching = false;
   private commentaryTimer: ReturnType<typeof setTimeout> | undefined;
   private greetTimer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
@@ -360,6 +373,8 @@ export class WtWorld implements World {
     this.pollTimer = undefined;
     this.commentaryTimer = undefined;
     this.greetTimer = undefined;
+    this.commentaryTimerMs = 0;
+    this.eventQueue = [];
     this.host = null;
   }
 
@@ -367,7 +382,14 @@ export class WtWorld implements World {
     return 'http://' + (this.opts.cfg.gameHost || '127.0.0.1') + ':' + this.opts.cfg.gamePort;
   }
 
+  /** 播报档位:配置里写错的值一律按 important 处理,不至于因为一个错字就没声了。 */
+  private chatter(): 'quiet' | 'important' | 'commentary' {
+    const level = this.opts.cfg.chatterLevel;
+    return level === 'quiet' || level === 'commentary' ? level : 'important';
+  }
+
   private commentaryEvery(): number {
+    if (this.chatter() === 'quiet') return 0;
     const every = Math.trunc(this.opts.cfg.commentaryEveryMs);
     return Number.isFinite(every) && every >= 5000 ? every : 0;
   }
@@ -384,6 +406,7 @@ export class WtWorld implements World {
 
   private scheduleCommentary(delay: number): void {
     if (this.stopped || delay <= 0) return;
+    this.commentaryTimerMs = Math.max(5000, delay);
     this.commentaryTimer = setTimeout(() => {
       void this.commentaryOnce()
         .catch((error: unknown) => { this.lastError = describeError(error); })
@@ -405,18 +428,86 @@ export class WtWorld implements World {
     if (!battle) return;
     this.polling = true;
     try {
+      this.syncCommentaryTimer();
+      this.maybeCheckKb();
       const events = await battle.watcher.poll();
       this.online = battle.watcher.online_now;
-      for (const event of events) {
-        try {
-          await this.handleBattleEvent(event);
-        } catch (error) {
-          this.lastError = describeError(error);
-        }
-      }
+      // 采样与文案分开:文案要走模型,模型慢的时候遥测不能停在原地等,否则下一轮采样整体后移。
+      for (const event of events) this.enqueueDraft(event);
+      this.pumpDrafts();
     } finally {
       this.polling = false;
     }
+  }
+
+  /**
+   * 事件入队。
+   *
+   * hud 类只留最新一条:过时的聊天/系统消息没有播报价值,留着只会占额度。
+   * 队列超限时丢最旧的,并记一句说明——静默丢弃会让人以为"这局没击毁"。
+   */
+  private enqueueDraft(event: BattleEvent): void {
+    if (event.kind === 'hud') this.eventQueue = this.eventQueue.filter((one) => one.kind !== 'hud');
+    this.eventQueue.push(event);
+    if (this.eventQueue.length > MAX_DRAFT_QUEUE) {
+      const dropped = this.eventQueue.length - MAX_DRAFT_QUEUE;
+      this.eventQueue.splice(0, dropped);
+      this.lastLlmNote = '文案队列积压,' + dropped + ' 条旧事件已丢弃';
+    }
+  }
+
+  /** 串行消费队列:同一条战局事件只生成一次文案,顺序保持采样顺序。 */
+  private pumpDrafts(): void {
+    if (this.draftBusy || this.stopped) return;
+    this.draftBusy = true;
+    void (async () => {
+      try {
+        while (!this.stopped && this.eventQueue.length > 0) {
+          const event = this.eventQueue.shift();
+          if (!event) break;
+          try {
+            await this.handleBattleEvent(event);
+          } catch (error) {
+            this.lastError = describeError(error);
+          }
+        }
+      } finally {
+        this.draftBusy = false;
+      }
+    })();
+  }
+
+  /**
+   * 解说计时器跟着配置走。
+   *
+   * 配置是 x-hot 的,但计时器原来只在 start 建一次:间隔从 0 改成 5000 时,那条"没建计时器"
+   * 的分支再也不会被触发,用户以为开了解说其实永远等不到。所以每轮采样都核对一次。
+   */
+  private syncCommentaryTimer(): void {
+    if (this.stopped) return;
+    const want = this.commentaryEvery();
+    if (want <= 0) {
+      if (this.commentaryTimer) clearTimeout(this.commentaryTimer);
+      this.commentaryTimer = undefined;
+      this.commentaryTimerMs = 0;
+      return;
+    }
+    if (this.commentaryTimer && this.commentaryTimerMs === want) return;
+    if (this.commentaryTimer) clearTimeout(this.commentaryTimer);
+    this.scheduleCommentary(want);
+  }
+
+  /** 知识库自动更新不能只在 start 判一次:进程开着一整天也要到点更新。 */
+  private maybeCheckKb(): void {
+    if (this.kbFetching) return;
+    const cfg = this.opts.cfg;
+    if (!cfg.kbUrl.trim() || cfg.kbAutoUpdateHours <= 0) return;
+    if (this.nowMs() - this.kbCheckAt < KB_CHECK_MS) return;
+    this.kbCheckAt = this.nowMs();
+    this.kbFetching = true;
+    void this.maybeAutoUpdateKb()
+      .catch((error: unknown) => { this.lastError = describeError(error); })
+      .finally(() => { this.kbFetching = false; });
   }
 
   private async handleBattleEvent(event: BattleEvent): Promise<void> {
@@ -434,21 +525,21 @@ export class WtWorld implements World {
         return;
       }
       case 'kill': {
-        if (!cfg.autoBrief) return;
+        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
         const material = '本局第 ' + event.total + ' 个击毁,当前连击 ' + event.streak + '。' + (event.detail ? '原始播报:' + event.detail : '') + ' 读数:' + battleLine(event.snapshot, 'zh');
         const text = await this.composeText(material, '用一两句话为这次击毁喝彩,可以带一个表情', () => killText(event.total, event.streak, event.detail, lang));
         await this.push('wt.kill', text, 'flush', { total: event.total, streak: event.streak });
         return;
       }
       case 'death': {
-        if (!cfg.autoBrief) return;
+        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
         const material = '本局第 ' + event.total + ' 次被击毁。' + battleLine(event.snapshot, 'zh');
         const text = await this.composeText(material, '用一两句话安慰并给出一条具体的下一步建议', () => deathText(event.total, lang));
         await this.push('wt.death', text, 'flush', { total: event.total });
         return;
       }
       case 'behind': {
-        if (!cfg.autoBrief) return;
+        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
         const material = '本局 ' + event.kills + ' 杀 ' + event.deaths + ' 死,局势逆风。';
         const text = await this.composeText(material, '用一两句话打气,给一条能立刻执行的战术建议', () => behindText(event.kills, event.deaths, lang));
         await this.push('wt.behind', text, 'flush', { kills: event.kills, deaths: event.deaths });
@@ -470,7 +561,8 @@ export class WtWorld implements World {
   private async commentaryOnce(): Promise<void> {
     if (this.stopped || !this.opts.cfg.autoBrief) return;
     const battle = this.ensureBattle();
-    if (!battle || !battle.watcher.inBattleNow) return;
+    // 判"要不要解说"看的是观测结果；状态机那一格只由 poll 推进，不该被展示逻辑消费。
+    if (!battle || !battle.watcher.observedInBattleNow) return;
     const snapshot = await battle.watcher.refresh();
     const material = battleLine(snapshot, 'zh');
     const text = await this.composeText(material, '用一句话接力解说当前战况,不要重复开场白', () => commentaryText(snapshot, this.lang()));
@@ -590,7 +682,7 @@ export class WtWorld implements World {
     try {
       // 这条 fetch 是模型能触发的(wt_kb_update),所以地址要过闸:默认只放公网 http(s)。
       const target = assertFetchableUrl(url, { allowPrivate: this.opts.cfg.kbAllowPrivate === true });
-      const remote = await fetchRemoteKb(target);
+      const remote = await fetchRemoteKb(target, { allowPrivate: this.opts.cfg.kbAllowPrivate === true });
       writeKbFile(this.opts.dataDir, { version: remote.version, fetchedAt: new Date(this.nowMs()).toISOString(), entries: remote.entries });
       this.view = loadKb(this.opts.dataDir);
       this.lastKbAt = new Date(this.nowMs()).toISOString();
@@ -872,10 +964,11 @@ export class WtWorld implements World {
           ...(this.opts.spawnImpl ? { spawnImpl: this.opts.spawnImpl } : {}),
         });
         if (!sent.ok) return '❌ 没发出去:' + (sent.error ?? '未知原因');
+        // 按键送达窗口 ≠ 服务器收下,回执只说前者。写成「已发送成功」是在替游戏打包票。
         return [
-          '✅ 已写进发言栏(' + sent.sent + ' 字符)',
+          '⌨️ 已按键送出 ' + sent.sent + ' 字符(Enter 开输入框 → 逐字打 → Enter 送出)',
           '「' + text + '」',
-          '游戏里没出现的话:通常是聊天键位被改过、或前台没抢回来(切回游戏再试一次)。',
+          '这只证明按键到了游戏窗口:对局里没出现,通常是聊天键位被改、前台没抢回来或输入被判异常 —— 切回游戏重来一次,或改用 clipboard 档。',
         ].join('\n');
       },
     };
@@ -899,18 +992,19 @@ export class WtWorld implements World {
           region,
           ...(this.opts.spawnImpl ? { spawnImpl: this.opts.spawnImpl } : {}),
         });
-        if (!result.ok) return '视觉探测失败:' + (result.error ?? '未知原因');
-        const hints = extractVisionHints(result.text).slice(0, MAX_VISION_HINTS);
-        // 整屏截图里可能有别的窗口内容,默认用完就删,只留识别文本。
-        let shotLine = '截图:' + result.pngPath;
-        if (cfg.visionKeepShot !== true) {
-          try {
-            rmSync(result.pngPath, { force: true });
-            shotLine = '截图已删(整屏截图含别的窗口内容;要留就把 worlds.wt.visionKeepShot 打开)';
-          } catch {
-            shotLine = '截图没删掉:' + result.pngPath;
-          }
+        // 清理放在判 ok 之前：OCR 失败时截图同样已经落盘，不能因为"这次没认出字"就留一份整屏图。
+        // 成功且用户要保留才留；否则截图与 OCR 文本一起删——删图不等于删掉识别结果。
+        let shotLine = '';
+        if (cfg.visionKeepShot === true && result.ok) {
+          shotLine = '截图:' + result.pngPath;
+        } else {
+          const cleaned = discardVisionRun(result);
+          shotLine = cleaned.removed
+            ? '截图与识别文本已删(整屏截图含别的窗口内容;要留就把 worlds.wt.visionKeepShot 打开)'
+            : cleaned.detail;
         }
+        if (!result.ok) return '视觉探测失败:' + (result.error ?? '未知原因') + (shotLine ? '\n' + shotLine : '');
+        const hints = extractVisionHints(result.text).slice(0, MAX_VISION_HINTS);
         const lines = ['🖼 视觉探测完成', '耗时 ' + result.ms + ' ms · 识别 ' + result.lines + ' 行', shotLine];
         if (result.text.trim()) lines.push('识别文本(前 400 字):' + clip(result.text, 400));
         else lines.push('画面里没识别出文字(窗口被遮挡或分辨率太低)。');
@@ -946,6 +1040,7 @@ export class WtWorld implements World {
           '因预算或上限被拦 ' + book.blocked + ' 次 · 今日清零账本 ' + book.resets + ' 次',
           '计价:输入 ' + this.opts.cfg.priceInPerM + ' 元/M · 输出 ' + this.opts.cfg.priceOutPerM + ' 元/M',
           '单次上限:输入 ' + this.opts.cfg.maxInputChars + ' 字符 · 输出 ' + this.opts.cfg.maxOutputTokens + ' tokens',
+          '口径:以上是本插件自己记的账,只覆盖它发出的请求;Coo 主会话的 token 与花费不在其中。',
           '每日上限:调用 ' + clamp(this.opts.cfg.maxCallsPerDay, 1, 5000) + ' 次 · token ' + clamp(this.opts.cfg.maxTokensPerDay, 1000, 2_000_000) + ' · 每分钟 ' + clamp(this.opts.cfg.maxCallsPerMinute, 1, 120) + ' 次',
         ].join('\n');
       },
@@ -954,13 +1049,31 @@ export class WtWorld implements World {
 
   // ---- 回执 ----
 
-  private sourceText(): string {
+  /**
+   * 文案通道的真实能力。
+   *
+   * 只看 llmMode 会误报:host 模式在宿主没有 cognition 时一次模型都不调,
+   * 这条路上点绿灯等于告诉用户"AI 在写",其实输出的是模板。
+   */
+  private modelCapability(): { label: string; online: boolean; note: string } {
     const cfg = this.opts.cfg;
-    if (cfg.llmMode === 'off') return 'off(只用模板文案)';
-    if (cfg.llmMode === 'openai') return 'openai(' + (scrubUrl(cfg.llmBaseUrl) || '未填地址') + ' · ' + (cfg.llmModel || '未填模型') + ')';
-    if (this.host?.cognition) return 'host(宿主模型)';
-    if (cfg.llmApiKey.trim()) return 'host + 自填 key(' + cfg.llmModel + ')';
-    return 'host(宿主没提供 cognition 也没填 key:播报走模板,翻译交给对话自己)';
+    if (cfg.llmMode === 'off') {
+      return { label: '模板', online: false, note: '文案模型已关闭:播报、解说与翻译都用固定模板' };
+    }
+    if (this.host?.cognition) {
+      return { label: '主对话同款模型', online: true, note: '宿主提供 cognition:改写由主对话的模型完成' };
+    }
+    if (cfg.llmApiKey.trim()) {
+      const where = (scrubUrl(cfg.llmBaseUrl) || '未填地址') + ' · ' + (cfg.llmModel || '未填模型');
+      if (cfg.llmMode === 'openai') return { label: where, online: true, note: '独立接口(OpenAI 兼容)' };
+      return { label: where, online: true, note: '独立接口(宿主无 cognition,已退回自填 key)' };
+    }
+    return { label: '模板', online: false, note: '宿主没提供 cognition,也没填 key:播报走模板,翻译交给对话自己' };
+  }
+
+  private sourceText(): string {
+    const cap = this.modelCapability();
+    return cap.online ? cap.label + '(' + cap.note + ')' : 'off → ' + cap.note;
   }
 
   private reportStatus(): string {
@@ -968,7 +1081,7 @@ export class WtWorld implements World {
     const counts = kbCounts(this.view.entries);
     const book = readSpend(this.opts.dataDir, this.todayKey());
     const battle = this.watcher;
-    const inBattle = battle ? battle.inBattleNow : false;
+    const inBattle = battle ? battle.observedInBattleNow : false;
     const snapshot = battle ? battle.currentSnapshot : null;
     const lines = [
       '🐯 war thunder安东星助手 · 自检',
@@ -1016,7 +1129,8 @@ export class WtWorld implements World {
     // 只看 /state 会误判——真机对局里 /state 常常只有 { "valid": false }。
     const snapshot = await battle.watcher.refresh();
     if (!battle.watcher.online_now) return '遥测没连上(' + this.originText() + ')。确认游戏在运行、端口和配置一致。';
-    if (!battle.watcher.inBattleNow) return '遥测在线,但当前不在战局(菜单或战局加载中)。';
+    // refresh() 只更新采样值；这里必须读 observedInBattleNow，读状态机会拿到上一轮 poll 的陈旧值。
+    if (!battle.watcher.observedInBattleNow) return '遥测在线,但当前不在战局(菜单或战局加载中)。';
     const tally = battle.watcher.tally;
     return [
       '🎮 当前战局',
@@ -1033,7 +1147,7 @@ export class WtWorld implements World {
     const counts = kbCounts(this.view.entries);
     const book = readSpend(this.opts.dataDir, this.todayKey());
     const battle = this.watcher;
-    const inBattle = battle ? battle.inBattleNow : false;
+    const inBattle = battle ? battle.observedInBattleNow : false;
     const snapshot = battle ? battle.currentSnapshot : null;
     return {
       'wt.now': this.stamp(),
@@ -1059,7 +1173,7 @@ export class WtWorld implements World {
       lamps: [
         { label: '遥测', state: this.online ? 'online' : 'offline', hint: this.originText() },
         { label: '知识库', state: this.view.entries.length > 0 ? 'online' : 'offline', hint: 'v' + this.view.version + ' · ' + this.view.entries.length + ' 条' },
-        { label: '文案', state: cfg.llmMode === 'off' ? 'offline' : 'online', hint: this.sourceText() },
+        { label: '文案', state: this.modelCapability().online ? 'online' : 'offline', hint: this.sourceText() },
       ],
       badges: [
         { label: '知识库', value: this.view.entries.length + ' 条', tone: 'plain' as const },

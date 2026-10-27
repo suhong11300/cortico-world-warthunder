@@ -69,7 +69,9 @@ describe('探测', () => {
     expect(result.ok).toBe(true);
     expect(result.lines).toBe(2);
     expect(result.text).toContain('击毁 T-34');
-    expect(result.pngPath.endsWith('vision-last.png')).toBe(true);
+    // 每次探测一个独占目录，避免并发时后一次把前一次的截图覆盖掉。
+    expect(result.pngPath.endsWith('shot.png')).toBe(true);
+    expect(result.runDir).toContain('vision-');
     expect(result.ms).toBeGreaterThanOrEqual(0);
   });
 

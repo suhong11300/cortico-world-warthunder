@@ -43,14 +43,16 @@ export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
     const bits = [snapshot.vehicle || 'unknown vehicle'];
     if (snapshot.speed > 0) bits.push(Math.round(snapshot.speed) + ' km/h');
     if (snapshot.altitude > 0) bits.push(Math.round(snapshot.altitude) + ' m');
-    if (snapshot.enemies > 0 || snapshot.allies > 0) bits.push(snapshot.enemies + ' enemies / ' + snapshot.allies + ' allies nearby');
+    if (snapshot.enemies > 0 || snapshot.allies > 0) bits.push(snapshot.enemies + ' enemies / ' + snapshot.allies + ' allies on the visible map');
     return bits.join(' · ');
   }
   const bits: string[] = [];
   if (snapshot.vehicle) bits.push(snapshot.vehicle);
   if (snapshot.speed > 0) bits.push('速度 ' + Math.round(snapshot.speed) + ' km/h');
   if (snapshot.altitude > 0) bits.push('高度 ' + Math.round(snapshot.altitude) + ' m');
-  if (snapshot.enemies > 0 || snapshot.allies > 0) bits.push('附近 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友');
+  // 这两个数是 map_obj.json 里整张可见地图的敌方/友方对象计数,没有距离筛选,
+  // 写成「附近」会让人以为是雷达范围内的接触——那是另一件事,插件没这个数据。
+  if (snapshot.enemies > 0 || snapshot.allies > 0) bits.push('地图可见 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友');
   return bits.length > 0 ? bits.join(' · ') : '载具数据还没读全';
 }
 

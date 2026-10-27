@@ -7,6 +7,8 @@
  * 错误文本与地址在进回执前统一脱敏,避免密钥被写进对话。
  */
 
+import { lookup } from 'node:dns/promises';
+
 /** 本机遥测允许的主机名;别的值一律降级成 127.0.0.1。 */
 const LOCAL_HOSTS: readonly string[] = ['127.0.0.1', 'localhost', '::1'];
 
@@ -55,12 +57,32 @@ function isPrivateIpv4(host: string): boolean {
   return false;
 }
 
+/**
+ * 把 `::ffff:7f00:1` 这种十六进制写法的 IPv4-mapped 地址还原成点分四段。
+ *
+ * URL 规范化会把 `[::ffff:127.0.0.1]` 改写成 `[::ffff:7f00:1]`，只认点分那一种
+ * 就等于给了一条现成的绕过路线。
+ */
+function ipv4FromMappedHex(value: string): string | null {
+  const matched = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(value);
+  if (!matched) return null;
+  const hi = Number.parseInt(matched[1] as string, 16);
+  const lo = Number.parseInt(matched[2] as string, 16);
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff].join('.');
+}
+
 function isPrivateIpv6(host: string): boolean {
   const value = host.toLowerCase();
   if (value === '::1' || value === '::') return true;
   if (value.startsWith('fe8') || value.startsWith('fe9') || value.startsWith('fea') || value.startsWith('feb')) return true;
   if (value.startsWith('fc') || value.startsWith('fd')) return true;
-  if (value.startsWith('::ffff:')) return isPrivateIpv4(value.slice(7));
+  if (value.startsWith('::ffff:')) {
+    const tail = value.slice(7);
+    if (tail.includes('.')) return isPrivateIpv4(tail);
+    const mapped = ipv4FromMappedHex(value);
+    if (mapped) return isPrivateIpv4(mapped);
+    return false;
+  }
   return false;
 }
 
@@ -101,6 +123,69 @@ export function assertFetchableUrl(raw: string, opts: { allowPrivate?: boolean }
     throw new Error('拒绝访问内网地址 ' + host + ';确实要连本机服务,把 worlds.wt.kbAllowPrivate 打开');
   }
   return parsed.toString();
+}
+
+const MAX_REDIRECTS = 5;
+
+/** 主机是不是 IP 字面量(v4 / v6)。 */
+function isIpLiteral(host: string): boolean {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
+  return host.includes(':');
+}
+
+/**
+ * 域名解析出来的地址里有没有私网。
+ *
+ * 只看字面量不够：`kb.example.com` 完全可以解析到 127.0.0.1 或 169.254.169.254，
+ * 那时"主机名不是私网"这条判断就是假的。解析失败不阻断（实际连接多半也失败），
+ * 但只要有一个 A/AAAA 落在私网就拒绝。
+ */
+export async function resolvesToPrivate(host: string): Promise<boolean> {
+  const name = normalizeHost(host);
+  if (!name || isIpLiteral(name)) return false;
+  try {
+    const list = await lookup(name, { all: true });
+    return list.some((item) => (item.family === 6 ? isPrivateIpv6(normalizeHost(item.address)) : isPrivateIpv4(item.address)));
+  } catch {
+    return false;
+  }
+}
+
+export interface FetchGuardedOptions {
+  allowPrivate?: boolean;
+  fetchImpl?: typeof globalThis.fetch;
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+}
+
+/**
+ * 带闸门的 fetch：每一跳重定向都重新校验目标。
+ *
+ * 只校验入口地址是不够的——公网地址 302 到 127.0.0.1 就绕过了所有检查。
+ */
+export async function fetchGuarded(raw: string, opts: FetchGuardedOptions = {}): Promise<Response> {
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  let current = raw;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+    const target = assertFetchableUrl(current, { allowPrivate: opts.allowPrivate });
+    const host = normalizeHost(new URL(target).hostname);
+    if (!opts.allowPrivate && (await resolvesToPrivate(host))) {
+      throw new Error('拒绝访问 ' + host + ':这个域名解析到内网地址');
+    }
+    const res = await fetchImpl(target, {
+      method: 'GET',
+      redirect: 'manual',
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.headers ? { headers: opts.headers } : {}),
+    } as RequestInit);
+    const location = res.headers && typeof res.headers.get === 'function' ? res.headers.get('location') : null;
+    if (res.status >= 300 && res.status < 400 && location) {
+      current = new URL(location, target).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error('重定向次数超过 ' + MAX_REDIRECTS + ' 次,已停止');
 }
 
 /** 去掉地址里的凭据与查询串值,只留主机与路径,用于回执。 */

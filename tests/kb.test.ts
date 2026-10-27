@@ -168,3 +168,22 @@ describe('远程知识库', () => {
     await expect(fetchRemoteKb('   ', { fetchImpl: ok })).rejects.toThrow();
   });
 });
+
+describe('知识库源的重定向与限额', () => {
+  it('重定向到内网的那一跳会被拒绝', async () => {
+    const fake = (async () => ({
+      ok: false,
+      status: 302,
+      headers: { get: () => 'http://127.0.0.1:9200/kb.json' },
+      text: async () => '',
+    })) as unknown as typeof globalThis.fetch;
+    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: fake })).rejects.toThrow('内网');
+  });
+
+  it('限额按真实字节算,不是按 JS 字符数', async () => {
+    // 2.1MB 的纯 ASCII 只有约 73 万字符，旧实现用 text.length 判会直接放行。
+    const huge = 'a'.repeat(KB_MAX_BYTES + 4096);
+    const fake = (async () => ({ ok: true, status: 200, text: async () => huge })) as unknown as typeof globalThis.fetch;
+    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: fake })).rejects.toThrow('2MB');
+  });
+});

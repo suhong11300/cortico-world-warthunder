@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   chargeSpend,
   chatEndpoint,
+  contradictsFacts,
   compose,
   describeError,
   estimateTokens,
@@ -229,5 +230,114 @@ describe('配额闸与脱敏', () => {
     expect(result.reason).not.toContain('abcdefgh12345678');
     expect(result.reason).toContain('***');
     expect(result.reason).toContain('401');
+  });
+});
+
+describe('预算与并发一致性', () => {
+  it('并发抢最后一个名额时只有一次真正调用模型', async () => {
+    let calls = 0;
+    const cognition = {
+      async request() {
+        calls += 1;
+        // 故意慢一点，好让第二个请求在第一个还没结算时到达。
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { text: '拿下了!' };
+      },
+    };
+    const opts = baseOpts({ mode: 'host', maxCallsPerDay: 1, cognition });
+    const results = await Promise.all([compose(opts), compose(opts)]);
+    expect(calls).toBe(1);
+    expect(results.filter((r) => r.source === 'host')).toHaveLength(1);
+    expect(results.filter((r) => r.source === 'template')).toHaveLength(1);
+    const book = readSpend(dir, today);
+    expect(book.calls).toBe(1);
+    // 被挡下来的那次要留痕，否则用户只看到模板、不知道为什么。
+    expect(book.blocked).toBe(1);
+  });
+
+  it('并发记账不丢增量，重读盘的结果与累计一致', async () => {
+    const cognition = {
+      async request() {
+        await new Promise((resolve) => setTimeout(resolve, 3));
+        return { text: '连续两个击毁' };
+      },
+    };
+    const opts = baseOpts({ mode: 'host', maxCallsPerDay: 10, cognition });
+    await Promise.all([compose(opts), compose(opts), compose(opts)]);
+    const book = readSpend(dir, today);
+    expect(book.calls).toBe(3);
+    expect(book.inTokens).toBeGreaterThan(0);
+    expect(book.outTokens).toBeGreaterThan(0);
+    expect(book.yuan).toBeGreaterThan(0);
+    // "重启" = 重新从盘上读一遍，数字应与刚才一致。
+    expect(readSpend(dir, today)).toEqual(book);
+  });
+
+  it('模型调用失败也留下这次调用的记录', async () => {
+    const opts = baseOpts({
+      mode: 'host',
+      cognition: {
+        async request() {
+          throw new Error('上游 502');
+        },
+      },
+    });
+    const result = await compose(opts);
+    expect(result.source).toBe('template');
+    expect(result.reason).toContain('上游 502');
+    expect(readSpend(dir, today).calls).toBe(1);
+  });
+});
+
+describe('模型输出的两道闸', () => {
+  const opts = (over: Record<string, unknown>) => ({
+    dataDir: '',
+    lang: 'zh' as const,
+    mode: 'host' as const,
+    material: '本局击毁 2 个目标,阵亡 1 次',
+    instruction: '说一句',
+    template: () => '本局 2 杀 1 死',
+    maxInputChars: 1200,
+    maxOutputTokens: 32,
+    dailyBudgetYuan: 1,
+    maxCallsPerDay: 10,
+    maxTokensPerDay: 1_000_000,
+    price: { inPerM: 1, outPerM: 2 },
+    apiKey: '',
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-chat',
+    today: '2026-10-27',
+    ...over,
+  });
+
+  it('数字与素材对不上时整段弃用,退回模板', async () => {
+    const cognition = { request: async () => ({ text: '本局击毁 99 个目标,神了' }) };
+    const out = await compose(opts({ dataDir: dir, cognition }) as never);
+    expect(out.source).toBe('template');
+    expect(out.degraded).toBe('contradicts-facts');
+    expect(out.text).toBe('本局 2 杀 1 死');
+    expect(out.reason).toContain('数字');
+  });
+
+  it('超长输出被字符闸拦住(宿主通道不吃 max_tokens)', async () => {
+    const long = '打得好。'.repeat(200);
+    const cognition = { request: async () => ({ text: long }) };
+    const out = await compose(opts({ dataDir: dir, cognition }) as never);
+    expect(out.source).toBe('template');
+    expect(out.degraded).toBe('too-long');
+    expect(long.length).toBeGreaterThan(160);
+  });
+
+  it('重述素材数字的正常输出照旧放行', async () => {
+    const cognition = { request: async () => ({ text: '本局 2 杀 1 死,稳住这个节奏' }) };
+    const out = await compose(opts({ dataDir: dir, cognition }) as never);
+    expect(out.source).toBe('host');
+    expect(out.text).toContain('2 杀');
+  });
+
+  it('事实判定只看数字,不管文风', () => {
+    expect(contradictsFacts('击毁 2 个', ['本局击毁 2 个'])).toBe(false);
+    expect(contradictsFacts('击毁 99 个', ['本局击毁 2 个'])).toBe(true);
+    expect(contradictsFacts('随便说一句', [])).toBe(false);
   });
 });

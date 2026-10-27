@@ -114,7 +114,7 @@
     },
     {
       "name": "wt_battle_state",
-      "description": "主动读一次当前战局:是否在战局、载具、速度高度、附近敌我数量与本局战绩。",
+      "description": "主动读一次当前战局:是否在战局、载具、速度高度、地图可见敌我数量与本局战绩。",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -205,7 +205,7 @@
     },
     {
       "name": "wt_say",
-      "description": "把一句话落到《战争雷霆》对局发言栏。默认复制到剪贴板,用户 Ctrl+V 再回车就发出去(最稳,不碰游戏);配成 confirm/auto 时改用键盘直写发言栏(不经过剪贴板、不发鼠标事件)。用户说\"帮我把这句发出去\"\"翻译完直接发\"时用它。",
+      "description": "把一句话落到《战争雷霆》对局发言栏。默认复制到剪贴板,用户 Ctrl+V 再回车就发出去(最稳,不碰游戏);配成 confirm/auto 时改用键盘直写发言栏(不经过剪贴板、不发鼠标事件)。用户说\"帮我把这句发出去\"\"翻译完直接发\"时用它。回执只代表按键送到了窗口,不代表服务器收下了。",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -219,7 +219,7 @@
           "confirm": {
             "type": "boolean",
             "default": false,
-            "description": "预演之后确认发送。"
+            "description": "预演之后确认发送。这是工具入参,不是授权:只有用户明确说过\"发出去\"才传 true。"
           }
         },
         "required": [

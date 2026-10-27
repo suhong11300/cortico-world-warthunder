@@ -121,8 +121,18 @@ async function boot(
   return rigged;
 }
 
+/**
+ * 跑一轮采样,并等文案队列排空。
+ *
+ * 采样与文案现在是两条链:轮询只把事件放进队列,文案由 pumpDrafts 串行消费。
+ * 断言推送结果前必须等消费完,否则会读到"还没生成"的空数组。
+ */
 async function pollOnce(world: WtWorld): Promise<void> {
-  await (world as unknown as { pollOnce(): Promise<void> }).pollOnce();
+  const inner = world as unknown as { pollOnce(): Promise<void>; eventQueue: unknown[]; draftBusy: boolean };
+  await inner.pollOnce();
+  for (let i = 0; i < 400 && (inner.draftBusy || inner.eventQueue.length > 0); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 async function call(world: WtWorld, name: string, args: Record<string, unknown> = {}): Promise<string> {
@@ -538,7 +548,7 @@ describe('发言落地', () => {
     expect(preview).toContain('预演');
     expect(fake.calls.length).toBe(0);
     const sent = await call(world, 'wt_say', { text: 'push now!', confirm: true });
-    expect(sent).toContain('已写进发言栏');
+    expect(sent).toContain('已按键送出');
     expect(sent).toContain('8 字符');
     expect(fake.calls.length).toBe(1);
     await world.stop();
@@ -580,7 +590,7 @@ describe('隐私与副作用闸', () => {
     const fake = visionSpawn('击毁 T-34\n胜利', shots);
     const { world } = await boot({ visionMode: 'probe' }, () => ({ state: inMenu }), undefined, fake.impl);
     const out = await call(world, 'wt_vision_probe');
-    expect(out).toContain('截图已删');
+    expect(out).toContain('已删');
     expect(out).toContain('击毁');
     expect(existsSync(shots[0])).toBe(false);
     await world.stop();
@@ -610,7 +620,7 @@ describe('隐私与副作用闸', () => {
     expect(fake.calls.length).toBe(0);
     await call(world, 'wt_say', { text: 'push now!' });
     const sent = await call(world, 'wt_say', { text: 'push now!', confirm: true });
-    expect(sent).toContain('已写进发言栏');
+    expect(sent).toContain('已按键送出');
     expect(fake.calls.length).toBe(1);
     await world.stop();
   });
@@ -620,7 +630,7 @@ describe('隐私与副作用闸', () => {
     const { world } = await boot({ chatSendMode: 'auto' }, () => ({ state: inMenu }), undefined, fake.impl);
     const outs: string[] = [];
     for (let i = 0; i < 4; i += 1) outs.push(await call(world, 'wt_say', { text: 'gg' }));
-    expect(outs[0]).toContain('已写进发言栏');
+    expect(outs[0]).toContain('已按键送出');
     expect(outs[3]).toContain('上限 3 次');
     expect(fake.calls.length).toBe(3);
     await world.stop();
@@ -641,6 +651,73 @@ describe('隐私与副作用闸', () => {
     expect(second).toContain('打得好');
     expect(second).toContain('复用上次译文');
     expect(used).toBe(1);
+    await world.stop();
+  });
+});
+
+describe('文案灯按能力显示', () => {
+  it('宿主没有 cognition 也没填 key 时文案灯是暗的,并说明走模板', async () => {
+    const { world } = await boot({}, () => ({ state: inMenu }));
+    const ui = world.webUi();
+    const lamp = (ui.lamps ?? []).find((one) => one.label === '文案');
+    expect(lamp?.state).toBe('offline');
+    expect(lamp?.hint ?? '').toContain('模板');
+    await world.stop();
+  });
+
+  it('填了 key 但宿主没有 cognition 时灯亮,并写明是独立接口', async () => {
+    const { world } = await boot({ llmApiKey: 'sk-test-key' }, () => ({ state: inMenu }));
+    const lamp = (world.webUi().lamps ?? []).find((one) => one.label === '文案');
+    expect(lamp?.state).toBe('online');
+    expect(lamp?.hint ?? '').toContain('独立接口');
+    await world.stop();
+  });
+});
+
+describe('热更新', () => {
+  it('解说间隔从 0 改成 5000 后计时器会自己建起来', async () => {
+    // R11:配置是 x-hot 的,但计时器原来只在 start 建一次,改成非 0 之后永远等不到。
+    const rigged = await boot({ commentaryEveryMs: 0 }, () => ({ state: inMenu }));
+    const inner = rigged.world as unknown as { commentaryTimer?: unknown };
+    expect(inner.commentaryTimer).toBeUndefined();
+    rigged.cfg.commentaryEveryMs = 5000;
+    await pollOnce(rigged.world);
+    expect(inner.commentaryTimer).toBeDefined();
+    await rigged.world.stop();
+  });
+
+  it('采样不等文案:模型慢的时候轮询照常返回,事件随后补上', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying };
+    const rigged = await boot({ pollMs: 1500 }, () => routes);
+    rigged.host.cognition = {
+      request: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        return { text: '慢模型说一句' };
+      },
+    };
+    const inner = rigged.world as unknown as { pollOnce(): Promise<void>; draftBusy: boolean };
+    const started = Date.now();
+    await inner.pollOnce();
+    const cost = Date.now() - started;
+    expect(cost).toBeLessThan(90);
+    for (let i = 0; i < 200 && inner.draftBusy; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(rigged.host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
+    await rigged.world.stop();
+  });
+});
+
+describe('播报档位', () => {
+  it('quiet 档只报进局与结算,战绩照常累加', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
+    const { world, host } = await boot({ chatterLevel: 'quiet' }, () => routes);
+    await pollOnce(world);
+    routes.hud = { events: [], damage: [1, 2].map((id) => ({ id, msg: 'destroyed T-34' })) };
+    await pollOnce(world);
+    expect(host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
+    expect(host.events.some((event) => event.type === 'wt.kill')).toBe(false);
+    expect(await call(world, 'wt_battle_state')).toContain('本局:2 杀');
     await world.stop();
   });
 });

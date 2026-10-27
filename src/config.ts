@@ -5,6 +5,13 @@ export interface WtConfigSection {
   enabled: boolean;
   /** 自动播报总开关:关掉后只在被显式调用时才说话。 */
   autoBrief: boolean;
+  /**
+   * 播报档位。
+   *
+   * quiet 只报进局与结算;important 再报击毁、阵亡、逆风(默认);commentary 才按间隔定时讲态势。
+   * 开箱默认不持续解说——桌宠一直在旁边讲话,比少说几句更烦人。
+   */
+  chatterLevel: 'quiet' | 'important' | 'commentary';
   /** 本地遥测服务地址,战争雷霆客户端运行时监听。 */
   gameHost: string;
   gamePort: number;
@@ -61,6 +68,7 @@ export interface WtConfigSection {
 export const WT_DEFAULTS: WtConfigSection = {
   enabled: false,
   autoBrief: true,
+  chatterLevel: 'important',
   gameHost: '127.0.0.1',
   gamePort: 8111,
   pollMs: 1500,
@@ -115,6 +123,7 @@ const ENTRIES: Entry[] = [
   { key: 'worlds.wt.chatTarget', title: '翻译成', description: '对局对话要翻成的语言;玩家名始终保持原文。', prop: { type: 'string', enum: ['zh', 'en', 'ja', 'ru'] } },
   { key: 'worlds.wt.chatMaxInputChars', title: '翻译输入上限(字符)', description: '翻译对局聊天时单独给模型的字符预算。播报仍用「输入上限」那一项;两边都受每日 token 上限约束。', prop: { type: 'number', minimum: 200, maximum: 8000 } },
   { key: 'worlds.wt.visionRegion', title: '截图区域', description: '形如 "x,y,w,h";留空表示整屏。缩到记分板或击杀提示能显著提速。', prop: { type: 'string' } },
+  { key: 'worlds.wt.chatterLevel', title: '播报档位', description: 'quiet 只报进局与结算;important 再报击毁、阵亡、逆风;commentary 才按间隔定时讲态势。', prop: { type: 'string', enum: ['quiet', 'important', 'commentary'] } },
   { key: 'worlds.wt.llmMode', title: '文案模型', description: 'host 用宿主当前模型;openai 用下面的兼容接口;off 只用模板文案。', prop: { type: 'string', enum: ['host', 'openai', 'off'] } },
   { key: 'worlds.wt.llmBaseUrl', title: '接口地址', description: 'OpenAI 兼容的 /v1 前缀地址,例如 https://api.deepseek.com。', prop: { type: 'string' } },
   { key: 'worlds.wt.llmModel', title: '模型名', description: '接口里填的 model 字段。', prop: { type: 'string' } },

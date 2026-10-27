@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   assertFetchableUrl,
   assertLocalHost,
+  fetchGuarded,
   isLoopbackHost,
   isPrivateHost,
   normalizeHost,
@@ -102,5 +103,30 @@ describe('OCR 区域参数', () => {
     expect(parseRegion('-1,2,3,4')).toHaveProperty('error');
     expect(parseRegion('1,2,0,4')).toHaveProperty('error');
     expect(parseRegion('1,2,3,4; rm -rf /')).toHaveProperty('error');
+  });
+});
+
+describe('私网与元数据的等价写法', () => {
+  it('IPv4-mapped IPv6 的十六进制形式也认成私网', () => {
+    // URL 会把 [::ffff:127.0.0.1] 规范成 [::ffff:7f00:1]，只认点分写法就有一条现成的绕过路线。
+    expect(isPrivateHost('::ffff:7f00:1')).toBe(true);
+    expect(isPrivateHost('::ffff:127.0.0.1')).toBe(true);
+    expect(isPrivateHost('::ffff:a9fe:a9fe')).toBe(true);
+    expect(() => assertFetchableUrl('http://[::ffff:127.0.0.1]/kb.json')).toThrow();
+  });
+
+  it('公网地址照旧放行', () => {
+    expect(assertFetchableUrl('https://example.com/kb.json')).toBe('https://example.com/kb.json');
+    expect(isPrivateHost('example.com')).toBe(false);
+  });
+
+  it('重定向到私网的那一跳会被拦住', async () => {
+    const hops: string[] = [];
+    const fake = (async (input: unknown) => {
+      hops.push(String(input));
+      return { ok: false, status: 302, headers: { get: () => 'http://127.0.0.1/kb.json' }, text: async () => '' };
+    }) as unknown as typeof globalThis.fetch;
+    await expect(fetchGuarded('https://example.com/kb.json', { fetchImpl: fake })).rejects.toThrow('内网');
+    expect(hops).toHaveLength(1);
   });
 });

@@ -131,3 +131,14 @@ describe('发言栏直写', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('注入脚本的窗口焦点', () => {
+  it('AttachThreadInput 传的是线程 ID,不是进程 ID', () => {
+    const dir = scratch();
+    const path = ensureSendScript(dir);
+    const script = readFileSync(path, 'utf8');
+    expect(script).toContain('[WtKey]::AttachThreadInput($mine, $fgTid, $true)');
+    expect(script).toContain('[WtKey]::AttachThreadInput($mine, $fgTid, $false)');
+    expect(script).not.toContain('AttachThreadInput($mine, $fgPid');
+  });
+});

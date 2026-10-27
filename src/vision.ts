@@ -12,7 +12,7 @@ import { join } from 'node:path';
  * 且全文保持 ASCII:5.1 按 GBK 解析含中文的 .ps1 会乱码。
  */
 
-export const VISION_SCRIPT = "param(\r\n  [Parameter(Mandatory=$true)][string]$Out,\r\n  [Parameter(Mandatory=$true)][string]$TextOut,\r\n  [string]$Region = ''\r\n)\r\n$ErrorActionPreference = 'Stop'\r\nAdd-Type -AssemblyName System.Drawing\r\nAdd-Type -AssemblyName System.Windows.Forms\r\n\r\n$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\r\n$full = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height\r\n$graphics = [System.Drawing.Graphics]::FromImage($full)\r\n$graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size)\r\n$graphics.Dispose()\r\n\r\n$target = $full\r\nif ($Region -ne '') {\r\n  $parts = $Region.Split(',')\r\n  if ($parts.Length -eq 4) {\r\n    $rx = [int]$parts[0]\r\n    $ry = [int]$parts[1]\r\n    $rw = [int]$parts[2]\r\n    $rh = [int]$parts[3]\r\n    if ($rw -gt 0 -and $rh -gt 0 -and ($rx + $rw) -le $full.Width -and ($ry + $rh) -le $full.Height) {\r\n      $target = New-Object System.Drawing.Bitmap $rw, $rh\r\n      $g2 = [System.Drawing.Graphics]::FromImage($target)\r\n      $srcRect = New-Object System.Drawing.Rectangle $rx, $ry, $rw, $rh\r\n      $dstRect = New-Object System.Drawing.Rectangle 0, 0, $rw, $rh\r\n      $g2.DrawImage($full, $dstRect, $srcRect, [System.Drawing.GraphicsUnit]::Pixel)\r\n      $g2.Dispose()\r\n    }\r\n  }\r\n}\r\n$target.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)\r\n\r\nAdd-Type -AssemblyName System.Runtime.WindowsRuntime\r\n$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]\r\nfunction Await($op, $type) {\r\n  $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op))\r\n  $task.Wait(-1) | Out-Null\r\n  $task.Result\r\n}\r\n[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null\r\n[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime] | Out-Null\r\n[Windows.Media.Ocr.OcrEngine,Windows.Media.Ocr,ContentType=WindowsRuntime] | Out-Null\r\n\r\n$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Out)) ([Windows.Storage.StorageFile])\r\n$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])\r\n$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])\r\n$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])\r\n\r\n$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage('zh-Hans-CN')\r\nif ($engine -eq $null) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage('en-US') }\r\nif ($engine -eq $null) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }\r\nif ($engine -eq $null) { throw 'no OCR engine available' }\r\n\r\n$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])\r\n$lines = @()\r\nforeach ($line in $result.Lines) { $lines += $line.Text }\r\n$joined = [string]::Join(\"`n\", $lines)\r\n[System.IO.File]::WriteAllText($TextOut, $joined, (New-Object System.Text.UTF8Encoding($false)))\r\nWrite-Output ('VISION_OK ' + $lines.Count)\r\n";
+export const VISION_SCRIPT = "param(\r\n  [Parameter(Mandatory=$true)][string]$Out,\r\n  [Parameter(Mandatory=$true)][string]$TextOut,\r\n  [string]$Region = ''\r\n)\r\n$ErrorActionPreference = 'Stop'\r\nAdd-Type -AssemblyName System.Drawing\r\nAdd-Type -AssemblyName System.Windows.Forms\r\n\r\n$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\r\n$full = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height\r\n$graphics = [System.Drawing.Graphics]::FromImage($full)\r\n$graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size)\r\n$graphics.Dispose()\r\n\r\n$target = $full\r\nif ($Region -ne '') {\r\n  $parts = $Region.Split(',')\r\n  if ($parts.Length -eq 4) {\r\n    $rx = [int]$parts[0]\r\n    $ry = [int]$parts[1]\r\n    $rw = [int]$parts[2]\r\n    $rh = [int]$parts[3]\r\n    if ($rw -gt 0 -and $rh -gt 0 -and ($rx + $rw) -le $full.Width -and ($ry + $rh) -le $full.Height) {\r\n      $target = New-Object System.Drawing.Bitmap $rw, $rh\r\n      $g2 = [System.Drawing.Graphics]::FromImage($target)\r\n      $srcRect = New-Object System.Drawing.Rectangle $rx, $ry, $rw, $rh\r\n      $dstRect = New-Object System.Drawing.Rectangle 0, 0, $rw, $rh\r\n      $g2.DrawImage($full, $dstRect, $srcRect, [System.Drawing.GraphicsUnit]::Pixel)\r\n      $g2.Dispose()\r\n    } else {\r\n      throw ('region out of screen bounds: ' + $Region + ' / screen ' + $full.Width + 'x' + $full.Height)\r\n    }\r\n  } else {\r\n    throw ('region must be x,y,w,h: ' + $Region)\r\n  }\r\n}\r\n$target.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)\r\n\r\nAdd-Type -AssemblyName System.Runtime.WindowsRuntime\r\n$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]\r\nfunction Await($op, $type) {\r\n  $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op))\r\n  $task.Wait(-1) | Out-Null\r\n  $task.Result\r\n}\r\n[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] | Out-Null\r\n[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime] | Out-Null\r\n[Windows.Media.Ocr.OcrEngine,Windows.Media.Ocr,ContentType=WindowsRuntime] | Out-Null\r\n\r\n$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Out)) ([Windows.Storage.StorageFile])\r\n$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])\r\n$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])\r\n$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])\r\n\r\n$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage('zh-Hans-CN')\r\nif ($engine -eq $null) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage('en-US') }\r\nif ($engine -eq $null) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }\r\nif ($engine -eq $null) { throw 'no OCR engine available' }\r\n\r\n$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])\r\n$lines = @()\r\nforeach ($line in $result.Lines) { $lines += $line.Text }\r\n$joined = [string]::Join(\"`n\", $lines)\r\n[System.IO.File]::WriteAllText($TextOut, $joined, (New-Object System.Text.UTF8Encoding($false)))\r\nWrite-Output ('VISION_OK ' + $lines.Count)\r\n";
 
 export interface VisionProbeOptions {
   dataDir: string;
@@ -26,6 +26,13 @@ export interface VisionResult {
   ok: boolean;
   /** 截下来的 PNG 绝对路径。 */
   pngPath: string;
+  /**
+   * 这一次探测独占的临时目录（截图与 OCR 文本都在里面）。
+   *
+   * 以前所有探测共用 wt/vision-last.*，并发时后一次会把前一次的截图覆盖掉，
+   * 清理时就可能删错、或者谁都删不干净。每次一个目录，删的时候整棵删，OCR 文本也一起消失。
+   */
+  runDir: string;
   /** OCR 出来的纯文本,按行用 \n 连接。 */
   text: string;
   lines: number;
@@ -36,6 +43,26 @@ export interface VisionResult {
 export interface VisionHint {
   kind: 'kill' | 'death' | 'result' | 'score';
   text: string;
+}
+
+/**
+ * 删掉一次探测留下的全部东西：截图、OCR 文本、临时目录。
+ *
+ * 成功、失败、超时三条路都要走这里——OCR 失败时截图同样已经落在盘上，而整屏截图里
+ * 可能有别的窗口内容；删图也不等于删掉识别结果，所以 OCR 文本一起删。
+ * 只删自己产生的 wt/vision-* 目录，路径不像就拒绝，避免传错参数把用户文件删了。
+ */
+export function discardVisionRun(result: VisionResult): { removed: boolean; detail: string } {
+  const target = result.runDir || '';
+  if (!/[\\/]wt[\\/]vision-[a-z0-9]+-[a-z0-9]+$/.test(target)) {
+    return { removed: false, detail: '路径不像本次探测的临时目录，没有删:' + target };
+  }
+  try {
+    rmSync(target, { recursive: true, force: true });
+    return { removed: true, detail: '已删除截图与 OCR 文本' };
+  } catch (error) {
+    return { removed: false, detail: '删除失败:' + (error instanceof Error ? error.message : String(error)) };
+  }
 }
 
 const KILL_WORDS = ['击毁', '击落', '命中', 'destroyed', 'shot down', 'killed', 'hit'];
@@ -61,17 +88,17 @@ export function ensureVisionScript(dataDir: string): string {
 /** 跑一次截图 + OCR。失败一律不抛,包成 {ok:false, error}。 */
 export async function probeVision(opts: VisionProbeOptions): Promise<VisionResult> {
   const started = Date.now();
-  const pngPath = join(opts.dataDir, 'wt', 'vision-last.png');
-  const textPath = join(opts.dataDir, 'wt', 'vision-last.txt');
-  const base: VisionResult = { ok: false, pngPath, text: '', lines: 0, ms: 0 };
+  const runDir = join(opts.dataDir, 'wt', 'vision-' + started.toString(36) + '-' + Math.random().toString(36).slice(2, 8));
+  const pngPath = join(runDir, 'shot.png');
+  const textPath = join(runDir, 'ocr.txt');
+  const base: VisionResult = { ok: false, pngPath, runDir, text: '', lines: 0, ms: 0 };
 
   if (process.platform !== 'win32') {
     return { ...base, error: '视觉通道用的是 Windows OCR,当前系统不支持', ms: Date.now() - started };
   }
 
   const script = ensureVisionScript(opts.dataDir);
-  const outDir = join(opts.dataDir, 'wt');
-  mkdirSync(outDir, { recursive: true });
+  mkdirSync(runDir, { recursive: true });
   try {
     rmSync(textPath, { force: true });
   } catch {
@@ -134,7 +161,7 @@ export async function probeVision(opts: VisionProbeOptions): Promise<VisionResul
   }
   let lines = 0;
   for (const line of text.split(/\r?\n/)) if (line.trim()) lines += 1;
-  return { ok: true, pngPath, text, lines, ms };
+  return { ok: true, pngPath, runDir, text, lines, ms };
 }
 
 /** 从 OCR 文本里挑出战况线索;只做提示,不据此算战绩。 */

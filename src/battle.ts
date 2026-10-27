@@ -16,6 +16,14 @@ export interface GameState {
 
 export interface Indicators {
   valid: boolean;
+  /**
+   * 响应里到底有没有 valid 字段。
+   *
+   * 真机 /indicators 偶尔只回一半字段，或者返回一个残缺对象；那种情况下 bool(undefined)
+   * 会得到 false，若直接当成"阵亡"就是凭缺失字段编战绩。所以把"有没有这个字段"单独记下来，
+   * 只有明确说出 false 才算指标失效。
+   */
+  known: boolean;
   speed: number;
   altitude: number;
   type: string;
@@ -97,8 +105,6 @@ export interface BattleClientOptions {
 export interface BattleWatcherOptions {
   client: BattleClient;
   now?: () => number;
-  /** 阵亡多少秒后可以再判一次,避免同一局反复触发。 */
-  deathCooldownMs?: number;
 }
 
 function num(value: unknown, fallback = 0): number {
@@ -150,6 +156,13 @@ const KILL_WORDS = [
 const MAX_KILL_EVENTS = 3;
 /** 全战场播报里最多取几条当素材。 */
 const MAX_HUD_EVENTS = 12;
+/**
+ * 同一毫秒级的重复判定防抖。
+ *
+ * 早期版本用 8 秒冷却挡重复计死，但冷却既挡不住"持续失效反复计死"，又会吞掉重生后
+ * 短时间内的二次阵亡。现在由"存活边沿"负责去重，这里只留一个极小的防抖窗。
+ */
+const DEATH_DEBOUNCE_MS = 200;
 const EVENT_WORDS = ['captured', 'lost', 'destroyed', 'killed', 'shot down'];
 
 function looksLikeKill(text: string): boolean {
@@ -216,6 +229,7 @@ export class BattleClient {
     const item = raw as Record<string, unknown>;
     return {
       valid: bool(item.valid),
+      known: 'valid' in item,
       speed: num(item.speed),
       altitude: num(item.altitude),
       type: str(item.type),
@@ -374,9 +388,18 @@ interface BattleProbe {
 export class BattleWatcher {
   private readonly client: BattleClient;
   private readonly now: () => number;
-  private readonly deathCooldownMs: number;
   private online = false;
+  /** 事件状态机里的"在战局"，只由 poll 推进。 */
   private inBattle = false;
+  /** 最近一次采样看到的"在战局"，只反映观测，不消费入局/结算的转移。 */
+  private observedInBattle = false;
+  /**
+   * 阵亡边沿的武装位。
+   *
+   * 只有在 /indicators 上明确看到过一次 valid:true 才算"这一命是活的"，随后那次
+   * valid:false 才是这一次阵亡；否则持续的失效读数会被每一轮轮询重复计成死亡。
+   */
+  private aliveArmed = false;
   private lastEvt = -1;
   private lastDmg = -1;
   private kills = 0;
@@ -391,7 +414,6 @@ export class BattleWatcher {
   constructor(opts: BattleWatcherOptions) {
     this.client = opts.client;
     this.now = opts.now ?? (() => Date.now());
-    this.deathCooldownMs = opts.deathCooldownMs ?? 8000;
   }
 
   get online_now(): boolean {
@@ -400,6 +422,15 @@ export class BattleWatcher {
 
   get inBattleNow(): boolean {
     return this.inBattle;
+  }
+
+  /**
+   * 采样视角的"在战局"。
+   *
+   * 展示与工具回执要用它：用户问"现在在不在局里"是问观测结果，不该顺手把状态机推进一格。
+   */
+  get observedInBattleNow(): boolean {
+    return this.observedInBattle;
   }
 
   get currentSnapshot(): BattleSnapshot {
@@ -418,6 +449,7 @@ export class BattleWatcher {
     this.behindRaised = false;
     this.startedAt = this.now();
     this.lastDeathAt = 0;
+    this.aliveArmed = false;
     this.snapshot = { vehicle, mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
   }
 
@@ -459,11 +491,16 @@ export class BattleWatcher {
     const inBattle = missionRunning || stateOk || (mapReady && objects.length > 0);
     return { online, inBattle, state, objects };
   }
-  /** 主动刷新一次读数,不产生事件;游戏没开就保持原样。 */
+  /**
+   * 主动刷新一次读数,不产生事件、也不改变事件状态机。
+   *
+   * 早先这里会顺手写 inBattle，于是 wt_battle_state 先查一次之后，下一次 poll 就以为
+   * "已经在局里"，跳过了 reset/warmup，把上一局积压的伤害算成本局战绩。观测与转移必须分开。
+   */
   async refresh(): Promise<BattleSnapshot> {
     const probe = await this.probe();
     this.online = probe.online;
-    this.inBattle = probe.inBattle;
+    this.observedInBattle = probe.inBattle;
     if (probe.inBattle) await this.refreshSnapshot(probe.state, probe.objects);
     return this.snapshot;
   }
@@ -484,9 +521,11 @@ export class BattleWatcher {
         this.inBattle = false;
       }
       this.online = false;
+      this.observedInBattle = false;
       return out;
     }
     this.online = true;
+    this.observedInBattle = probe.inBattle;
     const state = probe.state;
     const inBattle = probe.inBattle;
 
@@ -495,6 +534,10 @@ export class BattleWatcher {
       this.resetBattle((state && state.vehicle) || '');
       await this.refreshSnapshot(state, probe.objects);
       await this.warmup();
+      // 入局这一拍就把存活边沿武装好。不武装的话,下一次读到的失效会因为"没见过活的"
+      // 而被当成缺数据直接丢掉,玩家看到的现象就是"第一次阵亡从来不播"。
+      const firstInd = await this.client.indicators();
+      if (firstInd && firstInd.known && firstInd.valid) this.aliveArmed = true;
       out.push({ kind: 'enter', snapshot: this.snapshot });
       return out;
     }
@@ -508,6 +551,21 @@ export class BattleWatcher {
     }
 
     const hud = await this.client.hud(this.lastEvt, this.lastDmg);
+    /**
+     * 服务端游标回退。
+     *
+     * 客户端重启/重连后 hudmsg 的 id 会从 1 重新计数；这时若继续用旧游标查询，
+     * 新播报的 id 永远小于旧游标，会被本地过滤掉——表现就是"接下来一局什么都读不到"。
+     * 只有真的看到"有数据但最大 id 比记录的小"才重建游标，读不到数据不算回退。
+     */
+    const dmgMax = maxId(hud.damage, -1);
+    const evtMax = maxId(hud.events, -1);
+    if ((hud.damage.length > 0 && dmgMax < this.lastDmg) || (hud.events.length > 0 && evtMax < this.lastEvt)) {
+      this.lastEvt = -1;
+      this.lastDmg = -1;
+      await this.warmup();
+      return out;
+    }
     this.lastEvt = maxId(hud.events, this.lastEvt);
     this.lastDmg = maxId(hud.damage, this.lastDmg);
 
@@ -533,14 +591,20 @@ export class BattleWatcher {
     }
 
     const ind = await this.client.indicators();
-    if (ind && !ind.valid && this.now() - this.lastDeathAt > this.deathCooldownMs) {
-      this.deaths += 1;
-      this.streak = 0;
-      this.lastDeathAt = this.now();
-      out.push({ kind: 'death', total: this.deaths, snapshot: this.snapshot });
-      if (!this.behindRaised && this.deaths >= this.kills + 2) {
-        this.behindRaised = true;
-        out.push({ kind: 'behind', kills: this.kills, deaths: this.deaths, snapshot: this.snapshot });
+    if (ind && ind.known) {
+      if (ind.valid) {
+        // 看到一次有效存活：武装边沿，下一次失效才算阵亡。
+        this.aliveArmed = true;
+      } else if (this.aliveArmed && this.now() - this.lastDeathAt >= DEATH_DEBOUNCE_MS) {
+        this.aliveArmed = false;
+        this.deaths += 1;
+        this.streak = 0;
+        this.lastDeathAt = this.now();
+        out.push({ kind: 'death', total: this.deaths, snapshot: this.snapshot });
+        if (!this.behindRaised && this.deaths >= this.kills + 2) {
+          this.behindRaised = true;
+          out.push({ kind: 'behind', kills: this.kills, deaths: this.deaths, snapshot: this.snapshot });
+        }
       }
     }
 

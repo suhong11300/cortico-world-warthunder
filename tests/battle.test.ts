@@ -130,24 +130,46 @@ describe('战局状态机', () => {
     void clock;
   });
 
-  it('阵亡按冷却判一次,连死会追加 behind', async () => {
+  it('同一具尸体只记一次阵亡,重生后再死才继续累加', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
     await watcher.poll();
 
+    // 存活 -> 失效 是一次边沿,记一次阵亡。
     routes.indicators = { valid: false, speed: 0, altitude: 0, type: 'P-51' };
     const first = await watcher.poll();
     expect(first.map((event) => event.kind)).toEqual(['death']);
 
+    // 尸体状态持续失效:不管过多久都不该继续加死亡数(旧版 8 秒冷却会在这里反复计死)。
     clock += 5_000;
-    const cooling = await watcher.poll();
-    expect(cooling).toEqual([]);
+    expect(await watcher.poll()).toEqual([]);
+    clock += 30_000;
+    expect(await watcher.poll()).toEqual([]);
+    expect(watcher.tally.deaths).toBe(1);
 
-    clock += 10_000;
+    // 重生:重新看到有效存活才重新武装,随后的失效才是第二次阵亡。
+    routes.indicators = { valid: true, speed: 380, altitude: 900, type: 'P-51' };
+    expect(await watcher.poll()).toEqual([]);
+    routes.indicators = { valid: false, speed: 0, altitude: 0, type: 'P-51' };
+    clock += 3_000;
     const second = await watcher.poll();
     expect(second.map((event) => event.kind)).toEqual(['death', 'behind']);
     expect(watcher.tally.deaths).toBe(2);
+  });
+
+  it('/indicators 缺 valid 字段时不当成阵亡', async () => {
+    let clock = 100_000;
+    const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    await watcher.poll();
+
+    // 只回一半字段(真机上偶发):这是"读不到",不是"死了"。
+    routes.indicators = { speed: 0, altitude: 0, type: 'P-51' } as unknown as Routes['indicators'];
+    expect(await watcher.poll()).toEqual([]);
+    clock += 12_000;
+    expect(await watcher.poll()).toEqual([]);
+    expect(watcher.tally.deaths).toBe(0);
   });
 
   it('离开战局推 leave,带本局战绩与时长', async () => {
@@ -195,7 +217,7 @@ describe('战局状态机', () => {
     expect(watcher.tally.kills).toBe(0);
   });
 
-  it('refresh 更新读数并同步在局标志,但不产事件', async () => {
+  it('refresh 只更新读数与采样标志,不消费入局转移', async () => {
     const routes: Routes = {
       state: inBattle,
       indicators: { valid: true, speed: 512, altitude: 3300, type: 'P-51D-30' },
@@ -207,8 +229,10 @@ describe('战局状态机', () => {
     expect(snapshot.speed).toBe(512);
     expect(snapshot.enemies).toBe(1);
     expect(snapshot.allies).toBe(1);
-    // refresh 只读数、不推事件;但状态标志要跟着同步,否则 wt_battle_state 会在局里报「不在战局」。
-    expect(watcher.inBattleNow).toBe(true);
+    // 采样标志要跟着更新(否则 wt_battle_state 会在局里报「不在战局」);
+    // 但入局/结算这类转移必须留给 poll,否则一次查询就会让后续 poll 跳过 reset/warmup。
+    expect(watcher.observedInBattleNow).toBe(true);
+    expect(watcher.inBattleNow).toBe(false);
     expect(watcher.tally.kills).toBe(0);
   });
 });

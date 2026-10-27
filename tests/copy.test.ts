@@ -80,7 +80,7 @@ describe('战局文案', () => {
     expect(line).toContain('P-51D-30 野马');
     expect(line).toContain('速度 412 km/h');
     expect(line).toContain('高度 1831 m');
-    expect(line).toContain('附近 3 敌 / 2 友');
+    expect(line).toContain('地图可见 3 敌 / 2 友');
   });
 
   it('读数全空时给出明确占位,不是空串', () => {
