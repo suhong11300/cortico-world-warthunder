@@ -328,6 +328,7 @@ export class WtWorld implements World {
       const client = new BattleClient({
         host,
         port: cfg.gamePort,
+        textEncoding: cfg.textEncoding,
         ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
       });
       const watcher = new BattleWatcher({ client, now: () => this.nowMs() });

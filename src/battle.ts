@@ -95,11 +95,66 @@ export type BattleEvent =
   | { kind: 'behind'; kills: number; deaths: number; snapshot: BattleSnapshot }
   | { kind: 'hud'; detail: string };
 
+/** 8111 响应的文本编码策略:auto 先按 UTF-8 试,解出替换字符就换 GBK;也可以钉死一种。 */
+export type TextEncoding = 'auto' | 'utf-8' | 'gbk';
+
+/** 真正交给 TextDecoder 的两档。 */
+type RealEncoding = 'utf-8' | 'gbk';
+
+/**
+ * 把 8111 的响应字节解成文本。
+ *
+ * 实测中文客户端的 /gamechat 与 /hudmsg 吐的是 GBK 字节:直接 res.text()(按 UTF-8 解)
+ * 会得到「?й?」这类替换字符,玩家名一起烂掉,按名字匹配全失真。所以这里先看 Content-Type
+ * 的 charset;没写清楚就先按 UTF-8 试解一次,出现 U+FFFD 再按 GBK 重解。
+ *
+ * 钉死档位(textEncoding=utf-8/gbk)只给排障用:猜错的那一次会把整段中文变成问号。
+ */
+export function decodeGameText(
+  input: ArrayBuffer | Uint8Array,
+  contentType = '',
+  mode: TextEncoding = 'auto',
+): string {
+  const all = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (all.byteLength === 0) return '';
+  // UTF-8 BOM 先剥掉,否则 JSON.parse 会因为开头的 \ufeff 直接失败。
+  const bom = all.length >= 3 && all[0] === 0xef && all[1] === 0xbb && all[2] === 0xbf ? 3 : 0;
+  const bytes = bom > 0 ? all.subarray(bom) : all;
+  const declared = declaredEncoding(contentType);
+  if (mode === 'gbk' || mode === 'utf-8') return decodeAs(mode, bytes);
+  if (declared) return decodeAs(declared, bytes);
+  // auto:GBK 字节按 UTF-8 解几乎必然产生 U+FFFD,拿它当「猜错了」的判据。
+  const utf8 = decodeAs('utf-8', bytes);
+  if (!utf8.includes('\ufffd')) return utf8;
+  const gbk = decodeAs('gbk', bytes);
+  return gbk.includes('\ufffd') ? utf8 : gbk;
+}
+
+function declaredEncoding(contentType: string): RealEncoding | '' {
+  const hit = /charset\s*=\s*"?([\w-]+)/i.exec(contentType);
+  if (!hit) return '';
+  const label = (hit[1] ?? '').toLowerCase();
+  if (label === 'gbk' || label === 'gb2312' || label === 'gb18030') return 'gbk';
+  if (label === 'utf-8' || label === 'utf8') return 'utf-8';
+  return '';
+}
+
+function decodeAs(label: RealEncoding, bytes: Uint8Array): string {
+  try {
+    return new TextDecoder(label).decode(bytes);
+  } catch {
+    // 运行时缺某张码表时退回另一档,至少别把整次读取变成异常。
+    return new TextDecoder(label === 'gbk' ? 'utf-8' : 'gbk').decode(bytes);
+  }
+}
+
 export interface BattleClientOptions {
   host: string;
   port: number;
   fetchImpl?: typeof globalThis.fetch;
   timeoutMs?: number;
+  /** 文本编码策略,默认 auto。 */
+  textEncoding?: TextEncoding;
 }
 
 export interface BattleWatcherOptions {
@@ -128,8 +183,8 @@ function toHudEvent(raw: unknown): HudEvent | null {
     id,
     time: num(item.time),
     type: str(item.type),
-    msg: str(item.msg),
-    sender: str(item.sender),
+    msg: cleanBattleText(str(item.msg)),
+    sender: cleanBattleText(str(item.sender)),
   };
 }
 
@@ -174,6 +229,7 @@ export class BattleClient {
   private readonly base: string;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
+  private readonly encoding: TextEncoding;
 
   constructor(opts: BattleClientOptions) {
     const host = opts.host.trim() || '127.0.0.1';
@@ -181,6 +237,7 @@ export class BattleClient {
     this.base = 'http://' + host + ':' + port;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 2500;
+    this.encoding = opts.textEncoding ?? 'auto';
   }
 
   get origin(): string {
@@ -196,7 +253,12 @@ export class BattleClient {
         headers: { accept: 'application/json' },
       });
       if (!res.ok) return null;
-      const text = await res.text();
+      const contentType = typeof res.headers?.get === 'function' ? res.headers.get('content-type') ?? '' : '';
+      // 真 Response 有 arrayBuffer:按字节解才拿得到正确的中文;测试与精简实现只有 text() 时退回去。
+      const text =
+        typeof res.arrayBuffer === 'function'
+          ? decodeGameText(new Uint8Array(await res.arrayBuffer()), contentType, this.encoding)
+          : await res.text();
       const start = text.indexOf('{');
       const startArray = text.indexOf('[');
       if (start < 0 && startArray < 0) return null;
@@ -636,20 +698,27 @@ function toChatLine(raw: unknown): ChatLine | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const item = raw as Record<string, unknown>;
   const id = num(item.id);
-  const msg = cleanChatText(str(item.msg)).slice(0, MAX_CHAT_MSG);
+  const msg = cleanBattleText(str(item.msg)).slice(0, MAX_CHAT_MSG);
   if (!msg) return null;
   return {
     id: Number.isFinite(id) ? id : 0,
-    sender: cleanChatText(str(item.sender)).slice(0, MAX_CHAT_SENDER),
+    sender: cleanBattleText(str(item.sender)).slice(0, MAX_CHAT_SENDER),
     msg,
     enemy: bool(item.enemy),
-    mode: cleanChatText(str(item.mode)).slice(0, 16) || 'All',
+    mode: cleanBattleText(str(item.mode)).slice(0, 16) || 'All',
   };
 }
 
-function cleanChatText(value: string): string {
+/**
+ * 清掉 8111 文本里的隐形垃圾。
+ *
+ * 玩家名里混进零宽空格(U+200B)与 BOM(U+FEFF)是实测过的:它们不可见,但会让「按名字
+ * 匹配」永远对不上,所以这里直接删掉而不是换成空格;真正的控制字符才当空白处理。
+ */
+function cleanBattleText(value: string): string {
   return value
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, " ")
+    .replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
     .replace(/\s+/g, " ")
     .trim();
 }

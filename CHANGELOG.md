@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.7
+
+### 修复
+
+- 遥测文本改按字节解码：中文客户端的 `/gamechat` 与 `/hudmsg` 返回的是 GBK 字节，原来用 `res.text()` 按 UTF-8 解，中文与玩家名会变成 `?й?` 一类的替换字符，按名字匹配全部失真。现在读 `arrayBuffer` 后先看 `Content-Type` 的 charset，没写清楚就先按 UTF-8 试解、出现 `U+FFFD` 再按 GBK 重解（`src/battle.ts` 的 `decodeGameText`）。
+- 新增配置 `textEncoding`（`auto` / `utf-8` / `gbk`，默认 `auto`）：排障时可以钉死一档；钉错会让整段中文变问号，所以默认交给自动判据。
+- 玩家名净化：`/hudmsg` 的 `msg` 与 `sender` 也走统一清洗。零宽空格（U+200B–U+200F）、行分隔符与 BOM（U+FEFF）**直接删除**而不是替换成空格——它们夹在名字中间，换成空格只会让「按名字匹配」更差；真正的控制字符仍当空白处理。
+- 测试 170 → 180：新增 GBK / UTF-8 双通道解码、`charset` 声明优先、BOM 剥离、钉错档位的代价、GBK 的 `/gamechat` 与 `/hudmsg` 端到端、零宽名字清洗，以及只有 `text()` 的 fetch 实现回归。
+
 ## 0.2.6
 
 ### 文档

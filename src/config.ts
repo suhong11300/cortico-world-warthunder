@@ -15,6 +15,13 @@ export interface WtConfigSection {
   /** 本地遥测服务地址,战争雷霆客户端运行时监听。 */
   gameHost: string;
   gamePort: number;
+  /**
+   * 8111 响应的文本编码。
+   *
+   * 中文客户端的 /gamechat 与 /hudmsg 是 GBK 字节,按 UTF-8 解会整套变问号、玩家名一起烂。
+   * auto 先试 UTF-8、见到替换字符再按 GBK 重解;钉死某一档只用于排障。
+   */
+  textEncoding: 'auto' | 'utf-8' | 'gbk';
   /** 轮询间隔(毫秒),实际下限 800。 */
   pollMs: number;
   /** 定时讲解间隔(毫秒),0 表示只报事件不报态势。 */
@@ -71,6 +78,7 @@ export const WT_DEFAULTS: WtConfigSection = {
   chatterLevel: 'important',
   gameHost: '127.0.0.1',
   gamePort: 8111,
+  textEncoding: 'auto',
   pollMs: 1500,
   commentaryEveryMs: 45000,
   kbUrl: '',
@@ -110,6 +118,7 @@ const ENTRIES: Entry[] = [
   { key: 'worlds.wt.autoBrief', title: '自动播报', description: '战局事件与定时讲解是否自动推送。关掉后只在被显式调用时出声。', prop: { type: 'boolean' } },
   { key: 'worlds.wt.gameHost', title: '遥测地址', description: '战争雷霆客户端的本地遥测服务所在主机。本机运行留 127.0.0.1。', prop: { type: 'string' } },
   { key: 'worlds.wt.gamePort', title: '遥测端口', description: '默认 8111。改过启动参数或端口被占用时改这里。', prop: { type: 'number' } },
+  { key: 'worlds.wt.textEncoding', title: '遥测文本编码', description: 'auto 先按 UTF-8 解、见到替换字符再按 GBK 重解;中文客户端的对局聊天是 GBK,钉死 utf-8 会整段变问号。', prop: { type: 'string', enum: ['auto', 'utf-8', 'gbk'] } },
   { key: 'worlds.wt.pollMs', title: '轮询间隔(ms)', description: '读取战局状态的频率,越小越跟手也越耗 CPU。1000 到 3000 之间最合适。', prop: { type: 'number' } },
   { key: 'worlds.wt.commentaryEveryMs', title: '讲解间隔(ms)', description: '战局中定时讲一句态势的间隔;0 表示只在击毁、阵亡、结算时开口。', prop: { type: 'number' } },
   { key: 'worlds.wt.kbUrl', title: '知识库源', description: '一个返回 {version, entries} 的 JSON 地址;留空则只用内置词条。', prop: { type: 'string' } },

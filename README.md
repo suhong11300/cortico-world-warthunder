@@ -75,6 +75,7 @@ WebUI 端口以宿主配置里的 `web.port` 为准（默认 17788），不要�
 | chatterLevel | important | 播报档位：`quiet` 只报进局与结算，`important` 再报击毁、阵亡、逆风，`commentary` 才按 `commentaryEveryMs` 定时讲态势 |
 | gameHost | 127.0.0.1 | 遥测服务主机；游戏在本机就留这个 |
 | gamePort | 8111 | 遥测端口 |
+| textEncoding | auto | 遥测文本编码：`auto` 先试 UTF-8、见替换字符再按 GBK 重解；`utf-8` / `gbk` 用于排障时钉死 |
 | pollMs | 1500 | 轮询间隔，1000–3000 最合适 |
 | commentaryEveryMs | 45000 | 战局中定时讲解间隔；0 表示只在事件上开口 |
 | kbUrl | 空 | 返回 `{version, entries}` 的 JSON 地址；留空只用内置 |
@@ -161,6 +162,8 @@ WebUI 端口以宿主配置里的 `web.port` 为准（默认 17788），不要�
 - **阵亡按存活边沿判**：先要看到 `/indicators` 的 `valid=true`（武装），之后变成 `valid=false` 才计一次；同一次持续阵亡不会反复累加，重生（重新 valid）后再死才继续增加。缺 `valid` 字段不当成阵亡——那只是没读到。
 - **击毁词**中英并列（`destroyed` / `击毁` / `引燃` / `先拔头筹` 等），中文客户端主要用「引燃」表示击毁。
 
+**文本编码**：中文客户端的 `/gamechat` 与 `/hudmsg` 吐的是 **GBK 字节**，按 UTF-8 解会变成 `?й?` 这种替换字符，玩家名一起烂掉，按名字匹配全部失真。默认 `textEncoding=auto`：先按 UTF-8 解，出现替换字符（`U+FFFD`）再按 GBK 重解；`Content-Type` 里写了 `charset=gbk` 就直接按声明走。玩家名里混进的零宽空格（`U+200B`）与 BOM（`U+FEFF`）会被直接删掉——它们夹在名字中间，换成空格只会让匹配更差。
+
 **读数口径**：`/map_obj.json` 统计的是整张可见地图上的对象，没有距离筛选，所以播报写「地图可见 N 敌 / M 友」而不是「附近」；阵亡、伤害归因、引燃与首杀匹配都是按消息文本的启发式判断。回执会带读取时间与缺失字段，不确定的列在「没读到」里，不回填 0。
 
 **能力边界**：这是客户端实现、非文档化合同——字段可能随版本变，只在本机可用，也没有鉴权。插件对每个字段都做了容错（缺字段按 0 / 空处理，解析失败当离线），但版本更新后仍建议先看一眼 `wt_status`。
@@ -219,7 +222,7 @@ WebUI 端口以宿主配置里的 `web.port` 为准（默认 17788），不要�
 
 ```bash
 corepack pnpm typecheck
-corepack pnpm test          # 8 个文件 170 项
+corepack pnpm test          # 9 个文件 180 项
 ```
 
 包内自带 `describe.json`（11 工具 / 7 事件 / 1 提示词），官方校验：
@@ -231,6 +234,7 @@ cd <Cortina>/state/cortico && corepack pnpm check:extension <包根目录>
 ## 限制
 
 - 遥测只在本机可用；云主机、主机版、端口被封需要走视觉档。
+- 8111 没写文档也没声明编码：响应按 `textEncoding=auto` 猜（先 UTF-8 再退 GBK）。客户端若改成别的代码页，会看到成片替换字符，此时手动钉一档即可。
 - 视觉档只做一次性探测，不做连续读屏。
 - 知识库是静态文本 + 远程 JSON，没有爬虫，不抓游戏官网。
 - `llmApiKey` 明文存在 `config.json`，别填主账号密钥。
