@@ -370,7 +370,7 @@ export class BattleClient {
     };
   }
 
-  /** lastEvt / lastDmg 传 -1 表示"不要历史",第一次预热用它只记游标。 */
+  /** lastEvt / lastDmg 传 -1 表示"要全量";本插件每轮都传 -1,按基线在本地过滤。 */
   async hud(lastEvt: number, lastDmg: number): Promise<HudSnapshot> {
     const raw = await this.json('/hudmsg?lastEvt=' + lastEvt + '&lastDmg=' + lastDmg);
     const empty: HudSnapshot = { events: [], damage: [] };
@@ -505,6 +505,65 @@ function maxId(events: HudEvent[], fallback: number): number {
   return max;
 }
 
+/** 同一次击毁的多条播报在 feed 里是相邻 id,间隔不会超过这个数。 */
+const KILL_DEDUPE_ID = 3;
+
+/** 一次"自己的击毁"命中,带去重用的幂等键。 */
+export interface SelfKillHit {
+  /** 幂等键:发起者>目标#第几次。全量重放多少轮都只会入账一次。 */
+  key: string;
+  /** 原始播报正文,拿去开口。 */
+  detail: string;
+  /** 目标昵称(已去掉尾部的载具括号)。 */
+  victim: string;
+  /** 这次击毁在 feed 里最大的那条 id。 */
+  id: number;
+  /** 在本轮 feed 范围内,同一对玩家之间的第几次击毁。 */
+  occurrence: number;
+}
+
+/**
+ * 从全量 damage feed 里挑出"自己的击杀"。
+ *
+ * 纯函数:不读时钟、不改状态,只按基线 id 过滤后按 id 升序判定。调用方拿 key 做幂等
+ * 去重即可 —— 这正是把增量游标换成"每轮全量重算"之后仍然不会重复计数的关键。
+ *
+ * 同一次击毁会连着吐多条播报(击毁 / 起火 / 首杀),这里按 发起者>目标 归组:组内
+ * time 相差不到 KILL_DEDUPE_MS 或 id 相差不超过 KILL_DEDUPE_ID 就算同一条。time
+ * 缺失(部分服务端、以及全部测试夹具)时自动退化为纯 id 邻近判断。
+ */
+export function computeSelfKills(
+  damage: HudEvent[],
+  opts: { afterId: number; playerName: string },
+): SelfKillHit[] {
+  const hits: SelfKillHit[] = [];
+  const anchor = new Map<string, { time: number; id: number }>();
+  const occurrence = new Map<string, number>();
+  const ordered = damage.filter((event) => event.id > opts.afterId).sort((a, b) => a.id - b.id);
+  for (const event of ordered) {
+    const detail = (event.msg || event.type || '').trim();
+    if (!looksLikeKill(detail)) continue;
+    const line = parseKillLine(detail);
+    if (!line || !isSelfKill(line, opts.playerName)) continue;
+    const pair = normalizePlayerName(line.killer) + '>' + normalizePlayerName(line.victim);
+    const prev = anchor.get(pair);
+    if (prev) {
+      const nearByTime = event.time > 0 && prev.time > 0 && Math.abs(event.time - prev.time) * 1000 < KILL_DEDUPE_MS;
+      const nearById = event.id - prev.id <= KILL_DEDUPE_ID;
+      if (nearByTime || nearById) {
+        // 是上一条的后续播报:只把锚点挪到最新,不重复入账。
+        anchor.set(pair, { time: event.time, id: event.id });
+        continue;
+      }
+    }
+    anchor.set(pair, { time: event.time, id: event.id });
+    const seq = (occurrence.get(pair) ?? 0) + 1;
+    occurrence.set(pair, seq);
+    hits.push({ key: pair + '#' + seq, detail, victim: line.victim, id: event.id, occurrence: seq });
+  }
+  return hits;
+}
+
 /**
  * 把 8111 的轮询结果翻译成"要不要开口"的事件。
  *
@@ -541,12 +600,22 @@ export class BattleWatcher {
    * valid:false 才是这一次阵亡；否则持续的失效读数会被每一轮轮询重复计成死亡。
    */
   private aliveArmed = false;
-  private lastEvt = -1;
-  private lastDmg = -1;
+  /**
+   * 本局基线：只认 id 大于它的播报，等于"入局那一刻之后发生的事"。
+   *
+   * 这里刻意不用增量游标查询（hudmsg?lastDmg=N）。游标一旦大于服务端现存的最大 id，
+   * 服务端就永远回空；而"回空"又不足以判定游标已经失效——两个判断互为前提，
+   * 于是整条战绩通道永久卡死（游戏重启后 id 从 1 重新计数必踩，且不重启宿主恢复不了）。
+   * 现在每轮拉全量、按名字幂等重算，回退只影响基线，不会再让计数停摆。
+   */
+  private baselineDmgId = -1;
+  private baselineEvtId = -1;
   /** 自己的游戏内昵称，空串表示没配（此时不认领任何击杀）。 */
   private readonly playerName: string;
-  /** 近期已计过的击杀，用来吸收同一次击毁的重复播报。 */
-  private readonly recentKills = new Map<string, number>();
+  /** 已经入账的击杀幂等键（发起者>目标#第几次），全量重放多少次都只算一次。 */
+  private readonly countedKills = new Set<string>();
+  /** 已经开口过的全战场播报 id，全量重放时不重复播。 */
+  private readonly seenHud = new Set<number>();
   private kills = 0;
   private deaths = 0;
   private streak = 0;
@@ -596,7 +665,10 @@ export class BattleWatcher {
     this.startedAt = this.now();
     this.lastDeathAt = 0;
     this.aliveArmed = false;
-    this.recentKills.clear();
+    this.countedKills.clear();
+    this.seenHud.clear();
+    this.baselineDmgId = -1;
+    this.baselineEvtId = -1;
     this.snapshot = { vehicle, mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
   }
 
@@ -651,11 +723,11 @@ export class BattleWatcher {
     if (probe.inBattle) await this.refreshSnapshot(probe.state, probe.objects);
     return this.snapshot;
   }
-  /** 预热:只把游标推到当前最新,不产生事件。 */
+  /** 预热:只把基线锚到当前最新,不产生事件。 */
   async warmup(): Promise<void> {
     const hud = await this.client.hud(-1, -1);
-    this.lastEvt = maxId(hud.events, this.lastEvt);
-    this.lastDmg = maxId(hud.damage, this.lastDmg);
+    this.baselineEvtId = maxId(hud.events, -1);
+    this.baselineDmgId = maxId(hud.damage, -1);
   }
 
   /** 拉一次并给出这一轮要推的事件;游戏没开就返回空数组。 */
@@ -697,43 +769,30 @@ export class BattleWatcher {
       return out;
     }
 
-    const hud = await this.client.hud(this.lastEvt, this.lastDmg);
-    /**
-     * 服务端游标回退。
-     *
-     * 客户端重启/重连后 hudmsg 的 id 会从 1 重新计数；这时若继续用旧游标查询，
-     * 新播报的 id 永远小于旧游标，会被本地过滤掉——表现就是"接下来一局什么都读不到"。
-     * 只有真的看到"有数据但最大 id 比记录的小"才重建游标，读不到数据不算回退。
-     */
+    // 每轮拉全量。增量游标一旦超过服务端现存的最大 id 就永久回空，而"回空"与
+    // "这段确实没播报"无法区分，两个判断互为前提 → 战绩永久卡死（游戏重启后 id 从 1
+    // 重新计数必踩，不重启宿主就恢复不了）。真机全量 159 条，1500ms 一轮完全扛得住。
+    const hud = await this.client.hud(-1, -1);
     const dmgMax = maxId(hud.damage, -1);
     const evtMax = maxId(hud.events, -1);
-    if ((hud.damage.length > 0 && dmgMax < this.lastDmg) || (hud.events.length > 0 && evtMax < this.lastEvt)) {
-      this.lastEvt = -1;
-      this.lastDmg = -1;
-      await this.warmup();
-      return out;
-    }
-    this.lastEvt = maxId(hud.events, this.lastEvt);
-    this.lastDmg = maxId(hud.damage, this.lastDmg);
+    /**
+     * 服务端 id 回退：游戏重启/重连后从 1 重新计数。
+     *
+     * 全量查询下这个信号每一轮都看得到，所以判定不再要求"这一轮必须先拿到非空数据"
+     * ——那条前置条件正是原来卡死的原因。基线作废后按当前 feed 重新锚定：宁可把
+     * 重启前的残留当历史，也不要整条通道停摆。
+     */
+    if (dmgMax >= 0 && this.baselineDmgId > dmgMax) this.baselineDmgId = -1;
+    if (evtMax >= 0 && this.baselineEvtId > evtMax) this.baselineEvtId = -1;
 
     await this.refreshSnapshot(state, probe.objects);
 
     let killPushed = 0;
-    for (const hit of hud.damage) {
-      if (!looksLikeKill(hit.msg + ' ' + hit.type)) continue;
-      /**
-       * 先判归属再计数。
-       *
-       * damage 是全场 kill feed，不判归属就会把别人的击杀全算成自己的战绩，还会让
-       * 「本局第 N 个」的喝彩串台、逆风判定永远打不起来。
-       */
-      const line = parseKillLine(hit.msg || hit.type);
-      if (!line || !isSelfKill(line, this.playerName)) continue;
-      // 同一次击毁会连着吐多条播报（击毁 + 起火 + 首杀），按发起者加目标做短窗去重。
-      const dedupeKey = normalizePlayerName(line.killer) + '>' + normalizePlayerName(line.victim);
-      const seenAt = this.recentKills.get(dedupeKey);
-      if (seenAt !== undefined && this.now() - seenAt < KILL_DEDUPE_MS) continue;
-      this.recentKills.set(dedupeKey, this.now());
+    for (const hit of computeSelfKills(hud.damage, { afterId: this.baselineDmgId, playerName: this.playerName })) {
+      // 幂等键 = 发起者>目标#第几次。全量重放多少轮都只入账一次，服务端 id 回退
+      // 或 feed 窗口滑动也不会重复计。
+      if (this.countedKills.has(hit.key)) continue;
+      this.countedKills.add(hit.key);
       // 战绩永远照实累加,限的只是"逐条开口"这件事。
       this.kills += 1;
       this.streak += 1;
@@ -745,7 +804,7 @@ export class BattleWatcher {
         kind: 'kill',
         total: this.kills,
         streak: this.streak,
-        detail: (hit.msg || hit.type || '').trim(),
+        detail: hit.detail,
         snapshot: this.snapshot,
       });
     }
@@ -770,12 +829,16 @@ export class BattleWatcher {
 
     let hudPushed = 0;
     for (const event of hud.events) {
+      // 全量重放:入局前的旧播报跳过,已经开过口的 id 不再重复,否则每一轮都会刷屏。
+      if (event.id <= this.baselineEvtId) continue;
+      if (this.seenHud.has(event.id)) continue;
       if (hudPushed >= MAX_HUD_EVENTS) break;
       const text = (event.msg || event.type || '').trim();
       if (!text) continue;
       const lower = text.toLowerCase();
       if (!EVENT_WORDS.some((word) => lower.includes(word))) continue;
       hudPushed += 1;
+      this.seenHud.add(event.id);
       out.push({ kind: 'hud', detail: text });
     }
 
