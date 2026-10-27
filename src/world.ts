@@ -13,6 +13,7 @@ import {
   chatDraftHint,
   chatDraftInstruction,
   chatInstruction,
+  chatChannelLabel,
   chatTargetLabel,
   clip,
   commentaryText,
@@ -331,7 +332,7 @@ export class WtWorld implements World {
         textEncoding: cfg.textEncoding,
         ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
       });
-      const watcher = new BattleWatcher({ client, now: () => this.nowMs() });
+      const watcher = new BattleWatcher({ client, now: () => this.nowMs(), playerName: this.opts.cfg.playerName });
       this.client = client;
       this.watcher = watcher;
       this.clientKey = key;
@@ -864,11 +865,10 @@ export class WtWorld implements World {
         if (lines.length === 0) return original;
         if (mode === 'recent') return original + '\n(要译文就再调一次 action=translate)';
         const material = [
-          '对局聊天原文(每条一行,格式 [频道/阵营] 玩家名: 内容):',
+          '对局聊天原文(每条一行,格式 [频道] 玩家名: 内容。频道取客户端本地化文案,enemy 字段真机自相矛盾,所以不标阵营):',
           ...lines.map((line) => {
-            const side = line.enemy ? '对面' : '我方';
-            const chan = line.mode && line.mode.toLowerCase() !== 'all' ? line.mode : '全体';
-            return '[' + chan + '/' + side + '] ' + (line.sender || '未知玩家') + ': ' + line.msg;
+            const chan = chatChannelLabel(line.mode, this.lang());
+            return '[' + chan + '] ' + (line.sender || '未知玩家') + ': ' + line.msg;
           }),
         ].join('\n');
         const label = chatTargetLabel(target, lang);
@@ -1087,6 +1087,7 @@ export class WtWorld implements World {
     const lines = [
       '🐯 war thunder安东星助手 · 自检',
       '📡 遥测:' + this.originText() + ' · ' + (this.online ? '在线' : '没连上'),
+      '🎯 昵称:' + (cfg.playerName.trim() ? cfg.playerName.trim() : '未配置(不统计击杀,填 worlds.wt.playerName 后按名字认领)'),
       '🎮 战局:' + (inBattle && snapshot ? '战局中(' + battleLine(snapshot, 'zh') + ')' : '不在战局'),
       '📚 知识库:v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')' +
         (this.view.remoteVersion ? ' · 远程 ' + this.view.remoteCount + ' 条' : ' · 仅内置'),
@@ -1137,6 +1138,10 @@ export class WtWorld implements World {
       '🎮 当前战局',
       '读数:' + battleLine(snapshot, 'zh'),
       '本局:' + tally.kills + ' 杀 · ' + tally.deaths + ' 死' + (tally.bestStreak > 1 ? ' · 最长连击 ' + tally.bestStreak : ''),
+      // 8111 的击杀列表是全场播报：没配昵称就一个都不认领，得直说，不能让 0 杀看着像数据坏了。
+      this.opts.cfg.playerName.trim()
+        ? '归因:按昵称「' + this.opts.cfg.playerName.trim() + '」筛自己的击杀'
+        : '归因:没配 worlds.wt.playerName,只统计阵亡、不认领击杀',
       '读于:' + this.stamp(),
     ].join('\n');
   }

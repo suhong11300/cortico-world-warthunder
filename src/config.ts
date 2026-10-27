@@ -22,6 +22,13 @@ export interface WtConfigSection {
    * auto 先试 UTF-8、见到替换字符再按 GBK 重解;钉死某一档只用于排障。
    */
   textEncoding: 'auto' | 'utf-8' | 'gbk';
+  /**
+   * 玩家自己的游戏内昵称。
+   *
+   * 8111 的 damage 列表是全场 kill feed（sender 恒为空），只有播报里的发起者名字能
+   * 认出「这条是我打的」。留空则不认领任何击杀，只统计阵亡。
+   */
+  playerName: string;
   /** 轮询间隔(毫秒),实际下限 800。 */
   pollMs: number;
   /** 定时讲解间隔(毫秒),0 表示只报事件不报态势。 */
@@ -79,6 +86,7 @@ export const WT_DEFAULTS: WtConfigSection = {
   gameHost: '127.0.0.1',
   gamePort: 8111,
   textEncoding: 'auto',
+  playerName: '',
   pollMs: 1500,
   commentaryEveryMs: 45000,
   kbUrl: '',
@@ -119,6 +127,7 @@ const ENTRIES: Entry[] = [
   { key: 'worlds.wt.gameHost', title: '遥测地址', description: '战争雷霆客户端的本地遥测服务所在主机。本机运行留 127.0.0.1。', prop: { type: 'string' } },
   { key: 'worlds.wt.gamePort', title: '遥测端口', description: '默认 8111。改过启动参数或端口被占用时改这里。', prop: { type: 'number' } },
   { key: 'worlds.wt.textEncoding', title: '遥测文本编码', description: 'auto 先按 UTF-8 解、见到替换字符再按 GBK 重解;中文客户端的对局聊天是 GBK,钉死 utf-8 会整段变问号。', prop: { type: 'string', enum: ['auto', 'utf-8', 'gbk'] } },
+  { key: 'worlds.wt.playerName', title: '我的游戏昵称', description: '填游戏里显示的名字（含符号）。8111 的击杀列表是全场公开播报，只有靠这个名字才认得出哪些是你打的；留空则不统计击杀。', prop: { type: 'string' } },
   { key: 'worlds.wt.pollMs', title: '轮询间隔(ms)', description: '读取战局状态的频率,越小越跟手也越耗 CPU。1000 到 3000 之间最合适。', prop: { type: 'number' } },
   { key: 'worlds.wt.commentaryEveryMs', title: '讲解间隔(ms)', description: '战局中定时讲一句态势的间隔;0 表示只在击毁、阵亡、结算时开口。', prop: { type: 'number' } },
   { key: 'worlds.wt.kbUrl', title: '知识库源', description: '一个返回 {version, entries} 的 JSON 地址;留空则只用内置词条。', prop: { type: 'string' } },

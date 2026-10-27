@@ -159,11 +159,12 @@ describe('对局聊天文案', () => {
     { sender: 'shino_rs', msg: 'gg', enemy: true, mode: 'Team' },
   ];
 
-  it('chatBlock 列出条数、阵营、频道与玩家名', () => {
+  it('chatBlock 列出条数、频道与玩家名,不再标阵营', () => {
     const text = chatBlock(lines, 'zh');
     expect(text).toContain('💬 对局对话（2 条）');
-    expect(text).toContain('[全体/我方] pecusgaming：nice shot');
-    expect(text).toContain('[Team/对面] shino_rs：gg');
+    expect(text).toContain('[全体] pecusgaming：nice shot');
+    expect(text).toContain('[我方] shino_rs：gg');
+    expect(text).not.toContain('对面');
   });
 
   it('没有对话时给一句提示', () => {

@@ -215,10 +215,10 @@ describe('挂载与播报', () => {
 
   it('击毁推 kill,阵亡推 death', async () => {
     const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
-    const { world, host } = await boot({}, () => routes);
+    const { world, host } = await boot({ playerName: 'Ace' }, () => routes);
     await pollOnce(world);
 
-    routes.hud = { events: [], damage: [{ id: 3, msg: 'destroyed T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 3, msg: 'Ace destroyed T-34' }] };
     await pollOnce(world);
     expect(host.events.at(-1)?.type).toBe('wt.kill');
 
@@ -355,11 +355,11 @@ describe('工具', () => {
 describe('滥用面的闸', () => {
   it('一次轮询里击毁成堆,也只逐条开口三次,战绩照实累加', async () => {
     const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
-    const { world, host } = await boot({}, () => routes);
+    const { world, host } = await boot({ playerName: 'Ace' }, () => routes);
     await pollOnce(world);
     routes.hud = {
       events: [],
-      damage: [1, 2, 3, 4, 5, 6].map((id) => ({ id, msg: 'destroyed T-34' })),
+      damage: [1, 2, 3, 4, 5, 6].map((id) => ({ id, msg: 'Ace destroyed T-' + id })),
     };
     await pollOnce(world);
     const kills = host.events.filter((event) => event.type === 'wt.kill');
@@ -430,7 +430,8 @@ describe('对局聊天工具', () => {
     const out = await call(world, 'wt_chat');
     expect(out).toContain('💬 对局对话（2 条）');
     expect(out).toContain('pecusgaming');
-    expect(out).toContain('对面');
+    expect(out).not.toContain('对面');
+    expect(out).toContain('[全体] pecusgaming');
     expect(out).toContain('打得好 / 这玩意儿有点强');
     expect(briefs.length).toBe(1);
     expect(briefs[0]).toContain('nice shot');
@@ -711,9 +712,9 @@ describe('热更新', () => {
 describe('播报档位', () => {
   it('quiet 档只报进局与结算,战绩照常累加', async () => {
     const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
-    const { world, host } = await boot({ chatterLevel: 'quiet' }, () => routes);
+    const { world, host } = await boot({ chatterLevel: 'quiet', playerName: 'Ace' }, () => routes);
     await pollOnce(world);
-    routes.hud = { events: [], damage: [1, 2].map((id) => ({ id, msg: 'destroyed T-34' })) };
+    routes.hud = { events: [], damage: [1, 2].map((id) => ({ id, msg: 'Ace destroyed T-' + id })) };
     await pollOnce(world);
     expect(host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
     expect(host.events.some((event) => event.type === 'wt.kill')).toBe(false);

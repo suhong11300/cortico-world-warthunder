@@ -160,7 +160,12 @@ export interface BattleClientOptions {
 export interface BattleWatcherOptions {
   client: BattleClient;
   now?: () => number;
+  /** 玩家自己的游戏内昵称，用来从全场 kill feed 里认出自己的击杀。 */
+  playerName?: string;
 }
+
+/** 同一次击毁可能连着吐多条播报，这个窗口内同发起者+同目标只算一次。 */
+const KILL_DEDUPE_MS = 8000;
 
 function num(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -198,9 +203,15 @@ function toHudEvent(raw: unknown): HudEvent | null {
  *   「⋇ X 先拔头筹！」    ← 首杀播报
  * 所以这里中英并列，且只用包含匹配（版本间措辞还会变）。
  */
+/**
+ * 判定「这条 damage 播报是不是一次击杀」的动词。
+ *
+ * 曾经把 `引燃`/`burned`（起火，未必当场击毁）与 `先拔头筹`（首杀播报，同一次击毁会再来
+ * 一条）也算进来，实测把 51 条「击毁了」数成 54 杀——多的几条就是这么重复的。只认终局动词。
+ */
 const KILL_WORDS = [
-  'destroyed', 'killed', 'shot down', 'burned', 'shattered',
-  '击毁', '击落', '引燃', '摧毁', '击杀', '先拔头筹',
+  'destroyed', 'killed', 'shot down', 'shattered',
+  '击毁了', '击落了', '摧毁了', '击杀了',
 ];
 /**
  * 一次轮询里最多为几条击毁各推一个事件。
@@ -218,11 +229,72 @@ const MAX_HUD_EVENTS = 12;
  * 短时间内的二次阵亡。现在由"存活边沿"负责去重，这里只留一个极小的防抖窗。
  */
 const DEATH_DEBOUNCE_MS = 200;
-const EVENT_WORDS = ['captured', 'lost', 'destroyed', 'killed', 'shot down'];
+/**
+ * 全战场播报里值得当素材的动词。
+ *
+ * 必须有中文：中文客户端的 events 是「占领了战区」这种，只留英文关键字时 includes 全部
+ * 落空，一个 hud 事件都不会产生（KILL_WORDS 一直是中英并列的，这里当初漏了）。
+ */
+const EVENT_WORDS = [
+  'captured', 'lost', 'destroyed', 'killed', 'shot down',
+  '占领', '丢失', '失去', '击毁', '击落', '摧毁', '击杀', '被摧毁',
+];
 
 function looksLikeKill(text: string): boolean {
   const lower = text.toLowerCase();
   return KILL_WORDS.some((word) => lower.includes(word));
+}
+
+/** 击杀播报的动词：词前是发起者，词后是被击毁的目标。 */
+const KILL_VERBS = ['击毁了', '击落了', '摧毁了', '击杀了', 'destroyed', 'killed', 'shot down', 'shattered'];
+
+export interface KillLine {
+  killer: string;
+  victim: string;
+}
+
+/** 去掉名字尾部的「(载具)」括号段，全角半角都认。 */
+function stripVehicleTag(value: string): string {
+  return value.replace(/\s*[（(][^（()）]*[)）]\s*$/, '').trim();
+}
+
+/** 比对用的名字归一化：去零宽、去所有空白、小写。 */
+export function normalizePlayerName(value: string): string {
+  return cleanBattleText(value).replace(/\s+/g, '').toLowerCase();
+}
+
+/**
+ * 从一条 damage 播报里切出发起者与受害者。
+ *
+ * 真机形如「迪特里希 (◄EMBT) 击毁了 勃兰特 (T-80BVM)」，英文客户端是「A destroyed B」。
+ * 切不出动词（或动词在最前=没有发起者）就返回 null。
+ */
+export function parseKillLine(msg: string): KillLine | null {
+  const text = cleanBattleText(msg);
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  for (const verb of KILL_VERBS) {
+    const at = lower.indexOf(verb);
+    if (at <= 0) continue;
+    const killer = stripVehicleTag(text.slice(0, at));
+    const victim = stripVehicleTag(text.slice(at + verb.length));
+    if (!killer) continue;
+    return { killer, victim };
+  }
+  return null;
+}
+
+/**
+ * 这条击杀是不是玩家自己造成的。
+ *
+ * 真机的 damage 列表是**全场 kill feed**：实测 144 条里 `sender` 字段全是空串，唯一的
+ * 归属线索是播报里的发起者名字。名字没配就一个都不认领——宁可不报，也不能把全场的
+ * 击杀当成自己的战绩，再拿去喊「本局第 N 个」。
+ */
+export function isSelfKill(line: KillLine, playerName: string): boolean {
+  const me = normalizePlayerName(playerName);
+  if (!me) return false;
+  return normalizePlayerName(line.killer).includes(me);
 }
 
 export class BattleClient {
@@ -331,7 +403,14 @@ export class BattleClient {
       const rgb = Array.isArray(item['color[]'])
         ? (item['color[]'] as unknown[]).map((part) => Math.trunc(num(part))).join(',')
         : '';
-      out.push({ icon: str(item.icon), type: str(item.type), x: num(item.x), y: num(item.y), color: rgb || str(item.color) });
+      out.push({
+        icon: str(item.icon),
+        type: str(item.type),
+        // 真机给的是 sx/sy（起点）与 ex/ey（终点），x/y 只在老客户端出现。
+        x: num(item.sx, num(item.x)),
+        y: num(item.sy, num(item.y)),
+        color: rgb || str(item.color),
+      });
     }
     return out;
   }
@@ -464,6 +543,10 @@ export class BattleWatcher {
   private aliveArmed = false;
   private lastEvt = -1;
   private lastDmg = -1;
+  /** 自己的游戏内昵称，空串表示没配（此时不认领任何击杀）。 */
+  private readonly playerName: string;
+  /** 近期已计过的击杀，用来吸收同一次击毁的重复播报。 */
+  private readonly recentKills = new Map<string, number>();
   private kills = 0;
   private deaths = 0;
   private streak = 0;
@@ -476,6 +559,7 @@ export class BattleWatcher {
   constructor(opts: BattleWatcherOptions) {
     this.client = opts.client;
     this.now = opts.now ?? (() => Date.now());
+    this.playerName = opts.playerName ?? '';
   }
 
   get online_now(): boolean {
@@ -512,6 +596,7 @@ export class BattleWatcher {
     this.startedAt = this.now();
     this.lastDeathAt = 0;
     this.aliveArmed = false;
+    this.recentKills.clear();
     this.snapshot = { vehicle, mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
   }
 
@@ -636,6 +721,19 @@ export class BattleWatcher {
     let killPushed = 0;
     for (const hit of hud.damage) {
       if (!looksLikeKill(hit.msg + ' ' + hit.type)) continue;
+      /**
+       * 先判归属再计数。
+       *
+       * damage 是全场 kill feed，不判归属就会把别人的击杀全算成自己的战绩，还会让
+       * 「本局第 N 个」的喝彩串台、逆风判定永远打不起来。
+       */
+      const line = parseKillLine(hit.msg || hit.type);
+      if (!line || !isSelfKill(line, this.playerName)) continue;
+      // 同一次击毁会连着吐多条播报（击毁 + 起火 + 首杀），按发起者加目标做短窗去重。
+      const dedupeKey = normalizePlayerName(line.killer) + '>' + normalizePlayerName(line.victim);
+      const seenAt = this.recentKills.get(dedupeKey);
+      if (seenAt !== undefined && this.now() - seenAt < KILL_DEDUPE_MS) continue;
+      this.recentKills.set(dedupeKey, this.now());
       // 战绩永远照实累加,限的只是"逐条开口"这件事。
       this.kills += 1;
       this.streak += 1;
@@ -717,6 +815,9 @@ function toChatLine(raw: unknown): ChatLine | null {
  */
 function cleanBattleText(value: string): string {
   return value
+    // 富文本标签：中文客户端会给聊天正文塞 <color=#FF00FF50>…</color>，方括号里的
+    // [e6] 是网格坐标，要保留。
+    .replace(/<\/?color(?:=[^>]*)?>/gi, '')
     .replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, '')
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
     .replace(/\s+/g, " ")

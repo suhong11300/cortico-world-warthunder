@@ -103,16 +103,16 @@ describe('战局状态机', () => {
   it('新增的击毁算进战绩与连击', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
-    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock, playerName: 'Ace' });
     await watcher.poll();
 
-    routes.hud = { events: [], damage: [{ id: 1, msg: 'destroyed T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 1, msg: 'Ace destroyed T-34' }] };
     const kills = await watcher.poll();
     expect(kills.map((event) => event.kind)).toEqual(['kill']);
     expect(kills[0]).toMatchObject({ total: 1, streak: 1 });
     expect(watcher.tally).toEqual({ kills: 1, deaths: 0, bestStreak: 1 });
 
-    routes.hud = { events: [], damage: [{ id: 2, msg: 'shot down Bf 109' }] };
+    routes.hud = { events: [], damage: [{ id: 2, msg: 'Ace shot down Bf 109' }] };
     const more = await watcher.poll();
     expect(more[0]).toMatchObject({ kind: 'kill', total: 2, streak: 2 });
     expect(watcher.tally.bestStreak).toBe(2);
@@ -175,9 +175,9 @@ describe('战局状态机', () => {
   it('离开战局推 leave,带本局战绩与时长', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
-    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock, playerName: 'Ace' });
     await watcher.poll();
-    routes.hud = { events: [], damage: [{ id: 1, msg: 'destroyed T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 1, msg: 'Ace destroyed T-34' }] };
     await watcher.poll();
 
     clock += 120_000;
@@ -316,19 +316,21 @@ describe('真机形状的在局判定', () => {
     expect(watcher.inBattleNow).toBe(false);
   });
 
-  it('中文客户端的引燃也算击毁', async () => {
+  it('中文客户端只认终局动词:引燃不计,击毁了才计', async () => {
     const routes: Routes = {
       mission: { status: 'running', objectives: [] },
       mapInfo: { valid: true },
       indicators: { valid: true, type: 'tankModels/ussr_t_80ue1_sm', speed: 0 },
       hud: { events: [], damage: [] },
     };
-    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000 });
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: 'Qing#11' });
     expect((await watcher.poll()).map((event) => event.kind)).toEqual(['enter']);
-    // 预热会把游标推到最新，所以这一条要在进局之后再加
+    // 预热会把游标推到最新，所以这些要在进局之后再加
     routes.hud?.damage.push({ id: 1701, msg: 'Qing#11 (M1A1 HC) 的攻击引燃了 ^LeCuk^ haoshuainiu (M1A2T)' });
-    const next = await watcher.poll();
-    expect(next.map((event) => event.kind)).toContain('kill');
+    expect((await watcher.poll()).map((event) => event.kind)).not.toContain('kill');
+    expect(watcher.tally.kills).toBe(0);
+    routes.hud?.damage.push({ id: 1702, msg: 'Qing#11 (M1A1 HC) 击毁了 ^LeCuk^ haoshuainiu (M1A2T)' });
+    expect((await watcher.poll()).map((event) => event.kind)).toContain('kill');
     expect(watcher.tally.kills).toBe(1);
   });
 });

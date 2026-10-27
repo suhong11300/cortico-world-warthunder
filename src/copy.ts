@@ -43,7 +43,11 @@ export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
     const bits = [snapshot.vehicle || 'unknown vehicle'];
     if (snapshot.speed > 0) bits.push(Math.round(snapshot.speed) + ' km/h');
     if (snapshot.altitude > 0) bits.push(Math.round(snapshot.altitude) + ' m');
-    if (snapshot.enemies > 0 || snapshot.allies > 0) bits.push(snapshot.enemies + ' enemies / ' + snapshot.allies + ' allies on the visible map');
+    if (snapshot.enemies > 0 || snapshot.allies > 0) {
+      // 陆战 RB 的小地图本来就不显示敌方单位，0 敌是真实读数而不是数据坏了，得说清。
+      const tail = snapshot.enemies === 0 ? ' (this mode usually hides enemy units, so 0 is normal)' : '';
+      bits.push(snapshot.enemies + ' enemies / ' + snapshot.allies + ' allies on the visible map' + tail);
+    }
     return bits.join(' · ');
   }
   const bits: string[] = [];
@@ -52,7 +56,11 @@ export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
   if (snapshot.altitude > 0) bits.push('高度 ' + Math.round(snapshot.altitude) + ' m');
   // 这两个数是 map_obj.json 里整张可见地图的敌方/友方对象计数,没有距离筛选,
   // 写成「附近」会让人以为是雷达范围内的接触——那是另一件事,插件没这个数据。
-  if (snapshot.enemies > 0 || snapshot.allies > 0) bits.push('地图可见 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友');
+  if (snapshot.enemies > 0 || snapshot.allies > 0) {
+    // 陆战 RB 的小地图本来就不显示敌方单位，0 敌是真实读数，写清楚免得被当成插件坏了。
+    const tail = snapshot.enemies === 0 ? '(该模式通常不显示敌方单位,0 属正常)' : '';
+    bits.push('地图可见 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友' + tail);
+  }
   return bits.length > 0 ? bits.join(' · ') : '载具数据还没读全';
 }
 
@@ -162,14 +170,40 @@ export function chatTargetLabel(target: string, lang: Lang): string {
 }
 
 /** 原文列表：翻译失败或模型关掉时，这段仍然可读。 */
+/** /gamechat 的 mode 是真机本地化中文，这里归一成频道。 */
+export type ChatChannel = 'all' | 'team' | 'squad' | '';
+
+export function chatChannelOf(mode: string): ChatChannel {
+  const m = (mode || '').trim().toLowerCase();
+  // 空 mode 表示客户端没给频道，不等于「全体」——标签层要能区分「不知道」与「全体」。
+  if (!m) return '';
+  if (m === 'all' || m === '全体' || m === '所有人') return 'all';
+  if (m === 'team' || m === '友军' || m === '我方') return 'team';
+  if (m === 'squad' || m === '小队' || m === '队伍') return 'squad';
+  return '';
+}
+
+/** 频道标签；认不出的 mode 原样保留，别把它吞成「全体」。 */
+export function chatChannelLabel(mode: string, lang: Lang): string {
+  const channel = chatChannelOf(mode);
+  if (channel === 'all') return lang === 'en' ? 'all' : '全体';
+  if (channel === 'team') return lang === 'en' ? 'team' : '我方';
+  if (channel === 'squad') return lang === 'en' ? 'squad' : '小队';
+  const raw = (mode || '').trim();
+  if (raw) return raw;
+  return lang === 'en' ? 'chat' : '对局';
+}
+
 export function chatBlock(lines: ChatLineView[], lang: Lang): string {
   if (lines.length === 0) return chatMissing(lang);
   const head = lang === "en" ? "💬 Match chat (" + lines.length + ")" : "💬 对局对话（" + lines.length + " 条）";
   const body = lines.map((line) => {
-    const side = line.enemy ? (lang === "en" ? "enemy" : "对面") : (lang === "en" ? "team" : "我方");
-    const mode = line.mode && line.mode.toLowerCase() !== "all" ? line.mode : (lang === "en" ? "all" : "全体");
+    // 只报频道，不再按 enemy 标「对面/我方」：真机的 enemy 字段自相矛盾（同一批数据里
+    // mode=友军 的 5 条全是 enemy:true，同一个人在 mode=所有人 那条是 enemy:false），
+    // 拼成「[友军/对面]」只会误导。
+    const mode = chatChannelLabel(line.mode, lang);
     const who = line.sender || (lang === "en" ? "unknown" : "未知玩家");
-    return "· [" + mode + "/" + side + "] " + who + "：" + line.msg;
+    return "· [" + mode + "] " + who + "：" + line.msg;
   });
   return [head, ...body].join("\n");
 }
