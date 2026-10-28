@@ -432,8 +432,11 @@ export class WtWorld implements World {
   }
 
   private async greet(): Promise<void> {
-    const text = readyText(this.online, this.view.entries.length, this.lang());
-    await this.push('wt.ready', text, 'flush', { kb: this.view.entries.length, online: this.online });
+    // 首次欢迎语默认未知；宿主未就绪后的补投可能已有当前身份的真实观测。
+    const watcher = this.ensureBattle()?.watcher;
+    const online = watcher?.hasObservation ? watcher.online_now : null;
+    const text = readyText(online, this.view.entries.length, this.lang());
+    await this.push('wt.ready', text, 'flush', { kb: this.view.entries.length, online });
   }
 
   // ---- 战局轮询 ----

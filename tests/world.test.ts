@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -195,6 +195,64 @@ describe('装配契约', () => {
 });
 
 describe('挂载与播报', () => {
+  it.each(['poll-online', 'poll-offline', 'refresh-online', 'refresh-offline'])('欢迎语补投使用本身份已完成的观测: %s', async (mode) => {
+    vi.useFakeTimers();
+    const online = mode.endsWith('-online');
+    const { world, host } = rig({ autoBrief: false, pollMs: mode.startsWith('poll') ? 800 : 30000 }, () => online
+      ? { state: { valid: false }, indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 } }
+      : { broken: true });
+    const push = host.pushEvent.bind(host);
+    let fail = true;
+    host.pushEvent = async (event, opts) => {
+      if (event.type === 'wt.ready' && fail) { fail = false; throw new Error('core-not-ready'); }
+      return push(event, opts);
+    };
+    try {
+      await world.start(host);
+      if (mode.startsWith('refresh')) await call(world, 'wt_battle_state');
+      await vi.advanceTimersByTimeAsync(2100);
+      const ready = host.events.find((event) => event.type === 'wt.ready');
+      expect(ready?.meta?.online).toBe(online);
+      expect(ready?.text).toContain(online ? '遥测已连上' : '遥测没连上');
+    } finally { await world.stop(); vi.useRealTimers(); }
+  });
+
+  it('欢迎补投前更换身份不继承旧身份的在线值', async () => {
+    vi.useFakeTimers();
+    const { world, host, cfg } = rig({ autoBrief: false, pollMs: 30000 }, () => ({ state: inBattle, indicators: flying }));
+    const push = host.pushEvent.bind(host);
+    let fail = true;
+    host.pushEvent = async (event, opts) => {
+      if (event.type === 'wt.ready' && fail) { fail = false; throw new Error('core-not-ready'); }
+      return push(event, opts);
+    };
+    try {
+      await world.start(host);
+      await call(world, 'wt_battle_state');
+      cfg.playerName = 'new-observer';
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(host.events.find((event) => event.type === 'wt.ready')?.meta?.online).toBeNull();
+    } finally { await world.stop(); vi.useRealTimers(); }
+  });
+
+  it('首次采样前欢迎语不把坦克试驾误报为离线', async () => {
+    const { world, host } = await boot({ autoBrief: false }, () => ({
+      state: { valid: false },
+      indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 },
+    }));
+    expect(host.events[0].text).toContain('遥测尚未采样');
+    expect(host.events[0].text).not.toContain('没连上');
+    expect(host.events[0].meta?.online).toBeNull();
+    await world.stop();
+  });
+
+  it('首次采样前也不武断判定故障端点离线', async () => {
+    const { world, host } = await boot({}, () => ({ broken: true }));
+    expect(host.events[0].text).toContain('遥测尚未采样');
+    expect(host.events[0].meta?.online).toBeNull();
+    await world.stop();
+  });
+
   it('挂载即投一条就绪事件', async () => {
     const { world, host } = await boot();
     expect(host.events.length).toBe(1);
@@ -276,11 +334,11 @@ describe('工具', () => {
     await world.stop();
   });
 
-  it('wt_status 在遥测断开后直说没连上', async () => {
+  it('wt_status 在遥测断开后明确当前离线与战局未知', async () => {
     const { world } = await boot({}, () => ({ broken: true }));
     await pollOnce(world);
     const text = await call(world, 'wt_status');
-    expect(text).toContain('没连上');
+    expect(text).toContain('离线/当前状态未知');
     expect(text).toContain('未知(遥测离线)');
     await world.stop();
   });

@@ -41,7 +41,9 @@ export function clip(text: string, max: number): string {
 export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
   if (snapshot.readings) {
     const { speed, altitude, mapKnown } = snapshot.readings;
-    const bits = [snapshot.vehicle || (lang === 'en' ? 'unknown vehicle ID' : '载具ID未知')];
+    const bits = [snapshot.vehicle || (snapshot.readings.vehiclePending
+      ? (lang === 'en' ? 'awaiting vehicle (placeholder ignored)' : '载具待生成(占位数据已忽略)')
+      : (lang === 'en' ? 'unknown vehicle ID' : '载具ID未知'))];
     if (speed.value !== null) bits.push(speed.unit === 'km/h'
       ? speed.kind + ' ' + Math.round(speed.value) + ' km/h'
       : (lang === 'en' ? 'speed instrument raw ' : '速度仪表原始值 ') + speed.value + (lang === 'en' ? ' (unit unconfirmed)' : '(单位未确认)'));
@@ -123,12 +125,12 @@ export function resultText(summary: BattleSummary, lang: Lang): string {
   return '🏁 已离开战局：观测累计 ' + summary.kills + ' 杀 ' + summary.deaths + ' 次阵亡/指标失效推断' + time + '；未取得官方胜负结算,仅供复盘。';
 }
 
-export function readyText(online: boolean, kbCount: number, lang: Lang): string {
+export function readyText(online: boolean | null, kbCount: number, lang: Lang): string {
   if (lang === 'en') {
-    const state = online ? 'local telemetry reachable' : 'local telemetry offline (game not running?)';
+    const state = online === null ? 'telemetry not sampled yet' : online ? 'local telemetry reachable' : 'local telemetry offline (game not running?)';
     return 'War Thunder companion ready: ' + state + ', ' + kbCount + ' entries in the knowledge base.';
   }
-  const state = online ? '遥测已连上' : '遥测没连上（游戏没开？）';
+  const state = online === null ? '遥测尚未采样' : online ? '遥测已连上' : '遥测没连上（游戏没开？）';
   return '🐯 战争雷霆百科就位：' + state + '，知识库 ' + kbCount + ' 条。问我概念、载具或打法都行。';
 }
 

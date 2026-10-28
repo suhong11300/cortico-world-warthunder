@@ -35,6 +35,61 @@ function rig() {
   return { routes, client, watcher, fetchImpl, now: () => now, tick: (ms = 1500) => { now += ms; } };
 }
 const row = (id: number, time: number, msg: string) => ({ id, time, msg, type: '', sender: '' });
+
+describe('实战入场占位数据', () => {
+  it.each([true, false])('占位与feed同拍=%s 时，真实重生后的新失效边沿仍可计数', async (samePoll) => {
+    const r = rig(); await r.watcher.poll();
+    r.routes['/hudmsg'] = { events: [], damage: [row(1, 101, 'Bob destroyed Ace')] };
+    if (samePoll) r.routes['/indicators'] = { valid: true, type: 'dummy_plane' };
+    r.tick(); await r.watcher.poll();
+    expect(r.watcher.tally.deaths).toBe(1);
+    if (!samePoll) {
+      r.routes['/indicators'] = { valid: true, type: 'dummy_plane' };
+      r.tick(); await r.watcher.poll();
+    }
+    r.routes['/indicators'] = { valid: true, type: 'aircraftModels/fixture-plane' };
+    r.tick(); await r.watcher.poll();
+    r.routes['/indicators'] = { valid: false };
+    r.tick(); await r.watcher.poll();
+    expect(r.watcher.tally.deaths).toBe(2);
+  });
+
+  it('dummy_plane 的飞机速度高度不作为真实载具读数，生成坦克后恢复', async () => {
+    const r = rig();
+    r.routes['/state'] = { valid: true, 'IAS, km/h': 300, 'H, m': 831 };
+    r.routes['/indicators'] = { valid: true, army: 'air', type: 'dummy_plane' };
+    await r.watcher.poll();
+    const snapshot = r.watcher.currentSnapshot;
+    expect(snapshot.vehicle).toBe('');
+    expect(snapshot.readings?.speed.value).toBeNull();
+    expect(snapshot.readings?.altitude.value).toBeNull();
+    expect(battleLine(snapshot, 'zh')).toContain('载具待生成');
+    expect(battleLine(snapshot, 'en')).toContain('awaiting vehicle');
+    r.routes['/state'] = { valid: false };
+    r.routes['/indicators'] = { valid: true, army: 'tank', type: 'tankModels/ussr_t_34_57_1943', speed: 23 };
+    r.tick(); await r.watcher.poll();
+    expect(r.watcher.currentSnapshot.vehicle).toBe('ussr_t_34_57_1943');
+    expect(r.watcher.currentSnapshot.readings?.speed.value).toBe(23);
+  });
+
+  it('加载占位的 valid:true 不武装一次虚假的阵亡', async () => {
+    const r = rig();
+    r.routes['/indicators'] = { valid: true, type: 'dummy_plane' };
+    await r.watcher.poll();
+    r.routes['/indicators'] = { valid: false };
+    r.tick(10000); await r.watcher.poll();
+    expect(r.watcher.tally.deaths).toBe(0);
+  });
+
+  it('真实载具与失效之间出现占位样本时不跨未知阶段推断阵亡', async () => {
+    const r = rig(); await r.watcher.poll();
+    r.routes['/indicators'] = { valid: true, type: 'dummy_plane' };
+    r.tick(10000); await r.watcher.poll();
+    r.routes['/indicators'] = { valid: false };
+    r.tick(10000); await r.watcher.poll();
+    expect(r.watcher.tally.deaths).toBe(0);
+  });
+});
 async function worldRig() {
   const r = rig(); const dir = mkdtempSync(join(tmpdir(), 'wt-accuracy-')); dirs.push(dir);
   const cfg = { ...WT_DEFAULTS, playerName: 'Ace', llmMode: 'off' as const, pollMs: 30000 };
