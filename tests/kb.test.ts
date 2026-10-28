@@ -19,6 +19,19 @@ import {
 } from '../src/kb.ts';
 import type { KbEntry } from '../src/kb-types.ts';
 
+/** 响应体以 ReadableStream 提供并分两片投喂：实现按字节流读，夹具必须给 body，否则测不到真实路径。 */
+function bodyOf(text: string) {
+  const bytes = new TextEncoder().encode(text);
+  const half = Math.max(1, Math.floor(bytes.length / 2));
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes.slice(0, half));
+      controller.enqueue(bytes.slice(half));
+      controller.close();
+    },
+  });
+}
+
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wt-kb-'));
@@ -151,19 +164,21 @@ describe('远程知识库', () => {
   });
 
   it('fetchRemoteKb 成功取回,HTTP 报错、非 JSON、超大响应都抛错', async () => {
-    const ok = (async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ version: '9.9.9', entries: [good] }) })) as unknown as typeof globalThis.fetch;
+    const payload = JSON.stringify({ version: '9.9.9', entries: [good] });
+    const ok = (async () => ({ ok: true, status: 200, text: async () => payload, body: bodyOf(payload) })) as unknown as typeof globalThis.fetch;
     const loaded = await fetchRemoteKb('https://example.com/kb.json', { fetchImpl: ok });
     expect(loaded.version).toBe('9.9.9');
 
     const bad = (async () => ({ ok: false, status: 503, text: async () => '' })) as unknown as typeof globalThis.fetch;
     await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: bad })).rejects.toThrow('HTTP 503');
 
-    const notJson = (async () => ({ ok: true, status: 200, text: async () => 'hello' })) as unknown as typeof globalThis.fetch;
+    const notJson = (async () => ({ ok: true, status: 200, text: async () => 'hello', body: bodyOf('hello') })) as unknown as typeof globalThis.fetch;
     await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: notJson })).rejects.toThrow('不是 JSON');
 
-    const huge = 'x'.repeat(KB_MAX_BYTES + 10);
-    const big = (async () => ({ ok: true, status: 200, text: async () => huge })) as unknown as typeof globalThis.fetch;
-    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: big })).rejects.toThrow('2MB');
+    expect(KB_MAX_BYTES).toBe(64 * 1024 * 1024);
+    const huge = 'x'.repeat(4096);
+    const big = (async () => ({ ok: true, status: 200, text: async () => huge, body: bodyOf(huge) })) as unknown as typeof globalThis.fetch;
+    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: big, limits: { maxBytes: 2048 } })).rejects.toThrow('超过字节上限');
 
     await expect(fetchRemoteKb('   ', { fetchImpl: ok })).rejects.toThrow();
   });
@@ -181,9 +196,15 @@ describe('知识库源的重定向与限额', () => {
   });
 
   it('限额按真实字节算,不是按 JS 字符数', async () => {
-    // 2.1MB 的纯 ASCII 只有约 73 万字符，旧实现用 text.length 判会直接放行。
-    const huge = 'a'.repeat(KB_MAX_BYTES + 4096);
-    const fake = (async () => ({ ok: true, status: 200, text: async () => huge })) as unknown as typeof globalThis.fetch;
-    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: fake })).rejects.toThrow('2MB');
+    // 旧实现读完再比 text.length：那是 UTF-16 码元数，ASCII 与中文都被低估。现在边读边累加字节。
+    const limits = { maxBytes: 2048 };
+    const ascii = 'a'.repeat(4096);
+    const asciiFetch = (async () => ({ ok: true, status: 200, text: async () => ascii, body: bodyOf(ascii) })) as unknown as typeof globalThis.fetch;
+    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: asciiFetch, limits })).rejects.toThrow('超过字节上限');
+
+    // 1200 个汉字只有 1200 个字符，UTF-8 却是 3600 字节，按字符数判会放行。
+    const cjk = '中'.repeat(1200);
+    const cjkFetch = (async () => ({ ok: true, status: 200, text: async () => cjk, body: bodyOf(cjk) })) as unknown as typeof globalThis.fetch;
+    await expect(fetchRemoteKb('https://example.com/kb.json', { fetchImpl: cjkFetch, limits })).rejects.toThrow('超过字节上限');
   });
 });

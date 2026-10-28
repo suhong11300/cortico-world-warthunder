@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -176,7 +176,7 @@ describe('装配契约', () => {
   it('环境段给出九个占位符', async () => {
     const { world } = await boot();
     const vars = world.envPromptVars() ?? {};
-    expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.chat', 'wt.kb', 'wt.now', 'wt.source', 'wt.status', 'wt.vehicle', 'wt.zone']);
+    expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.chat', 'wt.kb', 'wt.now', 'wt.source', 'wt.speech', 'wt.status', 'wt.vehicle', 'wt.zone']);
     expect(vars['wt.status']).toBe('遥测离线/状态未知');
     expect(vars['wt.kb']).toContain('53 条');
     await world.stop();
@@ -195,6 +195,41 @@ describe('装配契约', () => {
 });
 
 describe('挂载与播报', () => {
+  it('欢迎补投前更换身份不继承旧身份的在线值', async () => {
+    vi.useFakeTimers();
+    const { world, host, cfg } = rig({ autoBrief: true, pollMs: 30000 }, () => ({ state: inBattle, indicators: flying }));
+    const push = host.pushEvent.bind(host);
+    let fail = true;
+    host.pushEvent = async (event, opts) => {
+      if (event.type === 'wt.ready' && fail) { fail = false; throw new Error('core-not-ready'); }
+      return push(event, opts);
+    };
+    try {
+      await world.start(host);
+      await call(world, 'wt_battle_state');
+      cfg.playerName = 'new-observer';
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(host.events.find((event) => event.type === 'wt.ready')?.meta?.online).toBeNull();
+    } finally { await world.stop(); vi.useRealTimers(); }
+  });
+
+  it('首次采样前欢迎语不把坦克试驾误报为离线', async () => {
+    const { world, host } = await boot({ autoBrief: true }, () => ({
+      state: { valid: false },
+      indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 },
+    }));
+    expect(host.events[0].text).toContain('遥测尚未采样');
+    expect(host.events[0].text).not.toContain('没连上');
+    expect(host.events[0].meta?.online).toBeNull();
+    await world.stop();
+  });
+
+  it('首次采样前也不武断判定故障端点离线', async () => {
+    const { world, host } = await boot({}, () => ({ broken: true }));
+    expect(host.events[0].text).toContain('遥测尚未采样');
+    expect(host.events[0].meta?.online).toBeNull();
+    await world.stop();
+  });
   it('挂载即投一条就绪事件', async () => {
     const { world, host } = await boot();
     expect(host.events.length).toBe(1);
@@ -228,11 +263,11 @@ describe('挂载与播报', () => {
     await world.stop();
   });
 
-  it('关掉自动播报后只留就绪事件', async () => {
+  it('关掉自动播报后连就绪语也不推,工具仍可用', async () => {
     const routes: Routes = { state: inBattle, indicators: flying };
     const { world, host } = await boot({ autoBrief: false }, () => routes);
     await pollOnce(world);
-    expect(host.events.map((event) => event.type)).toEqual(['wt.ready']);
+    expect(host.events.map((event) => event.type)).toEqual([]);
     await world.stop();
   });
 
@@ -276,11 +311,11 @@ describe('工具', () => {
     await world.stop();
   });
 
-  it('wt_status 在遥测断开后直说没连上', async () => {
+  it('wt_status 在遥测断开后直说离线,不假装知道战局', async () => {
     const { world } = await boot({}, () => ({ broken: true }));
     await pollOnce(world);
     const text = await call(world, 'wt_status');
-    expect(text).toContain('没连上');
+    expect(text).toContain('离线/当前状态未知');
     expect(text).toContain('未知(遥测离线)');
     await world.stop();
   });
@@ -364,7 +399,7 @@ describe('滥用面的闸', () => {
     await pollOnce(world);
     const kills = host.events.filter((event) => event.type === 'wt.kill');
     expect(kills).toHaveLength(3);
-    expect(await call(world, 'wt_battle_state')).toContain('本局观测累计:6 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('本观测窗口累计:6 杀');
   });
 
   it('清零账本要先确认,而且一天最多三次', async () => {
@@ -657,12 +692,13 @@ describe('隐私与副作用闸', () => {
 });
 
 describe('文案灯按能力显示', () => {
-  it('宿主没有 cognition 也没填 key 时文案灯是暗的,并说明走模板', async () => {
+  it('宿主没有 cognition 也没填 key 时文案灯是暗的,并说明人格仍交给主对话', async () => {
     const { world } = await boot({}, () => ({ state: inMenu }));
     const ui = world.webUi();
     const lamp = (ui.lamps ?? []).find((one) => one.label === '文案');
     expect(lamp?.state).toBe('offline');
-    expect(lamp?.hint ?? '').toContain('模板');
+    expect(lamp?.hint ?? '').toContain('人格播报仍委托现有主对话Persona');
+    expect(lamp?.hint ?? '').not.toContain('模板');
     await world.stop();
   });
 
@@ -678,7 +714,8 @@ describe('文案灯按能力显示', () => {
 describe('热更新', () => {
   it('解说间隔从 0 改成 5000 后计时器会自己建起来', async () => {
     // R11:配置是 x-hot 的,但计时器原来只在 start 建一次,改成非 0 之后永远等不到。
-    const rigged = await boot({ commentaryEveryMs: 0 }, () => ({ state: inMenu }));
+    // 0.2.13 起定时讲解只在 commentary 档、自动播报开、读取未关闭时成立，档位不对再改间隔也不该建表。
+    const rigged = await boot({ commentaryEveryMs: 0, chatterLevel: 'commentary' }, () => ({ state: inMenu }));
     const inner = rigged.world as unknown as { commentaryTimer?: unknown };
     expect(inner.commentaryTimer).toBeUndefined();
     rigged.cfg.commentaryEveryMs = 5000;
@@ -718,7 +755,7 @@ describe('播报档位', () => {
     await pollOnce(world);
     expect(host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
     expect(host.events.some((event) => event.type === 'wt.kill')).toBe(false);
-    expect(await call(world, 'wt_battle_state')).toContain('本局观测累计:2 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('本观测窗口累计:2 杀');
     await world.stop();
   });
 });

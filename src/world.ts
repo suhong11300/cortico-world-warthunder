@@ -1,8 +1,8 @@
 import { fileURLToPath } from 'node:url';
 import type { ToolDef, TriggerMode, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
-import { WT_CONFIG_GROUP, type WtConfigSection } from './config.ts';
-import { BattleClient, BattleWatcher, type BattleEvent, type BattleSnapshot, type ChatLine } from './battle.ts';
+import { WT_CONFIG_GROUP, telemetryScopeAllowed, type WtConfigSection } from './config.ts';
+import { BattleClient, BattleWatcher, type BattleEvent, type BattleSnapshot, type ChatLine, type TelemetryScope } from './battle.ts';
 import {
   battleLine,
   behindText,
@@ -26,11 +26,13 @@ import {
   resultText,
   type Lang,
 } from './copy.ts';
-import { fetchRemoteKb, findVehicle, kbCounts, kbPath, loadKb, readKbFile, searchKb, writeKbFile, type KbView } from './kb.ts';
+import { findVehicle, kbCounts, kbPath, loadKb, searchKb, resolveKbLimits, type KbView } from './kb.ts';
+import { updateKbTransaction } from './kb-update.ts';
 import { compose, describeError, readSpend, writeSpend } from './llm.ts';
 import { discardVisionRun, extractVisionHints, probeVision } from './vision.ts';
 import { cleanOutgoing, copyToClipboard, sendToGame } from './sendkey.ts';
 import { assertFetchableUrl, assertLocalHost, parseRegion, redactSecret, scrubUrl } from './guard.ts';
+import { presentBattleFacts, BATTLE_SPEECH_EVENTS, type SpeechStyle } from './speech.ts';
 
 /** 提示词模板文件;describe 与 WebUI 都指向它。 */
 const ENV_PROMPT_FILE = fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url));
@@ -72,6 +74,8 @@ export interface WtWorldOptions {
   now?: () => number;
   /** 测试注入用;缺省走全局 fetch,这样 8111 可以被假数据替换。 */
   fetchImpl?: typeof globalThis.fetch;
+  /** 知识库网络适配器，独立于8111，缺省使用全局fetch。 */
+  kbFetchImpl?: typeof globalThis.fetch;
   /** 测试注入用;缺省起真的 powershell.exe。 */
   spawnImpl?: typeof import('node:child_process').spawn;
 }
@@ -235,6 +239,7 @@ export class WtWorld implements World {
   private commentaryTimerMs = 0;
   private kbCheckAt = 0;
   private kbFetching = false;
+  private kbController = new AbortController();
   private commentaryTimer: ReturnType<typeof setTimeout> | undefined;
   private greetTimer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
@@ -250,6 +255,8 @@ export class WtWorld implements World {
   /** 读过的对局聊天,进战局时清空(新一局的 id 会从头开始)。 */
   private chatHistory: ChatLine[] = [];
   private chatCursor = 0;
+  private chatScopeEnabled: boolean | undefined;
+  private chatGeneration = 0;
   /** 直写发言栏的时间戳;和模型调用分开计,因为它是别人能看见的副作用。 */
   private sayCalls: number[] = [];
   /** 预演过的文本;confirm 时必须一字不差,防止预演 A 实际发 B。 */
@@ -259,7 +266,7 @@ export class WtWorld implements World {
 
   constructor(opts: WtWorldOptions) {
     this.opts = opts;
-    this.view = loadKb(opts.dataDir);
+    this.view = loadKb(opts.dataDir, this.kbLimits());
   }
 
   // ---- 基础读数 ----
@@ -267,6 +274,9 @@ export class WtWorld implements World {
   private lang(): Lang {
     return this.opts.cfg.language === 'en' ? 'en' : 'zh';
   }
+
+  private speechStyle(): SpeechStyle { return this.opts.cfg.speechStyle === '模板' ? '模板' : '人格'; }
+  private speechMode(): string { return (this.opts.cfg.autoBrief ? '自动' : '手动') + '＋' + this.speechStyle(); }
 
   private nowMs(): number {
     return this.opts.now ? this.opts.now() : Date.now();
@@ -317,16 +327,28 @@ export class WtWorld implements World {
   /** 遥测地址或端口改了要换客户端,否则会一直打旧端口。 */
   private battleIdentity(): string {
     const cfg = this.opts.cfg;
-    return JSON.stringify([cfg.gameHost.trim(), cfg.gamePort, cfg.textEncoding, cfg.playerName.trim()]);
+    return JSON.stringify([cfg.gameHost.trim(), cfg.gamePort, cfg.textEncoding, cfg.playerName.trim(),
+      ...(['vehicle', 'map', 'mission', 'hud'] as TelemetryScope[]).map(scope => this.canRead(scope))]);
   }
 
   private isCurrentBattle(generation: number): boolean {
+    this.syncChatReadScope();
     if (this.clientKey !== this.battleIdentity()) this.ensureBattle();
     return generation === this.battleGeneration;
   }
 
+  private syncChatReadScope(): void {
+    const chatEnabled = this.canRead('chat');
+    if (this.chatScopeEnabled !== chatEnabled) {
+      this.chatScopeEnabled = chatEnabled; this.chatGeneration += 1;
+      this.chatCache = null; this.chatHistory = []; this.chatCursor = 0;
+    }
+    if (!this.canRead('chat')) { this.chatCache = null; this.chatHistory = []; this.chatCursor = 0; }
+  }
+
   private ensureBattle(): { client: BattleClient; watcher: BattleWatcher } | null {
     const cfg = this.opts.cfg;
+    this.syncChatReadScope();
     const key = this.battleIdentity();
     if (this.client && this.watcher && this.clientKey === key) return { client: this.client, watcher: this.watcher };
     try {
@@ -342,6 +364,7 @@ export class WtWorld implements World {
         port: cfg.gamePort,
         textEncoding: cfg.textEncoding,
         ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
+        canRead: (scope) => this.canRead(scope),
       });
       const watcher = new BattleWatcher({ client, now: () => this.nowMs(), playerName: this.opts.cfg.playerName });
       this.client = client;
@@ -362,7 +385,7 @@ export class WtWorld implements World {
   async start(host: WorldHost): Promise<void> {
     this.host = host;
     this.stopped = false;
-    this.view = loadKb(this.opts.dataDir);
+    if (this.kbController.signal.aborted) this.kbController = new AbortController();
     // 先建定时器再投事件:宿主 core 未就绪时 pushEvent 会抛,不能让它中断 start。
     this.schedulePoll(clamp(this.opts.cfg.pollMs, MIN_POLL_MS, MAX_POLL_MS));
     this.scheduleCommentary(this.commentaryEvery());
@@ -383,6 +406,7 @@ export class WtWorld implements World {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.kbController.abort();
     if (this.pollTimer) clearTimeout(this.pollTimer);
     if (this.commentaryTimer) clearTimeout(this.commentaryTimer);
     if (this.greetTimer) clearTimeout(this.greetTimer);
@@ -398,6 +422,21 @@ export class WtWorld implements World {
     return 'http://' + (this.opts.cfg.gameHost || '127.0.0.1') + ':' + this.opts.cfg.gamePort;
   }
 
+  private canRead(scope: TelemetryScope): boolean { return telemetryScopeAllowed(this.opts.cfg, scope); }
+
+  private readNotice(): string {
+    if (this.opts.cfg.readTelemetry === false) return '遥测读取已关闭，不访问8111或使用旧缓存。';
+    if (!(['vehicle', 'map', 'mission'] as TelemetryScope[]).some(scope => this.canRead(scope))) {
+      return '战局判定读取已关闭；载具、地图、任务至少需开启一项，当前战局未知。';
+    }
+    return '';
+  }
+
+  private readSummary(): string {
+    return ([['vehicle', '载具'], ['map', '地图'], ['mission', '任务'], ['hud', '战果日志'], ['chat', '聊天']] as const)
+      .map(([scope, label]) => label + (this.canRead(scope) ? '开' : '关')).join(' / ');
+  }
+
   /** 播报档位:配置里写错的值一律按 important 处理,不至于因为一个错字就没声了。 */
   private chatter(): 'quiet' | 'important' | 'commentary' {
     const level = this.opts.cfg.chatterLevel;
@@ -405,9 +444,14 @@ export class WtWorld implements World {
   }
 
   private commentaryEvery(): number {
-    if (this.chatter() === 'quiet') return 0;
+    if (!this.automaticCommentaryEnabled()) return 0;
     const every = Math.trunc(this.opts.cfg.commentaryEveryMs);
     return Number.isFinite(every) && every >= 5000 ? every : 0;
+  }
+
+  private automaticCommentaryEnabled(): boolean {
+    return this.opts.cfg.autoBrief && this.opts.cfg.broadcastCommentary !== false
+      && this.chatter() === 'commentary' && !this.readNotice();
   }
 
   private schedulePoll(delay: number): void {
@@ -432,8 +476,12 @@ export class WtWorld implements World {
   }
 
   private async greet(): Promise<void> {
-    const text = readyText(this.online, this.view.entries.length, this.lang());
-    await this.push('wt.ready', text, 'flush', { kb: this.view.entries.length, online: this.online });
+    if (!this.opts.cfg.autoBrief) return;
+    // 首次欢迎语默认未知；宿主未就绪后的补投可能已有当前身份的真实观测。
+    const watcher = this.ensureBattle()?.watcher;
+    const online = watcher?.hasObservation ? watcher.online_now : null;
+    const text = this.readNotice() || readyText(online, this.view.entries.length, this.lang());
+    await this.push('wt.ready', text, 'flush', { kb: this.view.entries.length, online });
   }
 
   // ---- 战局轮询 ----
@@ -446,6 +494,7 @@ export class WtWorld implements World {
     try {
       this.syncCommentaryTimer();
       this.maybeCheckKb();
+      if (this.readNotice()) return;
       const generation = this.battleGeneration;
       const events = await battle.watcher.poll();
       if (!this.isCurrentBattle(generation)) return;
@@ -541,38 +590,38 @@ export class WtWorld implements World {
         this.chatHistory = [];
         this.chatCursor = 0;
         this.chatCache = null;
-        if (!cfg.autoBrief) return;
+        if (!cfg.autoBrief || cfg.broadcastEntryExit === false) return;
         const text = enterText(event.snapshot, lang);
         await push('wt.battle_started', text, 'flush', { vehicle: event.snapshot.vehicle, observation: event.snapshot.readings });
         return;
       }
       case 'kill': {
-        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
+        if (!cfg.autoBrief || !this.canRead('hud') || cfg.broadcastKills === false || this.chatter() === 'quiet') return;
         const text = killText(event.total, event.streak, event.detail, lang);
         await push('wt.kill', '观测归因:' + text, 'flush', { total: event.total, streak: event.streak, observation: event.snapshot.readings });
         return;
       }
       case 'death': {
-        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
+        if (!cfg.autoBrief || cfg.broadcastDeaths === false || this.chatter() === 'quiet') return;
         const text = deathText(event.total, lang);
         await push('wt.death', '观测/指标推断(非服务端记分板):' + text, 'flush', { total: event.total, observation: event.snapshot.readings });
         return;
       }
       case 'behind': {
-        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
+        if (!cfg.autoBrief || !this.canRead('hud') || cfg.broadcastWarnings === false || this.chatter() === 'quiet') return;
         const text = behindText(event.kills, event.deaths, lang);
         await push('wt.behind', '观测累计(含推断):' + text, 'flush', { kills: event.kills, deaths: event.deaths });
         return;
       }
       case 'leave': {
-        if (!cfg.autoBrief) return;
-        const summary = event.summary;
+        if (!cfg.autoBrief || cfg.broadcastEntryExit === false) return;
+        const summary = { ...event.summary, killsKnown: this.canRead('hud'), deathsKnown: this.canRead('hud') || this.canRead('vehicle') };
         const text = resultText(summary, lang);
-        await push('wt.result', text, 'flush', { kills: summary.kills, deaths: summary.deaths });
+        await push('wt.result', text, 'flush', { kills: summary.killsKnown ? summary.kills : null, deaths: summary.deathsKnown ? summary.deaths : null, killsKnown: summary.killsKnown, deathsKnown: summary.deathsKnown });
         return;
       }
       case 'hud': {
-        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
+        if (!cfg.autoBrief || cfg.broadcastHud === false || this.chatter() === 'quiet') return;
         // This is third-party feed text, not a verified player statistic.
         await push('wt.commentary', '战场播报(外部原文,仅供参考):' + event.detail, 'debounce', { sourceEndpoint: '/hudmsg.events', verifiedTally: false }, 'external');
         return;
@@ -583,13 +632,14 @@ export class WtWorld implements World {
   }
 
   private async commentaryOnce(): Promise<void> {
-    if (this.stopped || !this.opts.cfg.autoBrief) return;
+    if (this.stopped || !this.automaticCommentaryEnabled()) return;
     const battle = this.ensureBattle();
     // 判"要不要解说"看的是观测结果；状态机那一格只由 poll 推进，不该被展示逻辑消费。
     if (!battle || !battle.watcher.observedInBattleNow) return;
     const generation = this.battleGeneration;
     const snapshot = await battle.watcher.refresh();
     if (!this.isCurrentBattle(generation)) return;
+    if (!this.automaticCommentaryEnabled()) return;
     this.online = battle.watcher.online_now;
     if (!this.online || !battle.watcher.observedBattleKnown || !battle.watcher.observedInBattleNow) return;
     const text = commentaryText(snapshot, this.lang());
@@ -664,6 +714,11 @@ export class WtWorld implements World {
   private async push(type: string, text: string, trigger: TriggerMode, meta?: Record<string, unknown>, origin: 'internal' | 'external' = 'internal'): Promise<void> {
     const host = this.host;
     if (!host) return;
+    const factText = text;
+    if (origin === 'internal' && BATTLE_SPEECH_EVENTS.has(type)) {
+      text = presentBattleFacts(factText, this.speechStyle(), this.lang());
+      meta = { ...meta, factText, speechStyle: this.speechStyle(), presentation: 'main-persona-context', backgroundRewrite: false };
+    }
     const envelope = {
       type,
       ts: nowIso(this.timezone()),
@@ -674,7 +729,7 @@ export class WtWorld implements World {
       ...(meta ? { meta } : {}),
     };
     await host.pushEvent(envelope as Parameters<WorldHost['pushEvent']>[0], { trigger });
-    this.lastText = text;
+    this.lastText = factText;
     this.lastTextAt = this.nowMs();
   }
 
@@ -693,8 +748,14 @@ export class WtWorld implements World {
   }
 
   private readKbFetchedAt(): string {
-    return readKbFile(this.opts.dataDir)?.fetchedAt ?? this.lastKbAt;
+    return this.view.fetchedAt || this.lastKbAt;
   }
+
+  private kbLimits() {
+    const cfg = this.opts.cfg;
+    return resolveKbLimits({ maxBytes: cfg.kbMaxDownloadMiB * 1024 * 1024, maxEntries: cfg.kbMaxEntries, memoryBudgetBytes: cfg.kbUpdateMemoryMiB * 1024 * 1024 });
+  }
+  private kbIdentity(): string { return JSON.stringify([this.opts.cfg.kbUrl.trim(), this.opts.cfg.kbAllowPrivate === true, this.kbLimits()]); }
 
   private async updateKb(force: boolean): Promise<string> {
     const cfg = this.opts.cfg;
@@ -709,15 +770,21 @@ export class WtWorld implements World {
     try {
       // 这条 fetch 是模型能触发的(wt_kb_update),所以地址要过闸:默认只放公网 http(s)。
       const target = assertFetchableUrl(url, { allowPrivate: this.opts.cfg.kbAllowPrivate === true });
-      const remote = await fetchRemoteKb(target, { allowPrivate: this.opts.cfg.kbAllowPrivate === true });
-      writeKbFile(this.opts.dataDir, { version: remote.version, fetchedAt: new Date(this.nowMs()).toISOString(), entries: remote.entries });
-      this.view = loadKb(this.opts.dataDir);
-      this.lastKbAt = new Date(this.nowMs()).toISOString();
+      const identity = this.kbIdentity(), signal = this.kbController.signal;
+      const result = await updateKbTransaction(this.opts.dataDir, {
+        url: target, allowPrivate: cfg.kbAllowPrivate === true, limits: this.kbLimits(), signal,
+        fetchedAt: new Date(this.nowMs()).toISOString(),
+        isCurrent: () => !this.stopped && !signal.aborted && identity === this.kbIdentity(),
+        ...(this.opts.kbFetchImpl ? { fetchImpl: this.opts.kbFetchImpl } : {}),
+      });
+      if (this.stopped || signal.aborted || identity !== this.kbIdentity()) return '知识库配置或生命周期已变化，本实例不应用旧候选。';
+      this.view = result.view;
+      this.lastKbAt = result.view.fetchedAt;
       const counts = kbCounts(this.view.entries);
-      const skipped = remote.skipped > 0 ? ',跳过 ' + remote.skipped + ' 条不合法词条' : '';
+      const skipped = result.skipped > 0 ? ',跳过 ' + result.skipped + ' 条不合法词条' : '';
       return '知识库更新到 v' + this.view.version + ':共 ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')' + skipped + '。';
     } catch (error) {
-      return '知识库更新失败:' + describeError(error) + '。内置 ' + this.view.entries.length + ' 条照旧可用。';
+      return '知识库更新失败:' + describeError(error) + '。当前 ' + this.view.entries.length + ' 条照旧可用。';
     }
   }
 
@@ -799,6 +866,8 @@ export class WtWorld implements World {
       handler: async (args) => {
         const mode = args.mode === 'cheer' || args.mode === 'urge' ? args.mode : 'sitrep';
         const battle = this.ensureBattle();
+        if (this.readNotice()) return this.readNotice();
+        if (mode === 'cheer' && !this.canRead('hud')) return '战果日志读取已关闭，击毁未知，不编造喝彩战绩。';
         if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
         const generation = this.battleGeneration;
         const snapshot = await battle.watcher.refresh();
@@ -816,12 +885,14 @@ export class WtWorld implements World {
             : lang === 'en' ? 'No attributed kills observed yet. Take your time and find a good position.'
               : '尚未观测到归属于你的击毁。稳住节奏,先找好位置。';
         } else if (mode === 'urge') {
-          template = (): string => behindText(tally.kills, tally.deaths, lang);
+          template = (): string => this.canRead('hud') ? behindText(tally.kills, tally.deaths, lang)
+            : lang === 'en' ? 'Kills unknown (HUD reads disabled); no K/D inference. Take your time and find cover.'
+              : '击毁未知(战果日志读取关闭)，不能据此判断逆风；先找掩体，稳住节奏。';
         }
         // The World supplies facts. Persona may express them; a second model must not invent telemetry.
         const text = template();
         await this.push('wt.commentary', text, 'flush', { manual: true, mode });
-        return text + '\n(已推送到对话)';
+        return presentBattleFacts(text, this.speechStyle(), lang) + '\n(已推送到对话)';
       },
     };
   }
@@ -836,8 +907,11 @@ export class WtWorld implements World {
    */
   private async readChat(limit: number): Promise<ChatLine[]> {
     const battle = this.ensureBattle();
-    if (!battle) return [];
+    if (!battle || !this.canRead('chat')) return [];
+    const generation = this.battleGeneration;
+    const chatGeneration = this.chatGeneration;
     const fresh = await battle.client.gamechat(this.chatCursor);
+    if (!this.isCurrentBattle(generation) || !this.canRead('chat') || chatGeneration !== this.chatGeneration) return [];
     if (fresh.length > 0) {
       let max = this.chatCursor;
       for (const line of fresh) if (line.id > max) max = line.id;
@@ -886,8 +960,11 @@ export class WtWorld implements World {
           return ['✍️ 代稿（' + chatTargetLabel(target, lang) + '）', oneLine, chatDraftHint(target, degraded, lang)].join('\n');
         }
         const battle = this.ensureBattle();
+        if (!this.canRead('chat')) return this.opts.cfg.readTelemetry === false ? this.readNotice() : '聊天读取已关闭，不访问/gamechat或使用旧缓存。';
+        if (this.readNotice()) return this.readNotice();
         if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
         const generation = this.battleGeneration;
+        const chatGeneration = this.chatGeneration;
         await battle.watcher.refresh();
         if (!this.isCurrentBattle(generation)) return '观测身份已改变,请重试。';
         this.online = battle.watcher.online_now;
@@ -895,7 +972,9 @@ export class WtWorld implements World {
         if (!battle.watcher.observedBattleKnown) return '战局状态未知,不展示旧聊天。';
         if (!battle.watcher.observedInBattleNow) return '当前不在战局,不把旧聊天当作当前对局内容。';
         const lines = await this.readChat(limit);
+        if (!this.canRead('chat')) return '聊天读取已关闭，旧请求结果已丢弃。';
         if (!this.isCurrentBattle(generation)) return '观测身份已改变,旧聊天请求已丢弃。';
+        if (chatGeneration !== this.chatGeneration) return '聊天读取设置已改变，旧请求结果已丢弃。';
         const original = chatBlock(lines, lang);
         if (lines.length === 0) return original;
         if (mode === 'recent') return original + '\n(要译文就再调一次 action=translate)';
@@ -928,6 +1007,10 @@ export class WtWorld implements World {
           () => chatDelegated(target, lang),
           clamp(cfg.chatMaxInputChars, 200, 8000),
         );
+        this.syncChatReadScope();
+        if (!this.canRead('chat')) { this.chatCache = null; return '聊天读取已关闭，旧请求和译文已丢弃。'; }
+        if (!this.isCurrentBattle(generation)) return '观测身份已改变，旧聊天与译文已丢弃。';
+        if (chatGeneration !== this.chatGeneration) return '聊天读取设置已改变，旧聊天与译文已丢弃。';
         this.chatCache = { key: cacheKey, text, at: this.nowMs() };
         return original + '\n\n🗣 ' + label + ':\n' + text;
       },
@@ -1094,17 +1177,17 @@ export class WtWorld implements World {
   private modelCapability(): { label: string; online: boolean; note: string } {
     const cfg = this.opts.cfg;
     if (cfg.llmMode === 'off') {
-      return { label: '模板', online: false, note: '文案模型已关闭:播报、解说与翻译都用固定模板' };
+      return { label: '后台关闭', online: false, note: '插件后台生成已关闭；主对话Persona仍按人格/模板选择表达，翻译由主对话处理' };
     }
     if (this.host?.cognition) {
-      return { label: '主对话同款模型', online: true, note: '宿主提供 cognition:改写由主对话的模型完成' };
+      return { label: '宿主后台模型', online: true, note: '宿主提供cognition供翻译/代稿；战局风格由现有主对话Persona表达，不调用第二个战况模型' };
     }
     if (cfg.llmApiKey.trim()) {
       const where = (scrubUrl(cfg.llmBaseUrl) || '未填地址') + ' · ' + (cfg.llmModel || '未填模型');
       if (cfg.llmMode === 'openai') return { label: where, online: true, note: '独立接口(OpenAI 兼容)' };
       return { label: where, online: true, note: '独立接口(宿主无 cognition,已退回自填 key)' };
     }
-    return { label: '模板', online: false, note: '宿主没提供 cognition,也没填 key:播报走模板,翻译交给对话自己' };
+    return { label: '后台未提供', online: false, note: '宿主没有cognition、独立key为空；翻译交给主对话。人格播报仍委托现有主对话Persona，不等于人格失效' };
   }
 
   private sourceText(): string {
@@ -1122,9 +1205,12 @@ export class WtWorld implements World {
     const snapshot = battle ? battle.currentSnapshot : null;
     const lines = [
       '🐯 war thunder安东星助手 · 自检',
-      '📡 遥测:' + this.originText() + ' · ' + (online ? '在线' : '离线/当前状态未知'),
+      '📡 遥测:' + this.originText() + ' · ' + (this.readNotice() || (online ? '在线' : '离线/当前状态未知')),
+      '🔐 读取范围:' + this.readSummary(),
+      '📣 主动播报:' + (cfg.autoBrief ? '开' : '关(手动查询仍可用)') + ' · 档位 ' + this.chatter() + ' · 讲解间隔 ' + (cfg.commentaryEveryMs / 1000) + ' 秒',
+      '🗣 表达模式:' + this.speechMode() + ' · ' + (this.speechStyle() === '人格' ? '由现有主对话Persona表达，插件事实块不改写；实际口吻待桌宠验收' : '原样模板，不额外润色'),
       '🎯 昵称:' + (cfg.playerName.trim() ? cfg.playerName.trim() : '未配置(不认领feed战绩,仪表失效仅作推断)'),
-      '🎮 战局:' + (!online ? '未知(遥测离线)' : battle && !battle.observedBattleKnown ? '未知(部分端点不可用)' : inBattle && snapshot ? '战局中(' + battleLine(snapshot, 'zh') + ')' : '不在战局'),
+      '🎮 战局:' + (this.readNotice() ? '未知(读取关闭)' : !online ? '未知(遥测离线)' : battle && !battle.observedBattleKnown ? '未知(部分端点不可用)' : inBattle && snapshot ? '战局中(' + battleLine(snapshot, 'zh') + ')' : '不在战局'),
       '📚 知识库:v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')' +
         (this.view.remoteVersion ? ' · 远程 ' + this.view.remoteCount + ' 条' : ' · 仅内置'),
       '🧠 文案:' + this.sourceText(),
@@ -1146,6 +1232,7 @@ export class WtWorld implements World {
   private reportKb(): string {
     const counts = kbCounts(this.view.entries);
     const cfg = this.opts.cfg;
+    const limits = this.kbLimits();
     const lines = [
       '📚 知识库',
       '生效版本:v' + this.view.version,
@@ -1153,15 +1240,18 @@ export class WtWorld implements World {
       '来源:' + (this.view.remoteVersion ? '内置 + 远程(v' + this.view.remoteVersion + ',' + this.view.remoteCount + ' 条)' : '仅内置'),
       '更新源:' + (scrubUrl(cfg.kbUrl) || '未配置(worlds.wt.kbUrl 留空)'),
       '自动更新:' + (cfg.kbAutoUpdateHours > 0 ? '每 ' + cfg.kbAutoUpdateHours + ' 小时' : '已关'),
+      '容量准入:有效 ' + (limits.maxBytes / 1048576) + ' MiB / ' + limits.maxEntries + ' 条；额外更新估算预算 ' + (limits.memoryBudgetBytes / 1048576) + ' MiB(非进程RSS硬上限，旧库与宿主另计)',
       '本地文件:' + kbPath(this.opts.dataDir),
     ];
     const fetchedAt = this.readKbFetchedAt();
     if (fetchedAt) lines.push('上次拉取:' + fetchedAt);
+    if (this.view.loadError) lines.push('⚠️ 本地远程库未载入:' + this.view.loadError + '；原文件保留，仅内置库生效');
     return lines.join('\n');
   }
 
   private async reportBattle(): Promise<string> {
     const battle = this.ensureBattle();
+    if (this.readNotice()) return this.readNotice();
     if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
     // 交给 watcher 探：它同时看 /mission.json、/map_info.json、/map_obj.json 与 /state。
     // 只看 /state 会误判——真机对局里 /state 常常只有 { "valid": false }。
@@ -1174,10 +1264,12 @@ export class WtWorld implements World {
     // refresh() 只更新采样值；这里必须读 observedInBattleNow，读状态机会拿到上一轮 poll 的陈旧值。
     if (!battle.watcher.observedInBattleNow) return '遥测在线,但当前不在战局(菜单或战局加载中)。';
     const tally = battle.watcher.tally;
-    return [
+    const factText = [
       '🎮 当前战局',
       '读数:' + battleLine(snapshot, 'zh'),
-      '本局观测累计:' + tally.kills + ' 杀 · ' + tally.deaths + ' 死' + (tally.bestStreak > 1 ? ' · 最长观测连击 ' + tally.bestStreak : '') + '(不是服务端记分板,中途启用可能不完整)',
+      '本观测窗口累计:' + (this.canRead('hud') ? tally.kills + ' 杀' : '击毁未知(战果日志读取已关闭)') + ' · ' + (this.canRead('hud') || this.canRead('vehicle') ? tally.deaths + ' 死' : '阵亡未知(对应读取关闭)') + (tally.bestStreak > 1 ? ' · 最长观测连击 ' + tally.bestStreak : '') + '(不是服务端记分板,中途启用可能不完整)',
+      '读取范围:' + this.readSummary(),
+      '未接入:个人助攻总数、个人占点贡献、空地分项得分、排名与官方记分板；未知不表示0。可见对象也不能可靠区分AI与玩家。',
       // 8111 的击杀列表是全场播报：没配昵称就一个都不认领，得直说，不能让 0 杀看着像数据坏了。
       this.opts.cfg.playerName.trim()
         ? '归因:按昵称「' + this.opts.cfg.playerName.trim() + '」筛自己的击杀'
@@ -1185,6 +1277,7 @@ export class WtWorld implements World {
       '限制:阵亡包含指标失效推断;地图可见数量不是全场或附近数量;未确认单位的仪表不换算。',
       '读于:' + this.stamp(),
     ].join('\n');
+    return presentBattleFacts(factText, this.speechStyle(), this.lang());
   }
 
   // ---- 提示词与 WebUI ----
@@ -1200,14 +1293,15 @@ export class WtWorld implements World {
     return {
       'wt.now': this.stamp(),
       'wt.zone': this.timezone(),
-      'wt.status': online ? '遥测在线' : '遥测离线/状态未知',
-      'wt.battle': !online || (battle && !battle.observedBattleKnown) ? '当前战局未知,不要使用缓存读数' : inBattle && snapshot ? '战局中:' + battleLine(snapshot, 'zh') : '不在战局',
+      'wt.speech': this.speechMode() + '；' + (this.speechStyle() === '人格' ? '事实正文须逐字发到最终输出渠道，不改写不省略限定；Persona只用于额外一句不含新战况的鼓励，原始仪表不得推断运动状态' : '请原样转述模板事实，不润色、不额外调侃'),
+      'wt.status': this.readNotice() || (online ? '遥测在线' : '遥测离线/状态未知'),
+      'wt.battle': this.readNotice() ? '当前战局未知(读取已关闭),不要使用缓存读数' : !online || (battle && !battle.observedBattleKnown) ? '当前战局未知,不要使用缓存读数' : inBattle && snapshot ? '战局中:' + battleLine(snapshot, 'zh') : '不在战局',
       'wt.kb': 'v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')',
       'wt.source': this.sourceText(),
       'wt.budget': '今日 ' + book.yuan.toFixed(4) + ' 元 / 预算 ' + Math.max(0, cfg.dailyBudgetYuan) + ' 元',
-      'wt.vehicle': online && inBattle && snapshot && snapshot.vehicle ? snapshot.vehicle : '未知',
+      'wt.vehicle': !this.readNotice() && online && inBattle && snapshot && snapshot.vehicle ? snapshot.vehicle : '未知',
       'wt.chat':
-        this.chatHistory.length > 0
+        !this.canRead('chat') ? '聊天读取已关闭，不使用旧缓存' : this.chatHistory.length > 0
           ? '最近缓存 ' + this.chatHistory.length + ' 条(最后一条:' + clip(this.chatHistory[this.chatHistory.length - 1].msg, 40) + ')'
           : '还没读过对局对话',
     };
@@ -1215,15 +1309,17 @@ export class WtWorld implements World {
 
   webUi(): WorldWebUiDecl {
     const cfg = this.opts.cfg;
+    this.ensureBattle();
     const book = readSpend(this.opts.dataDir, this.todayKey());
     return {
       label: 'war thunder安东星助手',
       lamps: [
-        { label: '遥测', state: (this.watcher ? this.watcher.online_now : this.online) ? 'online' : 'offline', hint: this.originText() },
+        { label: '遥测', state: !this.readNotice() && (this.watcher ? this.watcher.online_now : this.online) ? 'online' : 'offline', hint: this.readNotice() || this.originText() },
         { label: '知识库', state: this.view.entries.length > 0 ? 'online' : 'offline', hint: 'v' + this.view.version + ' · ' + this.view.entries.length + ' 条' },
         { label: '文案', state: this.modelCapability().online ? 'online' : 'offline', hint: this.sourceText() },
       ],
       badges: [
+        { label: '播报模式', value: this.speechMode(), tone: 'plain' as const },
         { label: '知识库', value: this.view.entries.length + ' 条', tone: 'plain' as const },
         { label: '今日花费', value: book.yuan.toFixed(3) + ' 元', tone: 'plain' as const },
       ],

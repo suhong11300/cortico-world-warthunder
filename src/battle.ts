@@ -35,6 +35,8 @@ export interface Indicators {
   speedKnown: boolean;
   altitudeKnown: boolean;
   army: string;
+  /** 游戏入场阶段的已知占位模型，不是玩家载具。 */
+  placeholder?: boolean;
 }
 
 export interface HudEvent {
@@ -94,6 +96,7 @@ export interface BattleSnapshot {
     altitude: { value: number | null; unit: 'm' | 'unconfirmed'; source: string };
     mapKnown: boolean;
     observedAt: number;
+    vehiclePending?: boolean;
   };
 }
 
@@ -102,6 +105,8 @@ export interface BattleSummary {
   kills: number;
   deaths: number;
   seconds: number;
+  killsKnown?: boolean;
+  deathsKnown?: boolean;
 }
 
 export type BattleEvent =
@@ -165,6 +170,8 @@ function decodeAs(label: RealEncoding, bytes: Uint8Array): string {
   }
 }
 
+export type TelemetryScope = 'vehicle' | 'map' | 'mission' | 'hud' | 'chat';
+
 export interface BattleClientOptions {
   host: string;
   port: number;
@@ -172,6 +179,8 @@ export interface BattleClientOptions {
   timeoutMs?: number;
   /** 文本编码策略,默认 auto。 */
   textEncoding?: TextEncoding;
+  /** 每次实际请求前检查活权限，旧在途轮询也不能继续请求已关闭类别。 */
+  canRead?: (scope: TelemetryScope) => boolean;
 }
 
 export interface BattleWatcherOptions {
@@ -345,6 +354,7 @@ export class BattleClient {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
   private readonly encoding: TextEncoding;
+  private readonly canRead?: (scope: TelemetryScope) => boolean;
 
   constructor(opts: BattleClientOptions) {
     const host = opts.host.trim() || '127.0.0.1';
@@ -353,6 +363,7 @@ export class BattleClient {
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 2500;
     this.encoding = opts.textEncoding ?? 'auto';
+    this.canRead = opts.canRead;
   }
 
   get origin(): string {
@@ -360,6 +371,11 @@ export class BattleClient {
   }
 
   private async json(path: string): Promise<unknown> {
+    if (this.canRead) {
+      const scopes: Record<string, TelemetryScope> = { '/state': 'vehicle', '/indicators': 'vehicle', '/mission.json': 'mission', '/map_info.json': 'map', '/map_obj.json': 'map', '/hudmsg': 'hud', '/gamechat': 'chat' };
+      const scope = scopes[path.split('?')[0]];
+      try { if (!scope || !this.canRead(scope)) return null; } catch { return null; }
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -414,6 +430,7 @@ export class BattleClient {
       speed: num(item.speed),
       altitude: num(item.altitude),
       type: str(item.type),
+      ...(vehicleFromType(str(item.type)) === 'dummy_plane' ? { placeholder: true } : {}),
       speedKnown: finite(item.speed),
       altitudeKnown: finite(item.altitude),
       army: str(item.army),
@@ -752,6 +769,7 @@ export class BattleWatcher {
   private awaitingInvalidAfterFeed = false;
   private pendingIndicatorDeath = false;
   private observedKnown = false;
+  private observationMade = false;
   private combatTimeline: Array<{ identity: string; kind: 'kill' | 'death'; id: number; epoch: number }> = [];
   private combatEpoch = 0;
   private pendingIndicatorEntry: string | null = null;
@@ -776,6 +794,9 @@ export class BattleWatcher {
   get online_now(): boolean {
     return this.online;
   }
+
+  /** 区分构造默认值与该观测身份已经完成的一次探测（包含离线）。 */
+  get hasObservation(): boolean { return this.observationMade; }
 
   get inBattleNow(): boolean {
     return this.inBattle;
@@ -854,7 +875,11 @@ export class BattleWatcher {
   }
 
   private refreshSnapshot(probe: BattleProbe): void {
-    const { state, objects, indicators: ind } = probe;
+    const { objects } = probe;
+    const vehiclePending = probe.indicators?.placeholder === true;
+    // 实战入场会给 dummy_plane 及一整套有效飞机仪表；不能冒充玩家读数。
+    const state = vehiclePending ? null : probe.state;
+    const ind = vehiclePending ? null : probe.indicators;
     let enemies = 0;
     let allies = 0;
     for (const object of objects) {
@@ -883,6 +908,7 @@ export class BattleWatcher {
         altitude,
         mapKnown: probe.mapKnown,
         observedAt: this.now(),
+        ...(vehiclePending ? { vehiclePending: true } : {}),
       },
     };
   }
@@ -915,6 +941,7 @@ export class BattleWatcher {
    */
   async refresh(): Promise<BattleSnapshot> {
     const probe = await this.probe();
+    this.observationMade = true;
     this.online = probe.online;
     this.observedKnown = probe.battleKnown;
     this.observedInBattle = probe.inBattle;
@@ -936,6 +963,7 @@ export class BattleWatcher {
   async poll(): Promise<BattleEvent[]> {
     const out: BattleEvent[] = [];
     const probe = await this.probe();
+    this.observationMade = true;
     if (!probe.online) {
       // Missing transport data is unknown, not a confirmed match result.
       this.online = false;
@@ -958,7 +986,7 @@ export class BattleWatcher {
       // 入局这一拍就把存活边沿武装好。不武装的话,下一次读到的失效会因为"没见过活的"
       // 而被当成缺数据直接丢掉,玩家看到的现象就是"第一次阵亡从来不播"。
       const firstInd = probe.indicators;
-      if (firstInd && firstInd.known && firstInd.valid) this.aliveArmed = true;
+      if (firstInd && firstInd.known && firstInd.valid && !firstInd.placeholder) this.aliveArmed = true;
       out.push({ kind: 'enter', snapshot: this.snapshot });
       return out;
     }
@@ -1041,7 +1069,7 @@ export class BattleWatcher {
           continue;
         }
         feedDeathThisPoll = true;
-        this.awaitingInvalidAfterFeed = !!(probe.indicators?.known && probe.indicators.valid);
+        this.awaitingInvalidAfterFeed = !!(probe.indicators?.known && probe.indicators.valid && !probe.indicators.placeholder);
         this.aliveArmed = false; this.lastDeathAt = this.now(); this.applyDeath(out, { identity, id: hit.id });
         continue;
       }
@@ -1067,7 +1095,11 @@ export class BattleWatcher {
 
     for (const row of hud.damage) this.processedDamage.add(eventFingerprint(row));
     const ind = probe.indicators;
-    if (ind && ind.known) {
+    if (ind?.placeholder) {
+      this.aliveArmed = false;
+      this.awaitingInvalidAfterFeed = false;
+    }
+    if (ind && ind.known && !ind.placeholder) {
       if (ind.valid) {
         if (this.awaitingInvalidAfterFeed && this.now() - this.lastDeathAt >= DEATH_VIA_FEED_WINDOW_MS) this.awaitingInvalidAfterFeed = false;
         // 看到一次有效存活：武装边沿，下一次失效才算阵亡。
