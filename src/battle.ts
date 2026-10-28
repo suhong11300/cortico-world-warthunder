@@ -12,6 +12,11 @@ export interface GameState {
   vehicle: string;
   mode: string;
   army: string;
+  /** Only explicitly unit-labelled state fields are converted to display units. */
+  speedKmh?: number;
+  speedKind?: 'IAS' | 'TAS';
+  altitudeM?: number;
+  mapValidKnown?: boolean;
 }
 
 export interface Indicators {
@@ -27,6 +32,9 @@ export interface Indicators {
   speed: number;
   altitude: number;
   type: string;
+  speedKnown: boolean;
+  altitudeKnown: boolean;
+  army: string;
 }
 
 export interface HudEvent {
@@ -49,11 +57,13 @@ export interface ChatLine {
 export interface MissionState {
   running: boolean;
   objectives: string[];
+  status: string;
 }
 
 /** /map_info.json：地图元信息，valid 为真说明地图已加载（机库里通常为假）。 */
 export interface MapInfo {
   valid: boolean;
+  known: boolean;
 }
 
 export interface HudSnapshot {
@@ -78,6 +88,13 @@ export interface BattleSnapshot {
   altitude: number;
   enemies: number;
   allies: number;
+  /** Current endpoint provenance; absent only on legacy/manual snapshots. */
+  readings?: {
+    speed: { value: number | null; unit: 'km/h' | 'unconfirmed'; source: string; kind: string };
+    altitude: { value: number | null; unit: 'm' | 'unconfirmed'; source: string };
+    mapKnown: boolean;
+    observedAt: number;
+  };
 }
 
 export interface BattleSummary {
@@ -184,6 +201,14 @@ function bool(value: unknown): boolean {
   return value === true || value === 1;
 }
 
+function knownBool(value: unknown): boolean {
+  return typeof value === 'boolean' || value === 0 || value === 1;
+}
+
+function finite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
 function toHudEvent(raw: unknown): HudEvent | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const item = raw as Record<string, unknown>;
@@ -196,6 +221,10 @@ function toHudEvent(raw: unknown): HudEvent | null {
     msg: cleanBattleText(str(item.msg)),
     sender: cleanBattleText(str(item.sender)),
   };
+}
+
+function eventFingerprint(event: HudEvent): string {
+  return JSON.stringify([event.id, event.time, event.msg, event.type]);
 }
 
 /** 击毁类关键字:不同版本的消息措辞不一样,统一用包含匹配兜一层。 */
@@ -263,9 +292,18 @@ function stripVehicleTag(value: string): string {
   return value.replace(/\s*[（(][^（()）]*[)）]\s*$/, '').trim();
 }
 
-/** 比对用的名字归一化：去零宽、去所有空白、小写。 */
+/** 比对用名字归一化：去零宽、压平空白、小写，保留昵称中有意义的空格。 */
 export function normalizePlayerName(value: string): string {
-  return cleanBattleText(value).replace(/\s+/g, '').toLowerCase();
+  return cleanBattleText(value).toLowerCase();
+}
+
+function samePlayer(actual: string, configured: string): boolean {
+  const me = normalizePlayerName(stripVehicleTag(configured));
+  if (!me) return false;
+  const name = normalizePlayerName(stripVehicleTag(actual));
+  // A displayed squadron prefix is not an arbitrary nickname substring.
+  const withoutSquadron = name.replace(/^(?:\[[^\]]+\]|=[^=]+=|\^[^^]+\^)\s*/, '');
+  return name === me || withoutSquadron === me;
 }
 
 /**
@@ -279,11 +317,13 @@ export function parseKillLine(msg: string): KillLine | null {
   if (!text) return null;
   const lower = text.toLowerCase();
   for (const verb of KILL_VERBS) {
-    const at = lower.indexOf(verb);
+    // English verbs must be separated from names; e.g. NotDestroyedAce is a name.
+    const match = /^[a-z]/.test(verb) ? new RegExp('\\s' + verb + '\\s', 'i').exec(text) : null;
+    const at = /^[a-z]/.test(verb) ? (match ? match.index + 1 : -1) : lower.indexOf(verb);
     if (at <= 0) continue;
     const killer = stripVehicleTag(text.slice(0, at));
     const victim = stripVehicleTag(text.slice(at + verb.length));
-    if (!killer) continue;
+    if (!killer || !victim) continue;
     return { killer, victim };
   }
   return null;
@@ -297,9 +337,7 @@ export function parseKillLine(msg: string): KillLine | null {
  * 击杀当成自己的战绩，再拿去喊「本局第 N 个」。
  */
 export function isSelfKill(line: KillLine, playerName: string): boolean {
-  const me = normalizePlayerName(playerName);
-  if (!me) return false;
-  return normalizePlayerName(line.killer).includes(me);
+  return samePlayer(line.killer, playerName) && !samePlayer(line.victim, playerName);
 }
 
 export class BattleClient {
@@ -311,7 +349,7 @@ export class BattleClient {
   constructor(opts: BattleClientOptions) {
     const host = opts.host.trim() || '127.0.0.1';
     const port = Number.isFinite(opts.port) && opts.port > 0 ? Math.trunc(opts.port) : 8111;
-    this.base = 'http://' + host + ':' + port;
+    this.base = 'http://' + (host.includes(':') && !host.startsWith('[') ? '[' + host + ']' : host) + ':' + port;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 2500;
     this.encoding = opts.textEncoding ?? 'auto';
@@ -359,6 +397,10 @@ export class BattleClient {
       vehicle: str(item.vehicle_type),
       mode: str(item.game_mode),
       army: str(item.army),
+      ...(knownBool(item.map_valid) ? { mapValidKnown: true } : {}),
+      ...(finite(item['IAS, km/h']) ? { speedKmh: item['IAS, km/h'], speedKind: 'IAS' as const }
+        : finite(item['TAS, km/h']) ? { speedKmh: item['TAS, km/h'], speedKind: 'TAS' as const } : {}),
+      ...(finite(item['H, m']) ? { altitudeM: item['H, m'] } : {}),
     };
   }
 
@@ -368,10 +410,13 @@ export class BattleClient {
     const item = raw as Record<string, unknown>;
     return {
       valid: bool(item.valid),
-      known: 'valid' in item,
+      known: knownBool(item.valid),
       speed: num(item.speed),
       altitude: num(item.altitude),
       type: str(item.type),
+      speedKnown: finite(item.speed),
+      altitudeKnown: finite(item.altitude),
+      army: str(item.army),
     };
   }
 
@@ -399,8 +444,12 @@ export class BattleClient {
   }
 
   async mapObjects(): Promise<MapObject[]> {
+    return (await this.mapObjectsResult()).objects;
+  }
+
+  async mapObjectsResult(): Promise<{ objects: MapObject[]; known: boolean }> {
     const raw = await this.json('/map_obj.json');
-    if (!Array.isArray(raw)) return [];
+    if (!Array.isArray(raw)) return { objects: [], known: false };
     const out: MapObject[] = [];
     for (const entry of raw) {
       if (typeof entry !== 'object' || entry === null) continue;
@@ -417,7 +466,7 @@ export class BattleClient {
         color: rgb || str(item.color),
       });
     }
-    return out;
+    return { objects: out, known: true };
   }
 
   /**
@@ -453,14 +502,15 @@ export class BattleClient {
       }
     }
     const status = str(item.status).toLowerCase();
-    return { running: status === 'running', objectives };
+    return { running: status === 'running', objectives, status };
   }
 
   /** 地图元信息。valid 为真说明地图已加载。 */
   async mapInfo(): Promise<MapInfo | null> {
     const raw = await this.json('/map_info.json');
     if (typeof raw !== 'object' || raw === null) return null;
-    return { valid: bool((raw as Record<string, unknown>).valid) };
+    const value = (raw as Record<string, unknown>).valid;
+    return { valid: bool(value), known: knownBool(value) };
   }
 }
 
@@ -515,7 +565,7 @@ const KILL_DEDUPE_ID = 3;
 
 /** 一次"自己的击毁"命中,带去重用的幂等键。 */
 export interface SelfKillHit {
-  /** 幂等键:发起者>目标#第几次。全量重放多少轮都只会入账一次。 */
+  /** 当前响应内的稳定组键:发起者>目标@首条事件id。 */
   key: string;
   /** 原始播报正文,拿去开口。 */
   detail: string;
@@ -529,7 +579,7 @@ export interface SelfKillHit {
 
 /** 一次"自己被打掉"的命中,幂等键带 d: 前缀,与击杀分开计数。 */
 export interface SelfDeathHit {
-  /** 幂等键:d:发起者>目标#第几次。全量重放多少轮都只会入账一次。 */
+  /** 当前响应内的稳定组键:d:发起者>目标@首条事件id。 */
   key: string;
   /** 原始播报正文。 */
   detail: string;
@@ -554,8 +604,7 @@ interface KillRow {
  * 把全量 damage feed 收成去重后的击毁行。
  *
  * 同一次击毁会连着吐多条播报(击毁 / 起火 / 首杀),这里按 发起者>目标 归组:组内
- * time 相差不到 KILL_DEDUPE_MS 或 id 相差不超过 KILL_DEDUPE_ID 就算同一条。time
- * 缺失(部分服务端、以及全部测试夹具)时自动退化为纯 id 邻近判断。
+ * time 都存在时按时间窗口判重；仅 time 缺失时才退化为 id 邻近判断。
  */
 function collectKillRows(damage: HudEvent[], afterId: number): KillRow[] {
   const rows: KillRow[] = [];
@@ -571,8 +620,9 @@ function collectKillRows(damage: HudEvent[], afterId: number): KillRow[] {
     const prev = anchor.get(pair);
     if (prev) {
       const nearByTime = event.time > 0 && prev.time > 0 && Math.abs(event.time - prev.time) * 1000 < KILL_DEDUPE_MS;
+      const haveTime = event.time > 0 && prev.time > 0;
       const nearById = event.id - prev.id <= KILL_DEDUPE_ID;
-      if (nearByTime || nearById) {
+      if (haveTime ? nearByTime : nearById) {
         // 是上一条的后续播报:只把锚点挪到最新,不重复入账。
         anchor.set(pair, { time: event.time, id: event.id });
         continue;
@@ -599,7 +649,7 @@ export function computeSelfKills(
   return collectKillRows(damage, opts.afterId)
     .filter((row) => isSelfKill(row.line, opts.playerName))
     .map((row) => ({
-      key: row.pair + '#' + row.occurrence,
+      key: row.pair + '@' + row.id,
       detail: row.detail,
       victim: row.line.victim,
       id: row.id,
@@ -609,9 +659,7 @@ export function computeSelfKills(
 
 /** 受害者是不是我(按归一化后的昵称做包含匹配)。 */
 export function isSelfDeath(line: KillLine, playerName: string): boolean {
-  const me = normalizePlayerName(playerName);
-  if (!me) return false;
-  return normalizePlayerName(line.victim).includes(me);
+  return samePlayer(line.victim, playerName);
 }
 
 /**
@@ -620,7 +668,7 @@ export function isSelfDeath(line: KillLine, playerName: string): boolean {
  * 与 computeSelfKills 同一套路:每轮全量重算 + 幂等键去重,所以重连、换局、游戏重启
  * 都不会把阵亡数算丢或算重。键带 d: 前缀,与击杀键互不干扰。
  *
- * 自己把自己打掉(极罕见)只算击杀,这里跳过,免得一条播报两边各加一。
+ * 自伤只记阵亡，不奖励击毁。
  */
 export function computeSelfDeaths(
   damage: HudEvent[],
@@ -631,7 +679,7 @@ export function computeSelfDeaths(
     if (!isSelfDeath(row.line, opts.playerName)) continue;
     if (isSelfKill(row.line, opts.playerName)) continue;
     hits.push({
-      key: 'd:' + row.pair + '#' + row.occurrence,
+      key: 'd:' + row.pair + '@' + row.id,
       detail: row.detail,
       killer: row.line.killer,
       id: row.id,
@@ -644,9 +692,8 @@ export function computeSelfDeaths(
 /**
  * 把 8111 的轮询结果翻译成"要不要开口"的事件。
  *
- * 归因说明:hudmsg 的 damage 列表记为"本机造成的命中/击毁",events 是全战场播报。
- * 这个语义没有官方文档背书,所以 damage 只用来判断"有击毁"并给出细节,
- * events 只当作战况素材放进讲解,不当成自己的战绩。
+ * damage 不能整体当成本机战绩，逐条核对昵称归属；events只作外部战况原文，
+ * 不累加自己的战绩。两路均为客户端观察，不是服务器记分板。
  */
 /**
  * 一次探测的全部信号。
@@ -660,6 +707,9 @@ interface BattleProbe {
   inBattle: boolean;
   state: GameState | null;
   objects: MapObject[];
+  mapKnown: boolean;
+  indicators: Indicators | null;
+  battleKnown: boolean;
 }
 
 export class BattleWatcher {
@@ -692,9 +742,20 @@ export class BattleWatcher {
   /** 已经入账的击杀幂等键（发起者>目标#第几次），全量重放多少次都只算一次。 */
   private readonly countedKills = new Set<string>();
   /** 已经开口过的全战场播报 id，全量重放时不重复播。 */
-  private readonly seenHud = new Set<number>();
+  private readonly seenHud = new Set<string>();
   /** 已经入账的阵亡幂等键（d:发起者>目标#第几次）。 */
   private readonly countedDeaths = new Set<string>();
+  private readonly processedDamage = new Set<string>();
+  private readonly recentDamage = new Map<string, { id: number; time: number }>();
+  private lastDmgMax = -1;
+  private lastEvtMax = -1;
+  private awaitingInvalidAfterFeed = false;
+  private pendingIndicatorDeath = false;
+  private observedKnown = false;
+  private combatTimeline: Array<{ identity: string; kind: 'kill' | 'death'; id: number; epoch: number }> = [];
+  private combatEpoch = 0;
+  private pendingIndicatorEntry: string | null = null;
+  private inferredSequence = 0;
   private kills = 0;
   private deaths = 0;
   private streak = 0;
@@ -729,6 +790,8 @@ export class BattleWatcher {
     return this.observedInBattle;
   }
 
+  get observedBattleKnown(): boolean { return this.observedKnown; }
+
   get currentSnapshot(): BattleSnapshot {
     return this.snapshot;
   }
@@ -738,9 +801,23 @@ export class BattleWatcher {
   }
 
   /** 记一次阵亡：累加、断连胜、落后两杀以上喊一句逆风。两路共用，口径只有一处。 */
-  private applyDeath(out: BattleEvent[]): void {
+  private recomputeStreaks(): void {
+    let streak = 0;
+    let best = 0;
+    for (const event of [...this.combatTimeline].sort((a, b) => a.epoch - b.epoch || a.id - b.id)) {
+      if (event.kind === 'death') streak = 0;
+      else { streak += 1; best = Math.max(best, streak); }
+    }
+    this.streak = streak;
+    this.bestStreak = best;
+  }
+
+  private applyDeath(out: BattleEvent[], feed?: { identity: string; id: number }): void {
     this.deaths += 1;
-    this.streak = 0;
+    const identity = feed?.identity ?? 'inferred:' + (++this.inferredSequence);
+    this.combatTimeline.push({ identity, kind: 'death', id: feed?.id ?? this.lastDmgMax + 0.5, epoch: this.combatEpoch });
+    if (!feed) this.pendingIndicatorEntry = identity;
+    this.recomputeStreaks();
     out.push({ kind: 'death', total: this.deaths, snapshot: this.snapshot });
     if (!this.behindRaised && this.deaths >= this.kills + 2) {
       this.behindRaised = true;
@@ -761,13 +838,23 @@ export class BattleWatcher {
     this.countedKills.clear();
     this.countedDeaths.clear();
     this.seenHud.clear();
+    this.processedDamage.clear();
+    this.recentDamage.clear();
+    this.lastDmgMax = -1;
+    this.lastEvtMax = -1;
+    this.awaitingInvalidAfterFeed = false;
+    this.pendingIndicatorDeath = false;
+    this.combatTimeline = [];
+    this.combatEpoch = 0;
+    this.pendingIndicatorEntry = null;
+    this.inferredSequence = 0;
     this.baselineDmgId = -1;
     this.baselineEvtId = -1;
     this.snapshot = { vehicle, mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
   }
 
-  private async refreshSnapshot(state: GameState | null, objects: MapObject[]): Promise<void> {
-    const ind = await this.client.indicators();
+  private refreshSnapshot(probe: BattleProbe): void {
+    const { state, objects, indicators: ind } = probe;
     let enemies = 0;
     let allies = 0;
     for (const object of objects) {
@@ -776,33 +863,49 @@ export class BattleWatcher {
       if (side === 'enemy') enemies += 1;
       else if (side === 'ally') allies += 1;
     }
-    const vehicle = (state && state.vehicle) || (ind ? vehicleFromType(ind.type) : '');
+    const speed: NonNullable<BattleSnapshot['readings']>['speed'] = state?.valid && state.speedKmh !== undefined
+      ? { value: state.speedKmh, unit: 'km/h', source: '/state', kind: state.speedKind ?? 'speed' }
+      : { value: ind?.known && ind.valid && ind.speedKnown ? ind.speed : null, unit: 'unconfirmed', source: '/indicators.speed', kind: 'raw' };
+    const altitude: NonNullable<BattleSnapshot['readings']>['altitude'] = state?.valid && state.altitudeM !== undefined
+      ? { value: state.altitudeM, unit: 'm', source: '/state.H, m' }
+      : { value: ind?.known && ind.valid && ind.altitudeKnown ? ind.altitude : null, unit: 'unconfirmed', source: '/indicators.altitude' };
+    const vehicle = (state?.valid && state.vehicle) || (ind?.known && ind.valid ? vehicleFromType(ind.type) : '');
     this.snapshot = {
       vehicle,
       mode: state ? state.mode : this.snapshot.mode,
-      army: state ? state.army : this.snapshot.army,
-      speed: ind ? ind.speed : 0,
-      altitude: ind ? ind.altitude : 0,
+      army: state?.army || ind?.army || '',
+      speed: speed.value ?? 0,
+      altitude: altitude.value ?? 0,
       enemies,
       allies,
+      readings: {
+        speed,
+        altitude,
+        mapKnown: probe.mapKnown,
+        observedAt: this.now(),
+      },
     };
   }
 
-  /** 四路并发探一次：谁通都算在线，任一强信号为真就算在战局。 */
+  /** 五路并发观察：在线与战局状态分别判断；缺少强信号时保留“未知”。 */
   private async probe(): Promise<BattleProbe> {
-    const [state, mission, mapInfo, objects] = await Promise.all([
+    const [state, mission, mapInfo, map, indicators] = await Promise.all([
       this.client.state(),
       this.client.mission(),
       this.client.mapInfo(),
-      this.client.mapObjects(),
+      this.client.mapObjectsResult(),
+      this.client.indicators(),
     ]);
-    const online = state !== null || mission !== null || mapInfo !== null || objects.length > 0;
+    const objects = map.objects;
+    const online = state !== null || mission !== null || mapInfo !== null || objects.length > 0 || indicators !== null;
     const missionRunning = mission !== null && mission.running;
     const mapReady = mapInfo !== null && mapInfo.valid;
     const stateOk = state !== null && state.valid && state.mapValid;
     // 单独的 objects.length 不能当判据：机库里 map_obj.json 可能还残留上一局的单位。
-    const inBattle = missionRunning || stateOk || (mapReady && objects.length > 0);
-    return { online, inBattle, state, objects };
+    const missionEnded = mission !== null && ['ended', 'completed', 'success', 'failed', 'fail', 'over'].includes(mission.status);
+    const inBattle = !missionEnded && (missionRunning || stateOk || (mapReady && objects.some(isUnitObject)));
+    const confirmedOutside = missionEnded || (mapInfo?.known && !mapInfo.valid) || (state?.valid && state.mapValidKnown && !state.mapValid);
+    return { online, inBattle, state, objects, mapKnown: map.known, indicators, battleKnown: inBattle || !!confirmedOutside };
   }
   /**
    * 主动刷新一次读数,不产生事件、也不改变事件状态机。
@@ -813,8 +916,9 @@ export class BattleWatcher {
   async refresh(): Promise<BattleSnapshot> {
     const probe = await this.probe();
     this.online = probe.online;
+    this.observedKnown = probe.battleKnown;
     this.observedInBattle = probe.inBattle;
-    if (probe.inBattle) await this.refreshSnapshot(probe.state, probe.objects);
+    if (probe.inBattle) this.refreshSnapshot(probe);
     return this.snapshot;
   }
   /** 预热:只把基线锚到当前最新,不产生事件。 */
@@ -822,6 +926,10 @@ export class BattleWatcher {
     const hud = await this.client.hud(-1, -1);
     this.baselineEvtId = maxId(hud.events, -1);
     this.baselineDmgId = maxId(hud.damage, -1);
+    this.lastDmgMax = this.baselineDmgId;
+    this.lastEvtMax = this.baselineEvtId;
+    for (const event of hud.damage) this.processedDamage.add(eventFingerprint(event));
+    for (const event of hud.events) this.seenHud.add(eventFingerprint(event));
   }
 
   /** 拉一次并给出这一轮要推的事件;游戏没开就返回空数组。 */
@@ -829,27 +937,27 @@ export class BattleWatcher {
     const out: BattleEvent[] = [];
     const probe = await this.probe();
     if (!probe.online) {
-      if (this.inBattle) {
-        out.push({ kind: 'leave', summary: this.summaryOf() });
-        this.inBattle = false;
-      }
+      // Missing transport data is unknown, not a confirmed match result.
       this.online = false;
       this.observedInBattle = false;
+      this.observedKnown = false;
       return out;
     }
     this.online = true;
+    this.observedKnown = probe.battleKnown;
     this.observedInBattle = probe.inBattle;
+    if (!probe.battleKnown) return out;
     const state = probe.state;
     const inBattle = probe.inBattle;
 
     if (inBattle && !this.inBattle) {
       this.inBattle = true;
       this.resetBattle((state && state.vehicle) || '');
-      await this.refreshSnapshot(state, probe.objects);
+      this.refreshSnapshot(probe);
       await this.warmup();
       // 入局这一拍就把存活边沿武装好。不武装的话,下一次读到的失效会因为"没见过活的"
       // 而被当成缺数据直接丢掉,玩家看到的现象就是"第一次阵亡从来不播"。
-      const firstInd = await this.client.indicators();
+      const firstInd = probe.indicators;
       if (firstInd && firstInd.known && firstInd.valid) this.aliveArmed = true;
       out.push({ kind: 'enter', snapshot: this.snapshot });
       return out;
@@ -876,21 +984,75 @@ export class BattleWatcher {
      * ——那条前置条件正是原来卡死的原因。基线作废后按当前 feed 重新锚定：宁可把
      * 重启前的残留当历史，也不要整条通道停摆。
      */
-    if (dmgMax >= 0 && this.baselineDmgId > dmgMax) this.baselineDmgId = -1;
-    if (evtMax >= 0 && this.baselineEvtId > evtMax) this.baselineEvtId = -1;
+    if (dmgMax >= 0 && this.lastDmgMax > dmgMax) {
+      this.baselineDmgId = -1;
+      // A lower-ID subset may be stale, not a new server. Never erase known identities here.
+      // Keep cross-response anchors too: the next row may be a continuation of this old view.
+      const continuesKnownGroup = (event: HudEvent): boolean => {
+        const line = parseKillLine(event.msg);
+        if (!line) return false;
+        const previous = this.recentDamage.get(normalizePlayerName(line.killer) + '>' + normalizePlayerName(line.victim));
+        return !!previous && event.id > previous.id && (event.time > 0 && previous.time > 0
+          ? Math.abs(event.time - previous.time) * 1000 < KILL_DEDUPE_MS
+          : event.id - previous.id <= KILL_DEDUPE_ID);
+      };
+      if (hud.damage.length > 0 && hud.damage.every(event => !this.processedDamage.has(eventFingerprint(event)) && !continuesKnownGroup(event))) {
+        this.combatEpoch += 1;
+        this.recentDamage.clear();
+        this.pendingIndicatorDeath = false;
+        this.pendingIndicatorEntry = null;
+        this.lastDmgMax = dmgMax;
+      }
+    }
+    if (evtMax >= 0 && this.lastEvtMax > evtMax) this.baselineEvtId = -1;
+    if (dmgMax >= 0) this.lastDmgMax = Math.max(this.lastDmgMax, dmgMax);
+    if (evtMax >= 0) this.lastEvtMax = evtMax;
 
-    await this.refreshSnapshot(state, probe.objects);
+    this.refreshSnapshot(probe);
 
     let killPushed = 0;
-    for (const hit of computeSelfKills(hud.damage, { afterId: this.baselineDmgId, playerName: this.playerName })) {
+    let feedDeathThisPoll = false;
+    // One ordered stream, not all kills followed by all deaths: streaks cannot cross a death.
+    const hits = [
+      ...computeSelfKills(hud.damage, { afterId: this.baselineDmgId, playerName: this.playerName }).map(hit => ({ ...hit, kind: 'kill' as const })),
+      ...computeSelfDeaths(hud.damage, { afterId: this.baselineDmgId, playerName: this.playerName }).map(hit => ({ ...hit, kind: 'death' as const })),
+    ].sort((a, b) => a.id - b.id);
+    for (const hit of hits) {
+      const raw = hud.damage.find(row => row.id === hit.id)!;
+      const identity = eventFingerprint(raw);
+      if (this.processedDamage.has(identity)) continue;
+      const line = parseKillLine(hit.detail)!;
+      const pair = normalizePlayerName(line.killer) + '>' + normalizePlayerName(line.victim);
+      const previous = this.recentDamage.get(pair);
+      const duplicate = previous && (raw.time > 0 && previous.time > 0
+        ? Math.abs(raw.time - previous.time) * 1000 < KILL_DEDUPE_MS
+        : hit.id > previous.id && hit.id - previous.id <= KILL_DEDUPE_ID);
+      this.recentDamage.set(pair, { id: hit.id, time: raw.time });
+      if (duplicate) continue;
+      if (hit.kind === 'death') {
+        if (this.countedDeaths.has(identity)) continue;
+        this.countedDeaths.add(identity);
+        if (this.pendingIndicatorDeath && this.now() - this.lastIndicatorDeathAt < DEATH_VIA_FEED_WINDOW_MS) {
+          this.pendingIndicatorDeath = false;
+          const inferred = this.combatTimeline.find(event => event.identity === this.pendingIndicatorEntry);
+          if (inferred) inferred.id = hit.id;
+          this.pendingIndicatorEntry = null;
+          this.recomputeStreaks();
+          continue;
+        }
+        feedDeathThisPoll = true;
+        this.awaitingInvalidAfterFeed = !!(probe.indicators?.known && probe.indicators.valid);
+        this.aliveArmed = false; this.lastDeathAt = this.now(); this.applyDeath(out, { identity, id: hit.id });
+        continue;
+      }
       // 幂等键 = 发起者>目标#第几次。全量重放多少轮都只入账一次，服务端 id 回退
       // 或 feed 窗口滑动也不会重复计。
-      if (this.countedKills.has(hit.key)) continue;
-      this.countedKills.add(hit.key);
+      if (this.countedKills.has(identity)) continue;
+      this.countedKills.add(identity);
       // 战绩永远照实累加,限的只是"逐条开口"这件事。
       this.kills += 1;
-      this.streak += 1;
-      if (this.streak > this.bestStreak) this.bestStreak = this.streak;
+    this.combatTimeline.push({ identity, kind: 'kill', id: hit.id, epoch: this.combatEpoch });
+      this.recomputeStreaks();
       if (this.behindRaised && this.kills >= this.deaths) this.behindRaised = false;
       if (killPushed >= MAX_KILL_EVENTS) continue;
       killPushed += 1;
@@ -903,28 +1065,21 @@ export class BattleWatcher {
       });
     }
 
-    // 阵亡同样从全量 feed 重算：重启/重生那一下 indicators 的边沿还没武装好，只靠它必漏，
-    // 而且漏一次这一局就永远对不上。这里按 victim=我 数，幂等键去重，重连换局都自愈。
-    for (const hit of computeSelfDeaths(hud.damage, { afterId: this.baselineDmgId, playerName: this.playerName })) {
-      if (this.countedDeaths.has(hit.key)) continue;
-      this.countedDeaths.add(hit.key);
-      // 这一拍 indicators 可能已经把同一次阵亡数过，那就不再重复累加。
-      if (this.now() - this.lastIndicatorDeathAt < DEATH_VIA_FEED_WINDOW_MS) continue;
-      // feed 已经认领这一条，indicators 这边接下来失效的那一拍直接吞掉。
-      this.aliveArmed = false;
-      this.lastDeathAt = this.now();
-      this.applyDeath(out);
-    }
-
-    const ind = await this.client.indicators();
+    for (const row of hud.damage) this.processedDamage.add(eventFingerprint(row));
+    const ind = probe.indicators;
     if (ind && ind.known) {
       if (ind.valid) {
+        if (this.awaitingInvalidAfterFeed && this.now() - this.lastDeathAt >= DEATH_VIA_FEED_WINDOW_MS) this.awaitingInvalidAfterFeed = false;
         // 看到一次有效存活：武装边沿，下一次失效才算阵亡。
-        this.aliveArmed = true;
+        if (!feedDeathThisPoll && !this.awaitingInvalidAfterFeed) this.aliveArmed = true;
+      } else if (this.awaitingInvalidAfterFeed) {
+        this.awaitingInvalidAfterFeed = false;
+        this.aliveArmed = false;
       } else if (this.aliveArmed && this.now() - this.lastDeathAt >= DEATH_DEBOUNCE_MS) {
         // feed 里那一条还没到或压根没有（坠机、撞地），由 indicators 兜底计一次。
         this.aliveArmed = false;
         this.lastIndicatorDeathAt = this.now();
+        this.pendingIndicatorDeath = true;
         this.lastDeathAt = this.now();
         this.applyDeath(out);
       }
@@ -934,14 +1089,14 @@ export class BattleWatcher {
     for (const event of hud.events) {
       // 全量重放:入局前的旧播报跳过,已经开过口的 id 不再重复,否则每一轮都会刷屏。
       if (event.id <= this.baselineEvtId) continue;
-      if (this.seenHud.has(event.id)) continue;
+      if (this.seenHud.has(eventFingerprint(event))) continue;
       if (hudPushed >= MAX_HUD_EVENTS) break;
       const text = (event.msg || event.type || '').trim();
       if (!text) continue;
       const lower = text.toLowerCase();
       if (!EVENT_WORDS.some((word) => lower.includes(word))) continue;
       hudPushed += 1;
-      this.seenHud.add(event.id);
+      this.seenHud.add(eventFingerprint(event));
       out.push({ kind: 'hud', detail: text });
     }
 
@@ -969,7 +1124,7 @@ function toChatLine(raw: unknown): ChatLine | null {
     sender: cleanBattleText(str(item.sender)).slice(0, MAX_CHAT_SENDER),
     msg,
     enemy: bool(item.enemy),
-    mode: cleanBattleText(str(item.mode)).slice(0, 16) || 'All',
+    mode: cleanBattleText(str(item.mode)).slice(0, 16),
   };
 }
 

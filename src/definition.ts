@@ -37,12 +37,12 @@ export const WT: WorldDefinition<WtConfigSection> = {
         en: 'Pull one knowledge base update from the configured URL.',
       },
       wt_battle_state: {
-        zh: '主动读一次当前战局的载具、读数与战绩。',
-        en: 'Read the current battle: vehicle, readings and tally.',
+        zh: '读取当前观测、字段来源与可见地图；战绩为观测归因累计,非官方记分板。',
+        en: 'Read current observations and visible-map objects; attributed tally is not the official scoreboard.',
       },
       wt_commentary: {
-        zh: '生成一条战况播报推到对话:态势、喝彩或打气。',
-        en: 'Compose one battle commentary line: sitrep, cheer or urge.',
+        zh: '确定性生成当前观测播报:态势、喝彩或打气;未知状态不复用旧读数。',
+        en: 'Render current observed facts deterministically; never replay stale readings as current.',
       },
       wt_vision_probe: {
         zh: '视觉降级通道自检:截屏后做系统 OCR 并挑出战况线索。',
@@ -53,8 +53,8 @@ export const WT: WorldDefinition<WtConfigSection> = {
         en: 'Read in-battle chat and translate it; original first, then the translation.',
       },
       wt_say: {
-        zh: '把一句话打进游戏发言栏并回车发出；默认先预演再确认。',
-        en: 'Type a line into the in-game chat box and press Enter; dry run first unless confirmed.',
+        zh: '默认把文本复制到剪贴板；明确配置confirm/auto时可键盘直写。',
+        en: 'Copy text to the clipboard by default; optional confirm/auto mode types into game chat.',
       },
       wt_budget: {
         zh: '看今天的文案模型用量与花费,可清零。',
@@ -64,11 +64,11 @@ export const WT: WorldDefinition<WtConfigSection> = {
     events: [
       { type: 'wt.ready', description: { zh: 'World 挂载完成,附遥测与知识库状态。', en: 'The World was mounted, with telemetry and knowledge base status.' } },
       { type: 'wt.battle_started', description: { zh: '进入战局。', en: 'A battle started.' } },
-      { type: 'wt.kill', description: { zh: '本局击毁目标,带当前连击数。', en: 'A kill happened, with the current streak.' } },
-      { type: 'wt.death', description: { zh: '本局载具被击毁。', en: 'The vehicle was destroyed.' } },
-      { type: 'wt.behind', description: { zh: '局势逆风,需要打气。', en: 'The battle is going badly; encouragement is due.' } },
-      { type: 'wt.commentary', description: { zh: '定时或手动的战况解说。', en: 'A periodic or manual battle commentary.' } },
-      { type: 'wt.result', description: { zh: '离开战局,带本局战绩与时长。', en: 'The battle ended, with tally and duration.' } },
+      { type: 'wt.kill', description: { zh: 'feed中观测归属于昵称的击毁,非官方记分板。', en: 'An observed feed kill attributed to the configured nickname, not an official scoreboard update.' } },
+      { type: 'wt.death', description: { zh: '观测阵亡或指标失效推断,不能一律当确认击毁。', en: 'An observed death or indicator-loss inference, not always a confirmed destruction.' } },
+      { type: 'wt.behind', description: { zh: '观测累计含推断的死亡多于击毁,不代表全局胜负。', en: 'Observed/inferred losses exceed attributed kills; no match-result claim.' } },
+      { type: 'wt.commentary', description: { zh: '确定性观测播报,或明确external的原始HUD信息。', en: 'Deterministic observations, or raw HUD text explicitly framed as external.' } },
+      { type: 'wt.result', description: { zh: '离开观测战局,带观测累计与时长;官方胜负未知。', en: 'Left the observed battle, with local tally and duration; official result unknown.' } },
     ],
   },
 };

@@ -285,7 +285,6 @@ export function contradictsFacts(text: string, facts: string[]): boolean {
   if (facts.length === 0) return false;
   const known = new Set(numbersOf(facts.join(' ')));
   for (const token of numbersOf(text)) {
-    if (token === '0' || token === '1') continue;
     if (!known.has(token)) return true;
   }
   return false;

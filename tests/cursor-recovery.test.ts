@@ -83,7 +83,7 @@ describe('computeSelfKills:全量重算的纯函数', () => {
     ]);
     const hits = computeSelfKills(feed, { afterId: -1, playerName: 'Ace' });
     expect(hits.length).toBe(1);
-    expect(hits[0]?.key).toBe('ace>t-34#1');
+    expect(hits[0]?.key).toBe('ace>t-34@20');
   });
 
   it('两次真击毁(time 隔 30 秒)算两次,幂等键带序号', () => {

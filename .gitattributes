@@ -1,4 +1,5 @@
-# 官方校验会逐字比对新提示词内容，CRLF 检出会让换行差异变成失败
 * text=auto
-src/ENV_PROMPT.md text eol=lf
+*.ts text eol=lf
 *.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf

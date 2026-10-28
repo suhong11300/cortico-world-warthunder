@@ -177,7 +177,7 @@ describe('装配契约', () => {
     const { world } = await boot();
     const vars = world.envPromptVars() ?? {};
     expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.chat', 'wt.kb', 'wt.now', 'wt.source', 'wt.status', 'wt.vehicle', 'wt.zone']);
-    expect(vars['wt.status']).toBe('遥测离线');
+    expect(vars['wt.status']).toBe('遥测离线/状态未知');
     expect(vars['wt.kb']).toContain('53 条');
     await world.stop();
   });
@@ -236,7 +236,7 @@ describe('挂载与播报', () => {
     await world.stop();
   });
 
-  it('宿主有人格通道时播报文案走它,数字仍在素材里', async () => {
+  it('战况正文确定性生成,宿主人格通道不能改写事实', async () => {
     const routes: Routes = { state: inBattle, indicators: flying };
     const { world, host } = await boot({}, () => routes);
     let brief = '';
@@ -247,8 +247,8 @@ describe('挂载与播报', () => {
       },
     };
     await pollOnce(world);
-    expect(host.events.at(-1)?.text).toBe('稳住，狗斗别丢能量。');
-    expect(brief).toContain('数字一个都不要改');
+    expect(host.events.at(-1)?.text).toContain('进战局');
+    expect(brief).toBe('');
     await world.stop();
   });
 
@@ -281,7 +281,7 @@ describe('工具', () => {
     await pollOnce(world);
     const text = await call(world, 'wt_status');
     expect(text).toContain('没连上');
-    expect(text).toContain('不在战局');
+    expect(text).toContain('未知(遥测离线)');
     await world.stop();
   });
 
@@ -364,7 +364,7 @@ describe('滥用面的闸', () => {
     await pollOnce(world);
     const kills = host.events.filter((event) => event.type === 'wt.kill');
     expect(kills).toHaveLength(3);
-    expect(await call(world, 'wt_battle_state')).toContain('本局:6 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('本局观测累计:6 杀');
   });
 
   it('清零账本要先确认,而且一天最多三次', async () => {
@@ -400,9 +400,9 @@ describe('滥用面的闸', () => {
     let used = 0;
     const { world, host } = await boot({ maxCallsPerMinute: 1 }, () => ({ state: inBattle, indicators: flying }));
     host.cognition = { request: async () => { used += 1; return { text: '第一句用模型说的' }; } };
-    const first = await call(world, 'wt_commentary');
+    const first = await call(world, 'wt_chat', { action: 'compose', draft: '测试一句话' });
     expect(first).toContain('第一句用模型说的');
-    const second = await call(world, 'wt_commentary');
+    const second = await call(world, 'wt_chat', { action: 'compose', draft: '测试另一句话' });
     expect(second).not.toContain('第一句用模型说的');
     expect(used).toBe(1);
     expect(await call(world, 'wt_status')).toContain('本分钟模型调用已达上限 1 次');
@@ -411,7 +411,7 @@ describe('滥用面的闸', () => {
 
 describe('对局聊天工具', () => {
   const chatRoutes = (): Routes => ({
-    state: inMenu,
+    state: inBattle,
     chat: [
       { id: 70, msg: 'nice shot', sender: 'pecusgaming', enemy: false, mode: 'All' },
       { id: 71, msg: 'slightly op tbh', sender: 'shino_rs', enemy: true, mode: 'All' },
@@ -511,7 +511,7 @@ describe('对局聊天工具', () => {
   it('遥测没连上时直接说明', async () => {
     const { world } = await boot({}, () => ({ broken: true }));
     const out = await call(world, 'wt_chat');
-    expect(out).toContain('遥测没连上');
+    expect(out).toContain('遥测离线');
     await world.stop();
   });
 });
@@ -567,7 +567,7 @@ describe('发言落地', () => {
 
 describe('隐私与副作用闸', () => {
   const chatOne = (): Routes => ({
-    state: inMenu,
+    state: inBattle,
     chat: [{ id: 70, msg: 'nice shot', sender: 'pecusgaming', enemy: false, mode: 'All' }],
   });
 
@@ -718,7 +718,7 @@ describe('播报档位', () => {
     await pollOnce(world);
     expect(host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
     expect(host.events.some((event) => event.type === 'wt.kill')).toBe(false);
-    expect(await call(world, 'wt_battle_state')).toContain('本局:2 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('本局观测累计:2 杀');
     await world.stop();
   });
 });

@@ -113,14 +113,14 @@ describe('战局文案', () => {
     expect(commentaryText(snapshot, 'zh')).toContain('速度 412 km/h');
   });
 
-  it('resultText 按击杀减阵亡给出赚平亏判断', () => {
+  it('resultText 报观测累计,不以KD臆断胜负或收益', () => {
     const win: BattleSummary = { vehicle: 'P-51', kills: 4, deaths: 2, seconds: 620 };
     const even: BattleSummary = { vehicle: 'P-51', kills: 3, deaths: 3, seconds: 300 };
     const lose: BattleSummary = { vehicle: 'P-51', kills: 1, deaths: 4, seconds: 0 };
-    expect(resultText(win, 'zh')).toContain('这局是赚的');
+    expect(resultText(win, 'zh')).toContain('观测累计 4 杀');
     expect(resultText(win, 'zh')).toContain('打了约 10 分钟');
-    expect(resultText(even, 'zh')).toContain('势均力敌');
-    expect(resultText(lose, 'zh')).toContain('换条线路');
+    expect(resultText(even, 'zh')).toContain('未取得官方胜负结算');
+    expect(resultText(lose, 'zh')).toContain('未取得官方胜负结算');
   });
 
   it('readyText 分在线与离线两种说法', () => {

@@ -39,13 +39,29 @@ export function clip(text: string, max: number): string {
 
 /** 战局读数的单行摘要。 */
 export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
+  if (snapshot.readings) {
+    const { speed, altitude, mapKnown } = snapshot.readings;
+    const bits = [snapshot.vehicle || (lang === 'en' ? 'unknown vehicle ID' : '载具ID未知')];
+    if (speed.value !== null) bits.push(speed.unit === 'km/h'
+      ? speed.kind + ' ' + Math.round(speed.value) + ' km/h'
+      : (lang === 'en' ? 'speed instrument raw ' : '速度仪表原始值 ') + speed.value + (lang === 'en' ? ' (unit unconfirmed)' : '(单位未确认)'));
+    if (altitude.value !== null) bits.push(altitude.unit === 'm'
+      ? (lang === 'en' ? 'altitude ' : '高度 ') + Math.round(altitude.value) + ' m'
+      : (lang === 'en' ? 'altitude instrument raw ' : '高度仪表原始值 ') + altitude.value + (lang === 'en' ? ' (unit unconfirmed)' : '(单位未确认)'));
+    if (speed.value === null && altitude.value === null) bits.push(lang === 'en' ? 'speed/altitude unavailable' : '速度/高度不可用');
+    bits.push(mapKnown
+      ? lang === 'en' ? `${snapshot.enemies} enemies / ${snapshot.allies} allies on the visible map (not the full battlefield)`
+        : `地图可见 ${snapshot.enemies} 敌 / ${snapshot.allies} 友(非全场总数)`
+      : lang === 'en' ? 'map data unavailable' : '地图数据不可用');
+    return bits.join(' · ');
+  }
   if (lang === 'en') {
     const bits = [snapshot.vehicle || 'unknown vehicle'];
     if (snapshot.speed > 0) bits.push(Math.round(snapshot.speed) + ' km/h');
     if (snapshot.altitude > 0) bits.push(Math.round(snapshot.altitude) + ' m');
     if (snapshot.enemies > 0 || snapshot.allies > 0) {
       // 陆战 RB 的小地图本来就不显示敌方单位，0 敌是真实读数而不是数据坏了，得说清。
-      const tail = snapshot.enemies === 0 ? ' (this mode usually hides enemy units, so 0 is normal)' : '';
+      const tail = ' (not the full battlefield)';
       bits.push(snapshot.enemies + ' enemies / ' + snapshot.allies + ' allies on the visible map' + tail);
     }
     return bits.join(' · ');
@@ -58,7 +74,7 @@ export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
   // 写成「附近」会让人以为是雷达范围内的接触——那是另一件事,插件没这个数据。
   if (snapshot.enemies > 0 || snapshot.allies > 0) {
     // 陆战 RB 的小地图本来就不显示敌方单位，0 敌是真实读数，写清楚免得被当成插件坏了。
-    const tail = snapshot.enemies === 0 ? '(该模式通常不显示敌方单位,0 属正常)' : '';
+    const tail = '(非全场总数)';
     bits.push('地图可见 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友' + tail);
   }
   return bits.length > 0 ? bits.join(' · ') : '载具数据还没读全';
@@ -101,11 +117,10 @@ export function resultText(summary: BattleSummary, lang: Lang): string {
   const minutes = summary.seconds > 0 ? Math.max(1, Math.round(summary.seconds / 60)) : 0;
   if (lang === 'en') {
     const time = minutes > 0 ? ' in ' + minutes + ' min' : '';
-    return 'Match over: ' + summary.kills + ' kills, ' + summary.deaths + ' losses' + time + '.';
+    return 'Left the observed battle: ' + summary.kills + ' attributed kills, ' + summary.deaths + ' observed/inferred losses' + time + '; official result unknown.';
   }
   const time = minutes > 0 ? '，打了约 ' + minutes + ' 分钟' : '';
-  const tail = summary.kills > summary.deaths ? '，这局是赚的。' : summary.kills === summary.deaths ? '，势均力敌。' : '，下一局换条线路试试。';
-  return '🏁 本局结束：' + summary.kills + ' 杀 ' + summary.deaths + ' 死' + time + tail;
+  return '🏁 已离开战局：观测累计 ' + summary.kills + ' 杀 ' + summary.deaths + ' 次阵亡/指标失效推断' + time + '；未取得官方胜负结算,仅供复盘。';
 }
 
 export function readyText(online: boolean, kbCount: number, lang: Lang): string {

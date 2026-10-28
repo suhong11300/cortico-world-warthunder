@@ -162,10 +162,11 @@ describe('P2 小地图读数', () => {
     expect(objects[1].x).toBeCloseTo(0.1);
   });
 
-  it('0 敌时文案说明是该模式不显示敌方,不是数据坏了', () => {
+  it('0 敌只说明可见地图观测,不凭空判断游戏模式', () => {
     const zh = battleLine({ vehicle: 'T-80BVM', mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 17 }, 'zh');
     expect(zh).toContain('地图可见 0 敌 / 17 友');
-    expect(zh).toContain('0 属正常');
+    expect(zh).toContain('非全场总数');
+    expect(zh).not.toContain('该模式');
     const en = battleLine({ vehicle: 'T-80BVM', mode: '', army: '', speed: 0, altitude: 0, enemies: 3, allies: 17 }, 'en');
     expect(en).not.toContain('usually hides');
   });

@@ -68,7 +68,7 @@ describe('computeSelfDeaths:阵亡也走全量重算', () => {
     const hits = computeSelfDeaths(feed, { afterId: -1, playerName: 'Ace' });
     expect(hits.length).toBe(1);
     expect(hits[0]?.killer).toBe('Enemy1');
-    expect(hits[0]?.key).toBe('d:enemy1>ace#1');
+    expect(hits[0]?.key).toBe('d:enemy1>ace@5');
   });
 
   it('别人的阵亡不认领', () => {
@@ -90,10 +90,10 @@ describe('computeSelfDeaths:阵亡也走全量重算', () => {
     expect(hits[0]?.killer).toBe('Enemy1');
   });
 
-  it('自己把自己打掉只算击杀,不重复算阵亡', () => {
+  it('自己把自己打掉只算阵亡,不奖励击杀', () => {
     const feed = toEvents([{ id: 5, time: 10, msg: 'Ace 击毁了 Ace' }]);
-    expect(computeSelfDeaths(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(0);
-    expect(computeSelfKills(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(1);
+    expect(computeSelfDeaths(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(1);
+    expect(computeSelfKills(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(0);
   });
 
   it('同一次阵亡的连发播报只算一次', () => {

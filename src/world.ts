@@ -227,6 +227,7 @@ export class WtWorld implements World {
   private client: BattleClient | null = null;
   private watcher: BattleWatcher | null = null;
   private clientKey = '';
+  private battleGeneration = 0;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   /** 采样产生的待生成事件;与采样分开,模型慢不拖住下一次轮询。 */
   private eventQueue: BattleEvent[] = [];
@@ -314,9 +315,19 @@ export class WtWorld implements World {
   }
 
   /** 遥测地址或端口改了要换客户端,否则会一直打旧端口。 */
+  private battleIdentity(): string {
+    const cfg = this.opts.cfg;
+    return JSON.stringify([cfg.gameHost.trim(), cfg.gamePort, cfg.textEncoding, cfg.playerName.trim()]);
+  }
+
+  private isCurrentBattle(generation: number): boolean {
+    if (this.clientKey !== this.battleIdentity()) this.ensureBattle();
+    return generation === this.battleGeneration;
+  }
+
   private ensureBattle(): { client: BattleClient; watcher: BattleWatcher } | null {
     const cfg = this.opts.cfg;
-    const key = cfg.gameHost.trim() + ':' + cfg.gamePort;
+    const key = this.battleIdentity();
     if (this.client && this.watcher && this.clientKey === key) return { client: this.client, watcher: this.watcher };
     try {
       let host = '127.0.0.1';
@@ -336,6 +347,9 @@ export class WtWorld implements World {
       this.client = client;
       this.watcher = watcher;
       this.clientKey = key;
+      this.battleGeneration += 1;
+      this.eventQueue = [];
+      this.chatHistory = []; this.chatCursor = 0; this.chatCache = null;
       return { client, watcher };
     } catch (error) {
       this.lastError = describeError(error);
@@ -432,7 +446,9 @@ export class WtWorld implements World {
     try {
       this.syncCommentaryTimer();
       this.maybeCheckKb();
+      const generation = this.battleGeneration;
       const events = await battle.watcher.poll();
+      if (!this.isCurrentBattle(generation)) return;
       this.online = battle.watcher.online_now;
       // 采样与文案分开:文案要走模型,模型慢的时候遥测不能停在原地等,否则下一轮采样整体后移。
       for (const event of events) this.enqueueDraft(event);
@@ -515,44 +531,50 @@ export class WtWorld implements World {
   private async handleBattleEvent(event: BattleEvent): Promise<void> {
     const cfg = this.opts.cfg;
     const lang = this.lang();
+    const generation = this.battleGeneration;
+    const push = async (type: string, text: string, trigger: TriggerMode, meta?: Record<string, unknown>, origin: 'internal' | 'external' = 'internal'): Promise<void> => {
+      if (this.isCurrentBattle(generation)) await this.push(type, text, trigger, meta, origin);
+    };
     switch (event.kind) {
       case 'enter': {
         // 新一局的聊天 id 从头开始,旧游标留着会一条都读不到。
         this.chatHistory = [];
         this.chatCursor = 0;
+        this.chatCache = null;
         if (!cfg.autoBrief) return;
-        const material = '刚进入战局。' + battleLine(event.snapshot, 'zh');
-        const text = await this.composeText(material, '用一句话宣告进战局,并说明你会盯着哪些事', () => enterText(event.snapshot, lang));
-        await this.push('wt.battle_started', text, 'flush', { vehicle: event.snapshot.vehicle });
+        const text = enterText(event.snapshot, lang);
+        await push('wt.battle_started', text, 'flush', { vehicle: event.snapshot.vehicle, observation: event.snapshot.readings });
         return;
       }
       case 'kill': {
         if (!cfg.autoBrief || this.chatter() === 'quiet') return;
-        const material = '本局第 ' + event.total + ' 个击毁,当前连击 ' + event.streak + '。' + (event.detail ? '原始播报:' + event.detail : '') + ' 读数:' + battleLine(event.snapshot, 'zh');
-        const text = await this.composeText(material, '用一两句话为这次击毁喝彩,可以带一个表情', () => killText(event.total, event.streak, event.detail, lang));
-        await this.push('wt.kill', text, 'flush', { total: event.total, streak: event.streak });
+        const text = killText(event.total, event.streak, event.detail, lang);
+        await push('wt.kill', '观测归因:' + text, 'flush', { total: event.total, streak: event.streak, observation: event.snapshot.readings });
         return;
       }
       case 'death': {
         if (!cfg.autoBrief || this.chatter() === 'quiet') return;
-        const material = '本局第 ' + event.total + ' 次被击毁。' + battleLine(event.snapshot, 'zh');
-        const text = await this.composeText(material, '用一两句话安慰并给出一条具体的下一步建议', () => deathText(event.total, lang));
-        await this.push('wt.death', text, 'flush', { total: event.total });
+        const text = deathText(event.total, lang);
+        await push('wt.death', '观测/指标推断(非服务端记分板):' + text, 'flush', { total: event.total, observation: event.snapshot.readings });
         return;
       }
       case 'behind': {
         if (!cfg.autoBrief || this.chatter() === 'quiet') return;
-        const material = '本局 ' + event.kills + ' 杀 ' + event.deaths + ' 死,局势逆风。';
-        const text = await this.composeText(material, '用一两句话打气,给一条能立刻执行的战术建议', () => behindText(event.kills, event.deaths, lang));
-        await this.push('wt.behind', text, 'flush', { kills: event.kills, deaths: event.deaths });
+        const text = behindText(event.kills, event.deaths, lang);
+        await push('wt.behind', '观测累计(含推断):' + text, 'flush', { kills: event.kills, deaths: event.deaths });
         return;
       }
       case 'leave': {
         if (!cfg.autoBrief) return;
         const summary = event.summary;
-        const material = '本局结束。击杀 ' + summary.kills + ',被击毁 ' + summary.deaths + ',时长约 ' + Math.round(summary.seconds / 60) + ' 分钟。';
-        const text = await this.composeText(material, '用一两句话复盘这一局的结果与一个改进点', () => resultText(summary, lang));
-        await this.push('wt.result', text, 'flush', { kills: summary.kills, deaths: summary.deaths });
+        const text = resultText(summary, lang);
+        await push('wt.result', text, 'flush', { kills: summary.kills, deaths: summary.deaths });
+        return;
+      }
+      case 'hud': {
+        if (!cfg.autoBrief || this.chatter() === 'quiet') return;
+        // This is third-party feed text, not a verified player statistic.
+        await push('wt.commentary', '战场播报(外部原文,仅供参考):' + event.detail, 'debounce', { sourceEndpoint: '/hudmsg.events', verifiedTally: false }, 'external');
         return;
       }
       default:
@@ -565,9 +587,12 @@ export class WtWorld implements World {
     const battle = this.ensureBattle();
     // 判"要不要解说"看的是观测结果；状态机那一格只由 poll 推进，不该被展示逻辑消费。
     if (!battle || !battle.watcher.observedInBattleNow) return;
+    const generation = this.battleGeneration;
     const snapshot = await battle.watcher.refresh();
-    const material = battleLine(snapshot, 'zh');
-    const text = await this.composeText(material, '用一句话接力解说当前战况,不要重复开场白', () => commentaryText(snapshot, this.lang()));
+    if (!this.isCurrentBattle(generation)) return;
+    this.online = battle.watcher.online_now;
+    if (!this.online || !battle.watcher.observedBattleKnown || !battle.watcher.observedInBattleNow) return;
+    const text = commentaryText(snapshot, this.lang());
     await this.push('wt.commentary', text, 'debounce', { vehicle: snapshot.vehicle });
   }
 
@@ -636,14 +661,14 @@ export class WtWorld implements World {
     return result.text;
   }
 
-  private async push(type: string, text: string, trigger: TriggerMode, meta?: Record<string, unknown>): Promise<void> {
+  private async push(type: string, text: string, trigger: TriggerMode, meta?: Record<string, unknown>, origin: 'internal' | 'external' = 'internal'): Promise<void> {
     const host = this.host;
     if (!host) return;
     const envelope = {
       type,
       ts: nowIso(this.timezone()),
       source: this.id,
-      origin: 'internal' as const,
+      origin,
       senderKey: this.id,
       text,
       ...(meta ? { meta } : {}),
@@ -775,22 +800,26 @@ export class WtWorld implements World {
         const mode = args.mode === 'cheer' || args.mode === 'urge' ? args.mode : 'sitrep';
         const battle = this.ensureBattle();
         if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
+        const generation = this.battleGeneration;
         const snapshot = await battle.watcher.refresh();
+        if (!this.isCurrentBattle(generation)) return '配置/观测身份已改变,旧请求已丢弃,请重试。';
+        this.online = battle.watcher.online_now;
+        if (!this.online) return '遥测离线,当前战况未知;不播报上次缓存的读数。';
+        if (!battle.watcher.observedBattleKnown) return '战局状态未知(部分端点不可用),不播报缓存战况。';
+        if (!battle.watcher.observedInBattleNow) return '当前不在战局,不播报上次缓存的战况。';
         const tally = battle.watcher.tally;
         const lang = this.lang();
-        let material = battleLine(snapshot, 'zh');
-        let instruction = '用一句话接力解说当前战况,不要重复开场白';
         let template = (): string => commentaryText(snapshot, lang);
         if (mode === 'cheer') {
-          material = '本局已击毁 ' + tally.kills + ' 个,被击毁 ' + tally.deaths + ' 次,最长连击 ' + tally.bestStreak + '。读数:' + material;
-          instruction = '用一两句话为本局的高光喝彩,可以带一个表情';
-          template = (): string => killText(Math.max(1, tally.kills), Math.max(1, tally.bestStreak), '', lang);
+          template = (): string => tally.kills > 0
+            ? killText(tally.kills, tally.bestStreak, '', lang)
+            : lang === 'en' ? 'No attributed kills observed yet. Take your time and find a good position.'
+              : '尚未观测到归属于你的击毁。稳住节奏,先找好位置。';
         } else if (mode === 'urge') {
-          material = '本局 ' + tally.kills + ' 杀 ' + tally.deaths + ' 死,局势需要打气。读数:' + material;
-          instruction = '用一两句话打气,给一条能立刻执行的战术建议';
           template = (): string => behindText(tally.kills, tally.deaths, lang);
         }
-        const text = await this.composeText(material, instruction, template);
+        // The World supplies facts. Persona may express them; a second model must not invent telemetry.
+        const text = template();
         await this.push('wt.commentary', text, 'flush', { manual: true, mode });
         return text + '\n(已推送到对话)';
       },
@@ -858,9 +887,15 @@ export class WtWorld implements World {
         }
         const battle = this.ensureBattle();
         if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
-        const state = await battle.client.state();
-        if (!state) return '遥测没连上(' + this.originText() + ')。游戏在跑、端口对得上才读得到对局聊天。';
+        const generation = this.battleGeneration;
+        await battle.watcher.refresh();
+        if (!this.isCurrentBattle(generation)) return '观测身份已改变,请重试。';
+        this.online = battle.watcher.online_now;
+        if (!this.online) return '遥测离线,当前聊天未知,不展示旧缓存。';
+        if (!battle.watcher.observedBattleKnown) return '战局状态未知,不展示旧聊天。';
+        if (!battle.watcher.observedInBattleNow) return '当前不在战局,不把旧聊天当作当前对局内容。';
         const lines = await this.readChat(limit);
+        if (!this.isCurrentBattle(generation)) return '观测身份已改变,旧聊天请求已丢弃。';
         const original = chatBlock(lines, lang);
         if (lines.length === 0) return original;
         if (mode === 'recent') return original + '\n(要译文就再调一次 action=translate)';
@@ -1081,14 +1116,15 @@ export class WtWorld implements World {
     const cfg = this.opts.cfg;
     const counts = kbCounts(this.view.entries);
     const book = readSpend(this.opts.dataDir, this.todayKey());
-    const battle = this.watcher;
+    const battle = this.ensureBattle()?.watcher ?? null;
+    const online = battle ? battle.online_now : this.online;
     const inBattle = battle ? battle.observedInBattleNow : false;
     const snapshot = battle ? battle.currentSnapshot : null;
     const lines = [
       '🐯 war thunder安东星助手 · 自检',
-      '📡 遥测:' + this.originText() + ' · ' + (this.online ? '在线' : '没连上'),
-      '🎯 昵称:' + (cfg.playerName.trim() ? cfg.playerName.trim() : '未配置(不统计击杀,填 worlds.wt.playerName 后按名字认领)'),
-      '🎮 战局:' + (inBattle && snapshot ? '战局中(' + battleLine(snapshot, 'zh') + ')' : '不在战局'),
+      '📡 遥测:' + this.originText() + ' · ' + (online ? '在线' : '离线/当前状态未知'),
+      '🎯 昵称:' + (cfg.playerName.trim() ? cfg.playerName.trim() : '未配置(不认领feed战绩,仪表失效仅作推断)'),
+      '🎮 战局:' + (!online ? '未知(遥测离线)' : battle && !battle.observedBattleKnown ? '未知(部分端点不可用)' : inBattle && snapshot ? '战局中(' + battleLine(snapshot, 'zh') + ')' : '不在战局'),
       '📚 知识库:v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')' +
         (this.view.remoteVersion ? ' · 远程 ' + this.view.remoteCount + ' 条' : ' · 仅内置'),
       '🧠 文案:' + this.sourceText(),
@@ -1129,19 +1165,24 @@ export class WtWorld implements World {
     if (!battle) return '遥测客户端没建起来:' + (this.lastError || '未知原因');
     // 交给 watcher 探：它同时看 /mission.json、/map_info.json、/map_obj.json 与 /state。
     // 只看 /state 会误判——真机对局里 /state 常常只有 { "valid": false }。
+    const generation = this.battleGeneration;
     const snapshot = await battle.watcher.refresh();
+    if (!this.isCurrentBattle(generation)) return '观测身份已改变,旧查询已丢弃,请重试。';
+    this.online = battle.watcher.online_now;
     if (!battle.watcher.online_now) return '遥测没连上(' + this.originText() + ')。确认游戏在运行、端口和配置一致。';
+    if (!battle.watcher.observedBattleKnown) return '遥测在线,但战局状态未知(部分端点不可用)。';
     // refresh() 只更新采样值；这里必须读 observedInBattleNow，读状态机会拿到上一轮 poll 的陈旧值。
     if (!battle.watcher.observedInBattleNow) return '遥测在线,但当前不在战局(菜单或战局加载中)。';
     const tally = battle.watcher.tally;
     return [
       '🎮 当前战局',
       '读数:' + battleLine(snapshot, 'zh'),
-      '本局:' + tally.kills + ' 杀 · ' + tally.deaths + ' 死' + (tally.bestStreak > 1 ? ' · 最长连击 ' + tally.bestStreak : ''),
+      '本局观测累计:' + tally.kills + ' 杀 · ' + tally.deaths + ' 死' + (tally.bestStreak > 1 ? ' · 最长观测连击 ' + tally.bestStreak : '') + '(不是服务端记分板,中途启用可能不完整)',
       // 8111 的击杀列表是全场播报：没配昵称就一个都不认领，得直说，不能让 0 杀看着像数据坏了。
       this.opts.cfg.playerName.trim()
         ? '归因:按昵称「' + this.opts.cfg.playerName.trim() + '」筛自己的击杀'
-        : '归因:没配 worlds.wt.playerName,只统计阵亡、不认领击杀',
+        : '归因:没配 worlds.wt.playerName,不认领feed战绩;指标失效计数仅是推断',
+      '限制:阵亡包含指标失效推断;地图可见数量不是全场或附近数量;未确认单位的仪表不换算。',
       '读于:' + this.stamp(),
     ].join('\n');
   }
@@ -1152,18 +1193,19 @@ export class WtWorld implements World {
     const cfg = this.opts.cfg;
     const counts = kbCounts(this.view.entries);
     const book = readSpend(this.opts.dataDir, this.todayKey());
-    const battle = this.watcher;
+    const battle = this.ensureBattle()?.watcher ?? null;
+    const online = battle ? battle.online_now : this.online;
     const inBattle = battle ? battle.observedInBattleNow : false;
     const snapshot = battle ? battle.currentSnapshot : null;
     return {
       'wt.now': this.stamp(),
       'wt.zone': this.timezone(),
-      'wt.status': this.online ? '遥测在线' : '遥测离线',
-      'wt.battle': inBattle && snapshot ? '战局中:' + battleLine(snapshot, 'zh') : '不在战局',
+      'wt.status': online ? '遥测在线' : '遥测离线/状态未知',
+      'wt.battle': !online || (battle && !battle.observedBattleKnown) ? '当前战局未知,不要使用缓存读数' : inBattle && snapshot ? '战局中:' + battleLine(snapshot, 'zh') : '不在战局',
       'wt.kb': 'v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')',
       'wt.source': this.sourceText(),
       'wt.budget': '今日 ' + book.yuan.toFixed(4) + ' 元 / 预算 ' + Math.max(0, cfg.dailyBudgetYuan) + ' 元',
-      'wt.vehicle': snapshot && snapshot.vehicle ? snapshot.vehicle : '未知',
+      'wt.vehicle': online && inBattle && snapshot && snapshot.vehicle ? snapshot.vehicle : '未知',
       'wt.chat':
         this.chatHistory.length > 0
           ? '最近缓存 ' + this.chatHistory.length + ' 条(最后一条:' + clip(this.chatHistory[this.chatHistory.length - 1].msg, 40) + ')'
@@ -1177,7 +1219,7 @@ export class WtWorld implements World {
     return {
       label: 'war thunder安东星助手',
       lamps: [
-        { label: '遥测', state: this.online ? 'online' : 'offline', hint: this.originText() },
+        { label: '遥测', state: (this.watcher ? this.watcher.online_now : this.online) ? 'online' : 'offline', hint: this.originText() },
         { label: '知识库', state: this.view.entries.length > 0 ? 'online' : 'offline', hint: 'v' + this.view.version + ' · ' + this.view.entries.length + ' 条' },
         { label: '文案', state: this.modelCapability().online ? 'online' : 'offline', hint: this.sourceText() },
       ],

@@ -53,7 +53,7 @@ describe('8111 客户端', () => {
   it('把 state 的字段名映射成驼峰', async () => {
     const client = makeClient(() => ({ state: inBattle }));
     const state = await client.state();
-    expect(state).toEqual({ valid: true, mapValid: true, vehicle: 'P-51D-30', mode: 'domination', army: 'usa' });
+    expect(state).toEqual({ valid: true, mapValid: true, mapValidKnown: true, vehicle: 'P-51D-30', mode: 'domination', army: 'usa' });
   });
 
   it('非 200 一律当没连上,返回 null', async () => {
@@ -192,14 +192,14 @@ describe('战局状态机', () => {
     expect(watcher.inBattleNow).toBe(false);
   });
 
-  it('游戏关掉时把在线状态置否,并补一条 leave', async () => {
+  it('连接中断只说明未知,不能凭断连宣布结算', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
     await watcher.poll();
     routes.broken = true;
     const offline = await watcher.poll();
-    expect(offline.map((event) => event.kind)).toEqual(['leave']);
+    expect(offline.map((event) => event.kind)).toEqual([]);
     expect(watcher.online_now).toBe(false);
     const again = await watcher.poll();
     expect(again).toEqual([]);
@@ -267,8 +267,8 @@ describe('对局聊天', () => {
     expect(lines.length).toBe(2);
     expect(lines[0].msg).toBe('gg');
     expect(lines[0].sender).toBe('');
-    expect(lines[0].mode).toBe('All');
-    expect(lines[1].mode).toBe('All');
+    expect(lines[0].mode).toBe('');
+    expect(lines[1].mode).toBe('');
   });
 
   it('服务挂了或不是数组都返回空数组', async () => {
