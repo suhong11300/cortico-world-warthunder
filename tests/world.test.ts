@@ -198,7 +198,7 @@ describe('挂载与播报', () => {
   it.each(['poll-online', 'poll-offline', 'refresh-online', 'refresh-offline'])('欢迎语补投使用本身份已完成的观测: %s', async (mode) => {
     vi.useFakeTimers();
     const online = mode.endsWith('-online');
-    const { world, host } = rig({ autoBrief: false, pollMs: mode.startsWith('poll') ? 800 : 30000 }, () => online
+    const { world, host } = rig({ autoBrief: true, pollMs: mode.startsWith('poll') ? 800 : 30000 }, () => online
       ? { state: { valid: false }, indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 } }
       : { broken: true });
     const push = host.pushEvent.bind(host);
@@ -219,7 +219,7 @@ describe('挂载与播报', () => {
 
   it('欢迎补投前更换身份不继承旧身份的在线值', async () => {
     vi.useFakeTimers();
-    const { world, host, cfg } = rig({ autoBrief: false, pollMs: 30000 }, () => ({ state: inBattle, indicators: flying }));
+    const { world, host, cfg } = rig({ autoBrief: true, pollMs: 30000 }, () => ({ state: inBattle, indicators: flying }));
     const push = host.pushEvent.bind(host);
     let fail = true;
     host.pushEvent = async (event, opts) => {
@@ -236,7 +236,7 @@ describe('挂载与播报', () => {
   });
 
   it('首次采样前欢迎语不把坦克试驾误报为离线', async () => {
-    const { world, host } = await boot({ autoBrief: false }, () => ({
+    const { world, host } = await boot({ autoBrief: true }, () => ({
       state: { valid: false },
       indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 },
     }));
@@ -286,11 +286,11 @@ describe('挂载与播报', () => {
     await world.stop();
   });
 
-  it('关掉自动播报后只留就绪事件', async () => {
+  it('关掉自动播报后连欢迎语也静默，后台仍可采样', async () => {
     const routes: Routes = { state: inBattle, indicators: flying };
     const { world, host } = await boot({ autoBrief: false }, () => routes);
     await pollOnce(world);
-    expect(host.events.map((event) => event.type)).toEqual(['wt.ready']);
+    expect(host.events.map((event) => event.type)).toEqual([]);
     await world.stop();
   });
 
@@ -422,7 +422,7 @@ describe('滥用面的闸', () => {
     await pollOnce(world);
     const kills = host.events.filter((event) => event.type === 'wt.kill');
     expect(kills).toHaveLength(3);
-    expect(await call(world, 'wt_battle_state')).toContain('本局观测累计:6 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('本观测窗口累计:6 杀');
   });
 
   it('清零账本要先确认,而且一天最多三次', async () => {
@@ -736,7 +736,7 @@ describe('文案灯按能力显示', () => {
 describe('热更新', () => {
   it('解说间隔从 0 改成 5000 后计时器会自己建起来', async () => {
     // R11:配置是 x-hot 的,但计时器原来只在 start 建一次,改成非 0 之后永远等不到。
-    const rigged = await boot({ commentaryEveryMs: 0 }, () => ({ state: inMenu }));
+    const rigged = await boot({ chatterLevel: 'commentary', commentaryEveryMs: 0 }, () => ({ state: inMenu }));
     const inner = rigged.world as unknown as { commentaryTimer?: unknown };
     expect(inner.commentaryTimer).toBeUndefined();
     rigged.cfg.commentaryEveryMs = 5000;
@@ -776,7 +776,7 @@ describe('播报档位', () => {
     await pollOnce(world);
     expect(host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
     expect(host.events.some((event) => event.type === 'wt.kill')).toBe(false);
-    expect(await call(world, 'wt_battle_state')).toContain('本局观测累计:2 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('本观测窗口累计:2 杀');
     await world.stop();
   });
 });

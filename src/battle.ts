@@ -105,6 +105,8 @@ export interface BattleSummary {
   kills: number;
   deaths: number;
   seconds: number;
+  killsKnown?: boolean;
+  deathsKnown?: boolean;
 }
 
 export type BattleEvent =
@@ -168,6 +170,8 @@ function decodeAs(label: RealEncoding, bytes: Uint8Array): string {
   }
 }
 
+export type TelemetryScope = 'vehicle' | 'map' | 'mission' | 'hud' | 'chat';
+
 export interface BattleClientOptions {
   host: string;
   port: number;
@@ -175,6 +179,8 @@ export interface BattleClientOptions {
   timeoutMs?: number;
   /** 文本编码策略,默认 auto。 */
   textEncoding?: TextEncoding;
+  /** 每次实际请求前检查活权限，旧在途轮询也不能继续请求已关闭类别。 */
+  canRead?: (scope: TelemetryScope) => boolean;
 }
 
 export interface BattleWatcherOptions {
@@ -348,6 +354,7 @@ export class BattleClient {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
   private readonly encoding: TextEncoding;
+  private readonly canRead?: (scope: TelemetryScope) => boolean;
 
   constructor(opts: BattleClientOptions) {
     const host = opts.host.trim() || '127.0.0.1';
@@ -356,6 +363,7 @@ export class BattleClient {
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 2500;
     this.encoding = opts.textEncoding ?? 'auto';
+    this.canRead = opts.canRead;
   }
 
   get origin(): string {
@@ -363,6 +371,11 @@ export class BattleClient {
   }
 
   private async json(path: string): Promise<unknown> {
+    if (this.canRead) {
+      const scopes: Record<string, TelemetryScope> = { '/state': 'vehicle', '/indicators': 'vehicle', '/mission.json': 'mission', '/map_info.json': 'map', '/map_obj.json': 'map', '/hudmsg': 'hud', '/gamechat': 'chat' };
+      const scope = scopes[path.split('?')[0]];
+      try { if (!scope || !this.canRead(scope)) return null; } catch { return null; }
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {

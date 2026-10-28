@@ -119,10 +119,10 @@ export function resultText(summary: BattleSummary, lang: Lang): string {
   const minutes = summary.seconds > 0 ? Math.max(1, Math.round(summary.seconds / 60)) : 0;
   if (lang === 'en') {
     const time = minutes > 0 ? ' in ' + minutes + ' min' : '';
-    return 'Left the observed battle: ' + summary.kills + ' attributed kills, ' + summary.deaths + ' observed/inferred losses' + time + '; official result unknown.';
+    return 'Left the observed battle: ' + (summary.killsKnown === false ? 'kills unknown (HUD reads disabled)' : summary.kills + ' attributed kills') + ', ' + (summary.deathsKnown === false ? 'losses unknown (reads disabled)' : summary.deaths + ' observed/inferred losses') + time + '; official result unknown.';
   }
   const time = minutes > 0 ? '，打了约 ' + minutes + ' 分钟' : '';
-  return '🏁 已离开战局：观测累计 ' + summary.kills + ' 杀 ' + summary.deaths + ' 次阵亡/指标失效推断' + time + '；未取得官方胜负结算,仅供复盘。';
+  return '🏁 已离开战局：观测累计 ' + (summary.killsKnown === false ? '击毁未知(战果日志读取关闭)' : summary.kills + ' 杀') + ' ' + (summary.deathsKnown === false ? '阵亡未知(读取关闭)' : summary.deaths + ' 次阵亡/指标失效推断') + time + '；未取得官方胜负结算,仅供复盘。';
 }
 
 export function readyText(online: boolean | null, kbCount: number, lang: Lang): string {
