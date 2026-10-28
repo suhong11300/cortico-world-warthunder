@@ -35,6 +35,7 @@ function rig() {
   return { routes, client, watcher, fetchImpl, now: () => now, tick: (ms = 1500) => { now += ms; } };
 }
 const row = (id: number, time: number, msg: string) => ({ id, time, msg, type: '', sender: '' });
+
 describe('实战入场占位数据', () => {
   it.each([true, false])('占位与feed同拍=%s 时，真实重生后的新失效边沿仍可计数', async (samePoll) => {
     const r = rig(); await r.watcher.poll();

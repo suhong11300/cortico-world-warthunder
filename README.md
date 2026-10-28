@@ -9,13 +9,15 @@
 
 挂在 Coopanion 桌宠上的《战争雷霆》World：一边当本地百科（概念 / 载具 / 玩法），一边读客户端的本地遥测（8111）实时讲解战局、为击毁喝彩、为逆风打气，还能被叫到时翻译对局聊天、代写要发的话。
 
-### v0.2.13：表达模式与知识库限额
+## 🚀 v0.3.0 · 重大更新
 
-- 表达拆成两个独立维度：**谁触发**（自动 / 手动）与**怎么说**（人格 / 模板），共四种组合。事件与手动战况回执都携带固定的【事实开始】…【事实结束】事实块；人格只用于事实之外的一句短句，模板模式原样转述。插件不调用第二个战况模型，最终自然语言是否零改写由主对话决定。
-- 事实块明确禁止推断：单位未确认的原始速度不得读成移动或停止，地图可见数不得说成全场总数。这条直接来自实战——主 Persona 曾把原始速度 5 读成「多半停下来了」。
-- 知识库限额可调：默认 64 MiB 响应体、10 万条、512 MiB 额外更新估算预算，可放到 256 MiB / 50 万条 / 2048 MiB。该预算是更新工作集的准入估算，不是进程 RSS 硬限制，也不改全局 Node 堆。
-- 更新全链有界：边读边累加真实字节、超限立即中止；解析前先做结构与节点预算预检再 `JSON.parse`；落盘用唯一临时文件原子替换；单飞加跨进程锁，配置变化或停止时不提交旧候选，失败保留旧库。
-- 补回 0.2.12 的控制面回归（37 项）与入场占位 / 未采样回归：dummy_plane 占位不当真实读数、加载态 `valid:true` 不武装虚假阵亡、首次采样前只说「遥测尚未采样」。
+- **四种组合自由选择**：自动人格、自动模板、手动人格、手动模板。`autoBrief` 控制触发，`speechStyle` 控制表达；沿用桌宠现有Persona，不因缺少插件后台模型或密钥而关闭人格。
+- **事实保持、语气另写**：人格请求完整保留事实正文及未知限定，角色鼓励放在额外短句；模板只转述事实。已完成真实试驾两种模式的逐字对照，但不能保证大模型未来每次输出都不改写。
+- **大知识库安全导入**：默认 **64 MiB／10万条／512 MiB额外更新估算预算**，均可调；有界读取、解析前复杂度检查、原子写入、更新单飞和跨进程锁，失败保留旧库。估算预算不是RSS硬限制。
+- **读取与播报分别可控，时间以秒显示**：保留0.2.12的分类开关及旧设置兼容性；升级不会把原先关闭的自动播报打开。
+- **边界不变**：本包内置53条；用户自己的远程库不会随包发布。每日官方公告/Wiki采集管线尚未上线，更新URL留空时不下载；不提供官方记分板、个人助攻/占点分项或可靠AI区分。
+
+完整说明见 [重大更新说明](RELEASE_NOTES.md) 与 [更新日志](CHANGELOG.md)。
 
 ### v0.2.12：读取与播报分别控制
 
@@ -45,7 +47,7 @@
 
 *四张示意图依次是战局播报、知识库、对局翻译与花费面板，文案取自真实调用回执。*
 
-*Cortico World · `kind: world` · `api: 6` · `tags: game / companion / internet / external-setup / experimental / high-cost / injection-risk / computer-use` · MIT · 293 项单测通过、契约校验通过*
+*Cortico World · `kind: world` · `api: 6` · `tags: game / companion / internet / external-setup / experimental / high-cost / injection-risk / computer-use` · MIT · 324 项自动测试、契约校验通过*
 
 ## 目录
 
@@ -255,7 +257,7 @@ v0.2.11起，以下模型通道与预算用于翻译/代稿。战局事件、手
 
 ```bash
 corepack pnpm typecheck
-corepack pnpm test          # 14 个文件 293 项（含 0.2.11 的 45 项一致性回归、0.2.12 的 37 项控制回归与 0.2.13 补回的占位/未采样回归）
+corepack pnpm test          # 15 个文件 324 项（含0.2.11的45项一致性回归与0.2.12的37项控制回归）
 ```
 
 包内自带 `describe.json`（11 工具 / 7 事件 / 1 提示词），官方校验：
@@ -296,7 +298,7 @@ cd <Cortina>/state/cortico && corepack pnpm check:extension <包根目录>
 - 世界开关在 `Coopanion/data/home/companion/config.json` 的 `worlds.wt`，最少写 `{ "wt": { "enabled": true } }`，其余项由 `definition.defaults()` 合并，不必逐项抄。
 - 扩展只在进程启动时扫描：改完必须重启 Coopanion，否则一直是「待重启」。管理员 shell 直接起 Electron 会静默退出，用 `explorer.exe` 拉起安装目录里的 exe。
 - WebUI 端口看 `config.json` 的 `web.port`；World 面板路由形如 `#/provider/world%3Awt`。
-- 自检：`corepack pnpm typecheck` 与 `corepack pnpm test`（14 个文件 293 项）；官方校验 `check:extension <包根目录>`，入参是包根目录而不是包名。
+- 自检：`corepack pnpm typecheck` 与 `corepack pnpm test`（15 个文件 324 项）；官方校验 `check:extension <包根目录>`，入参是包根目录而不是包名。
 
 ## 许可
 

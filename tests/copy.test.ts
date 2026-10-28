@@ -127,6 +127,7 @@ describe('战局文案', () => {
     expect(readyText(null, 53, 'zh')).toContain('遥测尚未采样');
     expect(readyText(null, 53, 'en')).toContain('telemetry not sampled yet');
   });
+
   it('readyText 分在线与离线两种说法', () => {
     expect(readyText(true, 53, 'zh')).toContain('遥测已连上');
     expect(readyText(true, 53, 'zh')).toContain('知识库 53 条');

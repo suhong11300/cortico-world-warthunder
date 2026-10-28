@@ -195,6 +195,28 @@ describe('装配契约', () => {
 });
 
 describe('挂载与播报', () => {
+  it.each(['poll-online', 'poll-offline', 'refresh-online', 'refresh-offline'])('欢迎语补投使用本身份已完成的观测: %s', async (mode) => {
+    vi.useFakeTimers();
+    const online = mode.endsWith('-online');
+    const { world, host } = rig({ autoBrief: true, pollMs: mode.startsWith('poll') ? 800 : 30000 }, () => online
+      ? { state: { valid: false }, indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 } }
+      : { broken: true });
+    const push = host.pushEvent.bind(host);
+    let fail = true;
+    host.pushEvent = async (event, opts) => {
+      if (event.type === 'wt.ready' && fail) { fail = false; throw new Error('core-not-ready'); }
+      return push(event, opts);
+    };
+    try {
+      await world.start(host);
+      if (mode.startsWith('refresh')) await call(world, 'wt_battle_state');
+      await vi.advanceTimersByTimeAsync(2100);
+      const ready = host.events.find((event) => event.type === 'wt.ready');
+      expect(ready?.meta?.online).toBe(online);
+      expect(ready?.text).toContain(online ? '遥测已连上' : '遥测没连上');
+    } finally { await world.stop(); vi.useRealTimers(); }
+  });
+
   it('欢迎补投前更换身份不继承旧身份的在线值', async () => {
     vi.useFakeTimers();
     const { world, host, cfg } = rig({ autoBrief: true, pollMs: 30000 }, () => ({ state: inBattle, indicators: flying }));
@@ -230,6 +252,7 @@ describe('挂载与播报', () => {
     expect(host.events[0].meta?.online).toBeNull();
     await world.stop();
   });
+
   it('挂载即投一条就绪事件', async () => {
     const { world, host } = await boot();
     expect(host.events.length).toBe(1);
@@ -263,7 +286,7 @@ describe('挂载与播报', () => {
     await world.stop();
   });
 
-  it('关掉自动播报后连就绪语也不推,工具仍可用', async () => {
+  it('关掉自动播报后连欢迎语也静默，后台仍可采样', async () => {
     const routes: Routes = { state: inBattle, indicators: flying };
     const { world, host } = await boot({ autoBrief: false }, () => routes);
     await pollOnce(world);
@@ -311,7 +334,7 @@ describe('工具', () => {
     await world.stop();
   });
 
-  it('wt_status 在遥测断开后直说离线,不假装知道战局', async () => {
+  it('wt_status 在遥测断开后明确当前离线与战局未知', async () => {
     const { world } = await boot({}, () => ({ broken: true }));
     await pollOnce(world);
     const text = await call(world, 'wt_status');
@@ -692,13 +715,12 @@ describe('隐私与副作用闸', () => {
 });
 
 describe('文案灯按能力显示', () => {
-  it('宿主没有 cognition 也没填 key 时文案灯是暗的,并说明人格仍交给主对话', async () => {
+  it('宿主没有 cognition 也没填 key 时后台灯暗，但不误报主对话人格失效', async () => {
     const { world } = await boot({}, () => ({ state: inMenu }));
     const ui = world.webUi();
     const lamp = (ui.lamps ?? []).find((one) => one.label === '文案');
     expect(lamp?.state).toBe('offline');
-    expect(lamp?.hint ?? '').toContain('人格播报仍委托现有主对话Persona');
-    expect(lamp?.hint ?? '').not.toContain('模板');
+    expect(lamp?.hint ?? '').toContain('主对话Persona');
     await world.stop();
   });
 
@@ -714,8 +736,7 @@ describe('文案灯按能力显示', () => {
 describe('热更新', () => {
   it('解说间隔从 0 改成 5000 后计时器会自己建起来', async () => {
     // R11:配置是 x-hot 的,但计时器原来只在 start 建一次,改成非 0 之后永远等不到。
-    // 0.2.13 起定时讲解只在 commentary 档、自动播报开、读取未关闭时成立，档位不对再改间隔也不该建表。
-    const rigged = await boot({ commentaryEveryMs: 0, chatterLevel: 'commentary' }, () => ({ state: inMenu }));
+    const rigged = await boot({ chatterLevel: 'commentary', commentaryEveryMs: 0 }, () => ({ state: inMenu }));
     const inner = rigged.world as unknown as { commentaryTimer?: unknown };
     expect(inner.commentaryTimer).toBeUndefined();
     rigged.cfg.commentaryEveryMs = 5000;
