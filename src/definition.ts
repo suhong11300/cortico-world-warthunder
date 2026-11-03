@@ -12,7 +12,7 @@ export const WT: WorldDefinition<WtConfigSection> = {
       cfg: ctx.cfg,
       timezone: ctx.timezone,
       dataDir: ctx.dataDir,
-      botDir: ctx.botDir,
+      persist: (patch) => ctx.persist(patch as never),
     }),
   describe: {
     tools: describeTools(WT_TOOL_DECLS, {
@@ -39,6 +39,10 @@ export const WT: WorldDefinition<WtConfigSection> = {
       wt_battle_state: {
         zh: '读取当前观测、字段来源与可见地图；战绩为观测归因累计,非官方记分板。',
         en: 'Read current observations and visible-map objects; attributed tally is not the official scoreboard.',
+      },
+      wt_map_calib: {
+        zh: '地图坐标标定：原始归一化值、地图范围、格网参数与三种格号并列，用来与小地图对照。',
+        en: 'Map coordinate calibration: raw normalized values, map bounds, grid params and three grid-label variants for checking against the minimap.',
       },
       wt_commentary: {
         zh: '确定性生成当前观测播报:态势、喝彩或打气;未知状态不复用旧读数。',

@@ -1,0 +1,19 @@
+{
+  // 只有浏览器侧面板:与主 tsconfig 的差别是带 DOM,并且不含 node 侧源码。
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true
+  },
+  "include": ["src/webui/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

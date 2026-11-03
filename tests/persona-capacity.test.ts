@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as kb from '../src/kb.ts';
-import { WT_DEFAULTS, WT_CONFIG_GROUP } from '../src/config.ts';
+import { WT_CONFIG_GROUPS, WT_DEFAULTS } from '../src/config.ts';
 import { WtWorld } from '../src/world.ts';
 import { FakeHost } from './helpers/fake-host.ts';
 const MiB = 1024 * 1024;
@@ -29,53 +29,67 @@ describe('自动/手动 × 人格/模板', () => {
     r.host.events.length = 0;
     await (r.world as any).handleBattleEvent({ kind: 'kill', total: 4, streak: 2, detail: 'Ace destroyed Bob', snapshot });
     const kills = r.host.events.filter(e => e.type === 'wt.kill'); expect(kills.length).toBe(automatic ? 1 : 0);
-    if (automatic) { expect(kills[0].text).toContain(style === '人格' ? '表达模式：人格' : '表达模式：模板'); expect(kills[0].text).toContain('本局第 4 个击毁'); }
-    const manual = await r.call('wt_commentary'); expect(manual).toContain(style === '人格' ? '表达模式：人格' : '表达模式：模板');
+    if (automatic) {
+      // 正文以素材开头：不再顶一份「表达模式」声明；人格档在末尾加一句「按你的口吻重讲」的短引导。
+      const fact = String(kills[0].meta?.factText);
+      expect(kills[0].text).not.toContain('表达模式'); expect(kills[0].text).not.toContain('【事实');
+      expect(kills[0].text.startsWith(fact)).toBe(true);
+      expect(kills[0].text).toContain('本局第 4');
+      expect(kills[0].meta?.speechStyle).toBe(style);
+      if (style === '人格') expect(kills[0].text).toContain('按你的口吻重讲');
+      else expect(kills[0].text).toBe(fact);
+    }
+    const manual = await r.call('wt_commentary'); expect(manual).not.toContain('表达模式'); expect(manual.startsWith('📡 ')).toBe(true);
     const status = await r.call('wt_status'); expect(status).toContain((automatic ? '自动' : '手动') + '＋' + style);
   });
   it('人格默认可选、可见上下文中有请求，不靠metadata也不要求插件后台cognition', async () => {
-    const prop = WT_CONFIG_GROUP.schema.properties['worlds.wt.speechStyle'];
+    const prop = Object.assign({}, ...WT_CONFIG_GROUPS.map((group) => group.schema.properties))['worlds.wt.speechStyle'];
     expect(prop?.enum).toEqual(['人格', '模板']); expect((WT_DEFAULTS as any).speechStyle).toBe('人格');
     const r = rig(false, '人格'); await r.world.start(r.host);
-    expect(r.world.envPromptVars()['wt.speech']).toContain('人格');
-    expect(await r.call('wt_commentary')).toContain('现有Persona');
+    expect(r.world.envPromptVars()['wt.speech']).toContain('口吻');
     expect(await r.call('wt_status')).toContain('主对话');
   });
-  it('人格上下文不再以“不机械复读”暗示改写事实；原始仪表不推断运动状态', async () => {
+  it('人格口吻只在环境段写一次，播报正文不再自带长声明', async () => {
     const r = rig(false, '人格'); await r.world.start(r.host);
-    expect(r.world.envPromptVars()['wt.speech']).not.toContain('不机械复读');
+    const hint = r.world.envPromptVars()['wt.speech'];
+    expect(hint).toContain('口吻'); expect(hint).not.toContain('不机械复读');
     const output = await r.call('wt_commentary');
-    expect(output).toContain('逐字'); expect(output).toContain('不省略'); expect(output).toContain('停止');
+    expect(output).not.toContain('逐字'); expect(output).not.toContain('表达模式'); expect(output).not.toContain('【事实');
+    expect(output).toContain('fixture-plane');
   });
-  it('事实块字节保留，不为人格播报调用第二个模型', async () => {
+  it('事件正文就是事实本身，不为人格播报调用第二个模型', async () => {
     const r = rig(true, '人格'); let calls = 0;
     (r.host as any).cognition = { request: async () => { calls++; return { text: '速度300km/h，这局赢啦！' }; } };
     await r.world.start(r.host); r.host.events.length = 0;
     await (r.world as any).handleBattleEvent({ kind: 'kill', total: 4, streak: 2, detail: 'Ace destroyed Bob', snapshot: { vehicle: '', speed: 0, altitude: 0, army: '', mode: '', enemies: 0, allies: 0 } });
     const e = r.host.events.find(e => e.type === 'wt.kill')!;
-    expect(e.text).toContain('【事实开始】\n' + e.meta?.factText + '\n【事实结束】');
+    expect(e.text.startsWith(String(e.meta?.factText))).toBe(true);
     expect(e.text).not.toContain('这局赢啦'); expect(calls).toBe(0);
+    expect(e.text).toContain('按你的口吻重讲');
   });
   it('外部HUD不被改成internal，也不包可信人格操作', async () => {
     const r = rig(true, '人格'); await r.world.start(r.host); r.host.events.length = 0;
     await (r.world as any).handleBattleEvent({ kind: 'hud', detail: '占领了战区A' });
-    expect(r.host.events[0].origin).toBe('external'); expect(r.host.events[0].text).not.toContain('表达模式');
+    expect(r.host.events[0].origin).toBe('external'); expect(r.host.events[0].text).toBe('占领了战区A');
   });
   it('llmMode=off仅关闭插件后台，不把主对话人格说成模板失效', async () => {
     const r = rig(false, '人格'); r.cfg.llmMode = 'off'; await r.world.start(r.host);
     const status = await r.call('wt_status'); expect(status).not.toContain('播报、解说与翻译都用固定模板'); expect(status).toContain('主对话Persona');
   });
-  it('手动战局状态回执遵守热改风格，不只依赖旧ENV前缀', async () => {
+  it('手动战局状态默认三项，位置与战局按需取', async () => {
     const r = rig(false, '人格'); await r.world.start(r.host);
-    expect(await r.call('wt_battle_state')).toContain('表达模式：人格'); r.cfg.speechStyle = '模板';
-    expect(await r.call('wt_battle_state')).toContain('表达模式：模板');
+    const text = await r.call('wt_battle_state');
+    expect(text).toContain('🎮 载具：'); expect(text).toContain('📊 状态：');
+    expect(text).toContain('🎯 战绩：'); expect(text).not.toContain('📍 位置：');
+    expect(text).not.toContain('表达模式');
+    expect(await r.call('wt_battle_state', { fields: 'position' })).toContain('📍 位置：');
   });
 });
 describe('大知识库的容量与估算预算', () => {
   it('面板提供可调容量而不是修改全局Node堆', () => {
     for (const [key, def, max] of [['kbMaxDownloadMiB', 64, 256], ['kbMaxEntries', 100000, 500000], ['kbUpdateMemoryMiB', 512, 2048]] as const) {
       expect((WT_DEFAULTS as any)[key]).toBe(def);
-      expect(WT_CONFIG_GROUP.schema.properties['worlds.wt.' + key]?.maximum).toBe(max);
+      expect(Object.assign({}, ...WT_CONFIG_GROUPS.map((group) => group.schema.properties))['worlds.wt.' + key]?.maximum).toBe(max);
     }
   });
   it('默认64MiB、100000条、512MiB预算；越界设置有硬上界', () => {

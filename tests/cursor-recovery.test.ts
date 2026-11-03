@@ -67,8 +67,8 @@ function toEvents(lines: HudLine[]): HudEvent[] {
 describe('computeSelfKills:全量重算的纯函数', () => {
   it('只认基线 id 之后的播报', () => {
     const feed = toEvents([
-      { id: 5, time: 10, msg: 'Ace 击毁了 T-34' },
-      { id: 9, time: 12, msg: 'Ace 击毁了 豹2A6' },
+      { id: 5, time: 10, msg: 'Ace 击毁了 T-34 (M4A1)' },
+      { id: 9, time: 12, msg: 'Ace 击毁了 豹2A6 (M4A1)' },
     ]);
     const hits = computeSelfKills(feed, { afterId: 6, playerName: 'Ace' });
     expect(hits.length).toBe(1);
@@ -77,9 +77,9 @@ describe('computeSelfKills:全量重算的纯函数', () => {
 
   it('同一次击毁的多条播报(time 相同)只算一次', () => {
     const feed = toEvents([
-      { id: 20, time: 100, msg: 'Ace 击毁了 T-34' },
-      { id: 21, time: 100, msg: 'Ace 击毁了 T-34' },
-      { id: 22, time: 101, msg: 'Ace 击毁了 T-34' },
+      { id: 20, time: 100, msg: 'Ace 击毁了 T-34 (M4A1)' },
+      { id: 21, time: 100, msg: 'Ace 击毁了 T-34 (M4A1)' },
+      { id: 22, time: 101, msg: 'Ace 击毁了 T-34 (M4A1)' },
     ]);
     const hits = computeSelfKills(feed, { afterId: -1, playerName: 'Ace' });
     expect(hits.length).toBe(1);
@@ -88,8 +88,8 @@ describe('computeSelfKills:全量重算的纯函数', () => {
 
   it('两次真击毁(time 隔 30 秒)算两次,幂等键带序号', () => {
     const feed = toEvents([
-      { id: 30, time: 200, msg: 'Ace 击毁了 豹2A6' },
-      { id: 40, time: 230, msg: 'Ace 击毁了 豹2A6' },
+      { id: 30, time: 200, msg: 'Ace 击毁了 豹2A6 (M4A1)' },
+      { id: 40, time: 230, msg: 'Ace 击毁了 豹2A6 (M4A1)' },
     ]);
     const hits = computeSelfKills(feed, { afterId: -1, playerName: 'Ace' });
     expect(hits.length).toBe(2);
@@ -99,17 +99,17 @@ describe('computeSelfKills:全量重算的纯函数', () => {
 
   it('没有 time 时退化为 id 邻近判重', () => {
     const feed = toEvents([
-      { id: 50, msg: 'Ace 击毁了 FK-2000' },
-      { id: 51, msg: 'Ace 击毁了 FK-2000' },
-      { id: 60, msg: 'Ace 击毁了 FK-2000' },
-      { id: 70, msg: 'Ace 击毁了 FK-2000' },
+      { id: 50, msg: 'Ace 击毁了 FK-2000 (M4A1)' },
+      { id: 51, msg: 'Ace 击毁了 FK-2000 (M4A1)' },
+      { id: 60, msg: 'Ace 击毁了 FK-2000 (M4A1)' },
+      { id: 70, msg: 'Ace 击毁了 FK-2000 (M4A1)' },
     ]);
     const hits = computeSelfKills(feed, { afterId: -1, playerName: 'Ace' });
     expect(hits.length).toBe(3);
   });
 
   it('别人的击杀与空昵称一概不认领', () => {
-    const feed = toEvents([{ id: 80, time: 300, msg: 'Bob 击毁了 T-34' }]);
+    const feed = toEvents([{ id: 80, time: 300, msg: 'Bob 击毁了 T-34 (M4A1)' }]);
     expect(computeSelfKills(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(0);
     expect(computeSelfKills(feed, { afterId: -1, playerName: '' }).length).toBe(0);
   });
@@ -130,7 +130,7 @@ describe('BattleWatcher:击杀计数不再卡死', () => {
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), playerName: 'Ace', now: () => 100_000 });
     await watcher.poll();
-    routes.hud = { events: [], damage: [{ id: 11, time: 100, msg: 'Ace 击毁了 T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 11, time: 100, msg: 'Ace 击毁了 T-34 (M4A1)' }] };
     await watcher.poll();
     await watcher.poll();
     await watcher.poll();
@@ -142,13 +142,13 @@ describe('BattleWatcher:击杀计数不再卡死', () => {
     const watcher = new BattleWatcher({ client: makeClient(() => routes), playerName: 'Ace', now: () => 100_000 });
     await watcher.poll();
     routes.hud = { events: [], damage: [] };
-    for (let id = 100; id <= 110; id += 1) routes.hud.damage.push({ id, time: id, msg: 'Bob 击毁了 目标' + id });
+    for (let id = 100; id <= 110; id += 1) routes.hud.damage.push({ id, time: id, msg: 'Bob 击毁了 目标 (M4A1)' + id });
     await watcher.poll();
-    routes.hud.damage.push({ id: 111, time: 111, msg: 'Ace 击毁了 T-80U-E1' });
+    routes.hud.damage.push({ id: 111, time: 111, msg: 'Ace 击毁了 T-80U-E1 (M4A1)' });
     await watcher.poll();
     expect(watcher.tally.kills).toBe(1);
     // 游戏重启:hudmsg 的 id 从 1 重新计数,全部小于这一局记下的基线 111。
-    routes.hud = { events: [], damage: [{ id: 1, time: 5, msg: 'Ace 击毁了 豹2A6' }, { id: 2, time: 6, msg: 'Bob 击毁了 目标' }] };
+    routes.hud = { events: [], damage: [{ id: 1, time: 5, msg: 'Ace 击毁了 豹2A6 (M4A1)' }, { id: 2, time: 6, msg: 'Bob 击毁了 目标 (M4A1)' }] };
     const after = await watcher.poll();
     expect(after.filter((event) => event.kind === 'kill').length).toBe(1);
     expect(watcher.tally.kills).toBe(2);
@@ -158,10 +158,10 @@ describe('BattleWatcher:击杀计数不再卡死', () => {
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), playerName: 'Ace', now: () => 100_000 });
     await watcher.poll();
-    routes.hud = { events: [], damage: [{ id: 200, time: 200, msg: 'Bob 击毁了 目标' }] };
+    routes.hud = { events: [], damage: [{ id: 200, time: 200, msg: 'Bob 击毁了 目标 (M4A1)' }] };
     await watcher.poll();
     expect(watcher.tally.kills).toBe(0);
-    routes.hud.damage.push({ id: 201, time: 201, msg: 'Ace 击毁了 FK-2000' });
+    routes.hud.damage.push({ id: 201, time: 201, msg: 'Ace 击毁了 FK-2000 (M4A1)' });
     await watcher.poll();
     expect(watcher.tally.kills).toBe(1);
   });

@@ -164,6 +164,24 @@ export async function probeVision(opts: VisionProbeOptions): Promise<VisionResul
   return { ok: true, pngPath, runDir, text, lines, ms };
 }
 
+/** 占领相关词;8111 没有占领端点,只能从画面文字里找。 */
+const ZONE_WORDS = ['占领', '据点', '防守', '夺回', '控制点', 'capture', 'captured', 'contested'];
+
+/** 从 OCR 文本里挑出占领线索;只选含占领词的行,不推断进度。 */
+export function extractZoneHints(text: string, limit = 4): string[] {
+  const out: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.length > 60) continue;
+    const lower = line.toLowerCase();
+    if (!ZONE_WORDS.some((word) => lower.includes(word))) continue;
+    if (out.includes(line)) continue;
+    out.push(line);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 /** 从 OCR 文本里挑出战况线索;只做提示,不据此算战绩。 */
 export function extractVisionHints(text: string): VisionHint[] {
   const hints: VisionHint[] = [];

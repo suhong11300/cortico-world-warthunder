@@ -73,7 +73,7 @@ describe('8111 客户端', () => {
 
   it('hudmsg 里没有 id 的条目被丢掉', async () => {
     const client = makeClient(() => ({
-      hud: { events: [{ id: 3, msg: 'A captured B' }, { id: -1, msg: '没有 id' }], damage: [{ id: 4, msg: 'destroyed T-34' }] },
+      hud: { events: [{ id: 3, msg: 'A captured B' }, { id: -1, msg: '没有 id' }], damage: [{ id: 4, msg: ' destroyed T-34 (M4A1)' }] },
     }));
     const hud = await client.hud(-1, -1);
     expect(hud.events.length).toBe(1);
@@ -85,7 +85,7 @@ describe('8111 客户端', () => {
 describe('战局状态机', () => {
   it('首次进战局推 enter,并预热游标', async () => {
     let clock = 100_000;
-    const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 480, altitude: 2100, type: 'P-51D-30' }, hud: { events: [], damage: [{ id: 5, msg: 'destroyed 老早以前' }] }, map: [] };
+    const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 480, altitude: 2100, type: 'P-51D-30' }, hud: { events: [], damage: [{ id: 5, msg: ' destroyed 老早以前 (M4A1)' }] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
 
     const first = await watcher.poll();
@@ -106,13 +106,13 @@ describe('战局状态机', () => {
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock, playerName: 'Ace' });
     await watcher.poll();
 
-    routes.hud = { events: [], damage: [{ id: 1, msg: 'Ace destroyed T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 1, msg: 'Ace destroyed T-34 (M4A1)' }] };
     const kills = await watcher.poll();
     expect(kills.map((event) => event.kind)).toEqual(['kill']);
     expect(kills[0]).toMatchObject({ total: 1, streak: 1 });
     expect(watcher.tally).toEqual({ kills: 1, deaths: 0, bestStreak: 1 });
 
-    routes.hud = { events: [], damage: [{ id: 2, msg: 'Ace shot down Bf 109' }] };
+    routes.hud = { events: [], damage: [{ id: 2, msg: 'Ace shot down Bf 109 (M4A1)' }] };
     const more = await watcher.poll();
     expect(more[0]).toMatchObject({ kind: 'kill', total: 2, streak: 2 });
     expect(watcher.tally.bestStreak).toBe(2);
@@ -133,7 +133,7 @@ describe('战局状态机', () => {
   it('同一具尸体只记一次阵亡,重生后再死才继续累加', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
-    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    const watcher = new BattleWatcher({ inferDeathFromIndicators: true, client: makeClient(() => routes), now: () => clock });
     await watcher.poll();
 
     // 存活 -> 失效 是一次边沿,记一次阵亡。
@@ -177,11 +177,13 @@ describe('战局状态机', () => {
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock, playerName: 'Ace' });
     await watcher.poll();
-    routes.hud = { events: [], damage: [{ id: 1, msg: 'Ace destroyed T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 1, msg: 'Ace destroyed T-34 (M4A1)' }] };
     await watcher.poll();
 
     clock += 120_000;
     routes.state = inMenu;
+    // 离场的强证据是地图端点：机库里 /state 与 /mission.json 都可能还像"在局"。
+    routes.mapInfo = { valid: false };
     const left = await watcher.poll();
     expect(left.map((event) => event.kind)).toEqual(['leave']);
     const summary = (left[0] as { summary: { kills: number; deaths: number; seconds: number; vehicle: string } }).summary;
@@ -211,7 +213,7 @@ describe('战局状态机', () => {
     const routes: Routes = { state: inBattle, indicators: { valid: true, speed: 400, altitude: 1000, type: 'P-51' }, hud: { events: [], damage: [] }, map: [] };
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
     await watcher.poll();
-    routes.hud = { events: [{ id: 7, msg: 'PlayerX destroyed PlayerY' }], damage: [] };
+    routes.hud = { events: [{ id: 7, msg: 'PlayerX destroyed PlayerY (M4A1)' }], damage: [] };
     const events = await watcher.poll();
     expect(events.map((event) => event.kind)).toEqual(['hud']);
     expect(watcher.tally.kills).toBe(0);

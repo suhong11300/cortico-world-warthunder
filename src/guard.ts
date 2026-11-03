@@ -99,6 +99,20 @@ export function isPrivateHost(raw: string): boolean {
 }
 
 /**
+ * 把用户手填的知识库源补成合法地址。
+ *
+ * 手填 wiki.warthunder.com 这种写法很常见，直接交给 URL 会报「不是合法地址」，
+ * 界面上看不出是少了协议。这里只补协议，其余判断仍交给 assertFetchableUrl。
+ */
+export function normalizeKbSource(raw: string): string {
+  const text = raw.trim();
+  if (!text) return text;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return text;
+  if (/^[^\s/]+(\.[^\s/]+)+(\/.*)?$/.test(text)) return 'https://' + text;
+  return text;
+}
+
+/**
  * 校验一个可以被 fetch 的地址。
  *
  * 规则:必须 http(s);不许带用户名密码(会把凭据发出去);默认不许私网与云元数据,

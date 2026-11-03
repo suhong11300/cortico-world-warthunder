@@ -63,7 +63,7 @@ describe('computeSelfDeaths:阵亡也走全量重算', () => {
   it('victim 是我才算,幂等键带 d: 前缀', () => {
     const feed = toEvents([
       { id: 5, time: 10, msg: 'Enemy1 击毁了 Ace (M1A1)' },
-      { id: 9, time: 12, msg: 'Ace 击毁了 豹2A6' },
+      { id: 9, time: 12, msg: 'Ace 击毁了 豹2A6 (M4A1)' },
     ]);
     const hits = computeSelfDeaths(feed, { afterId: -1, playerName: 'Ace' });
     expect(hits.length).toBe(1);
@@ -79,19 +79,19 @@ describe('computeSelfDeaths:阵亡也走全量重算', () => {
   });
 
   it('没配昵称时一条都不认', () => {
-    const feed = toEvents([{ id: 5, time: 10, msg: 'Enemy1 击毁了 Ace' }]);
+    const feed = toEvents([{ id: 5, time: 10, msg: 'Enemy1 击毁了 Ace (M4A1)' }]);
     expect(computeSelfDeaths(feed, { afterId: -1, playerName: '' }).length).toBe(0);
   });
 
   it('名字里的零宽字符与大小写不影响匹配', () => {
-    const feed = toEvents([{ id: 5, time: 10, msg: 'Enemy\u200b1 击毁了 ACE' }]);
+    const feed = toEvents([{ id: 5, time: 10, msg: 'Enemy\u200b1 击毁了 ACE (M4A1)' }]);
     const hits = computeSelfDeaths(feed, { afterId: -1, playerName: 'ace' });
     expect(hits.length).toBe(1);
     expect(hits[0]?.killer).toBe('Enemy1');
   });
 
   it('自己把自己打掉只算阵亡,不奖励击杀', () => {
-    const feed = toEvents([{ id: 5, time: 10, msg: 'Ace 击毁了 Ace' }]);
+    const feed = toEvents([{ id: 5, time: 10, msg: 'Ace 击毁了 Ace (M4A1)' }]);
     expect(computeSelfDeaths(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(1);
     expect(computeSelfKills(feed, { afterId: -1, playerName: 'Ace' }).length).toBe(0);
   });
@@ -140,7 +140,7 @@ describe('BattleWatcher:阵亡计数不再漏也不再重', () => {
   it('indicators 先计、feed 随后认领时不重复累加', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: alive, hud: { events: [], damage: [] } };
-    const watcher = new BattleWatcher({ client: makeClient(() => routes), playerName: 'Ace', now: () => clock });
+    const watcher = new BattleWatcher({ inferDeathFromIndicators: true, client: makeClient(() => routes), playerName: 'Ace', now: () => clock });
     await watcher.poll();
     clock = 101_500;
     routes.indicators = dead;
@@ -168,7 +168,7 @@ describe('BattleWatcher:阵亡计数不再漏也不再重', () => {
   it('indicators 失效本身仍然兜底计一次(坠机这类 feed 里没有击毁行)', async () => {
     let clock = 100_000;
     const routes: Routes = { state: inBattle, indicators: alive, hud: { events: [], damage: [] } };
-    const watcher = new BattleWatcher({ client: makeClient(() => routes), playerName: 'Ace', now: () => clock });
+    const watcher = new BattleWatcher({ inferDeathFromIndicators: true, client: makeClient(() => routes), playerName: 'Ace', now: () => clock });
     await watcher.poll();
     clock = 101_500;
     routes.indicators = dead;

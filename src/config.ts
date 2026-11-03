@@ -1,4 +1,4 @@
-import type { ConfigProperty, ConfigGroup } from 'cortico/core/types.ts';
+import type { ConfigProperty, ConfigGroup, WorldPanelDecl } from 'cortico/core/types.ts';
 import type { TelemetryScope } from './battle.ts';
 
 /** `worlds.wt` 配置段。enabled 是框架总闸,World 定义里恒为 false,不写进面板。 */
@@ -7,12 +7,24 @@ export interface WtConfigSection {
   /** 自动播报总开关:关掉后只在被显式调用时才说话。 */
   autoBrief: boolean;
   speechStyle: '人格' | '模板';
+  /** 播报长度档位。 */
+  broadcastLength: 'full' | 'key' | 'brief' | 'custom';
+  /** 自定义档的字符上限。 */
+  broadcastMaxChars: number;
   readTelemetry: boolean;
   readVehicle: boolean;
   readMap: boolean;
   readMission: boolean;
   readHud: boolean;
+  /** 是否用指示灯失效边沿补记阵亡。默认开：feed 没有对应阵亡行时补一次,无人机/炮手/观战不计。 */
+  inferDeathFromIndicators: boolean;
+  /** 打完一把后保留几把复盘(0~5)。0 表示不存明细，只推进编号。 */
+  battleHistoryKeep: number;
+  /** 在局判定是否要求地图证据。默认开：机库里 8111 的 mission 仍报 running，只看任务会把机库算成战局。 */
+  strictInBattle: boolean;
   readChat: boolean;
+  /** 附近敌我的统计半径（m）。 */
+  nearbyRadiusM: number;
   broadcastEntryExit: boolean;
   broadcastKills: boolean;
   broadcastDeaths: boolean;
@@ -55,7 +67,10 @@ export interface WtConfigSection {
   kbMaxDownloadMiB: number;
   kbMaxEntries: number;
   kbUpdateMemoryMiB: number;
+  kbIngestMaxChars: number;
+  kbIngestMaxEntries: number;
   /** 视觉降级方案:off 关闭,probe 允许截图 + OCR 自检。 */
+  /** 截图 OCR 只在按需调用时执行，不自动采集。 */
   visionMode: 'off' | 'probe';
   /** 截图区域 "x,y,w,h",留空表示整屏。 */
   visionRegion: string;
@@ -100,12 +115,18 @@ export const WT_DEFAULTS: WtConfigSection = {
   enabled: false,
   autoBrief: true,
   speechStyle: '人格',
+  broadcastLength: 'full',
+  broadcastMaxChars: 0,
   readTelemetry: true,
   readVehicle: true,
   readMap: true,
   readMission: true,
   readHud: true,
+  inferDeathFromIndicators: true,
+  battleHistoryKeep: 3,
+  strictInBattle: true,
   readChat: true,
+  nearbyRadiusM: 500,
   broadcastEntryExit: true,
   broadcastKills: true,
   broadcastDeaths: true,
@@ -119,12 +140,14 @@ export const WT_DEFAULTS: WtConfigSection = {
   playerName: '',
   pollMs: 1500,
   commentaryEveryMs: 45000,
-  kbUrl: '',
+  kbUrl: 'https://gh-proxy.com/https://raw.githubusercontent.com/suhong11300/cortico-world-warthunder/main/kb.json,https://raw.githubusercontent.com/suhong11300/cortico-world-warthunder/main/kb.json',
   kbAutoUpdateHours: 24,
   kbAllowPrivate: false,
   kbMaxDownloadMiB: 64,
   kbMaxEntries: 100000,
   kbUpdateMemoryMiB: 512,
+  kbIngestMaxChars: 12000,
+  kbIngestMaxEntries: 30,
   visionMode: 'off',
   visionRegion: '',
   visionKeepShot: false,
@@ -162,65 +185,169 @@ interface Entry {
 }
 
 const ENTRIES: Entry[] = [
-  { key: 'worlds.wt.autoBrief', title: '触发方式：自动播报', description: '开=自动，关=仅手动呼唤；与表达风格独立组成自动人格/自动模板/手动人格/手动模板四种模式。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.speechStyle', title: '表达风格', description: '人格：请求现有桌宠Persona自然表达；模板：请求原样转述。事实块固定，手动呼唤同样遵守此选择；不要求插件后台cognition或新增密钥。', prop: { type: 'string', enum: ['人格', '模板'] } },
-  { key: 'worlds.wt.readTelemetry', title: '读取：8111总开关', description: '修改观测范围会重新开始本地统计。关闭后后台和手动工具均不访问8111；不影响独立的百科、知识库更新或显式OCR。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.readVehicle', title: '读取：载具仪表', description: '允许读取/state与/indicators中已接入的载具、速度高度和存活指标。关闭后也不作指标失效阵亡推断。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.readMap', title: '读取：地图对象', description: '允许读取/map_info.json与/map_obj.json；可见对象不是完整敌我名单，也不能区分AI与玩家。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.readMission', title: '读取：任务状态', description: '允许读取/mission.json辅助判断在局/离局；不是个人贡献或官方胜负记分板。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.readHud', title: '读取：战果与HUD日志', description: '允许读取/hudmsg并按昵称归因击毁/阵亡；关闭后击毁数量为未知，不显示为已测0。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.readChat', title: '读取：对局聊天', description: '关闭后wt_chat手动查询或翻译也不会访问/gamechat。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.broadcastEntryExit', title: '播报：进入与离开战局', description: '需自动播报总开关开启；只控制主动提示，不禁止手动查询。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.broadcastKills', title: '播报：个人击毁', description: '需自动播报开启且档位非quiet；不包含未接入的助攻或分项得分。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.broadcastDeaths', title: '播报：阵亡与指标失效推断', description: '需自动播报开启且档位非quiet；推断始终标明，不冒充确认击毁。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.broadcastWarnings', title: '播报：观测逆风提醒', description: '需自动播报开启且档位非quiet；不代表全队胜负。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.broadcastHud', title: '播报：全场HUD原文', description: '需自动播报开启且档位非quiet；外部原文不等于个人战绩。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.broadcastCommentary', title: '播报：定时战况', description: '需自动播报开启、档位commentary且讲解间隔大于0；关闭后仍允许手动讲解。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.gameHost', title: '遥测地址', description: '战争雷霆客户端的本地遥测服务所在主机。本机运行留 127.0.0.1。', prop: { type: 'string' } },
-  { key: 'worlds.wt.gamePort', title: '遥测端口', description: '默认 8111。改过启动参数或端口被占用时改这里。', prop: { type: 'number' } },
-  { key: 'worlds.wt.textEncoding', title: '遥测文本编码', description: 'auto 先按 UTF-8 解、见到替换字符再按 GBK 重解;中文客户端的对局聊天是 GBK,钉死 utf-8 会整段变问号。', prop: { type: 'string', enum: ['auto', 'utf-8', 'gbk'] } },
-  { key: 'worlds.wt.playerName', title: '我的游戏昵称', description: '填游戏里显示的名字（含符号）。8111 的击杀列表是全场公开播报，只有靠这个名字才认得出哪些是你打的；留空则不统计击杀。', prop: { type: 'string' } },
-  { key: 'worlds.wt.pollMs', title: '轮询间隔', description: '界面按秒显示，例如1.5秒；建议1–3秒。存储仍为毫秒，旧配置无需迁移。', prop: { type: 'number', minimum: 800, maximum: 30000, multipleOf: 1, 'x-scale': 1000, 'x-suffix': '秒' } },
-  { key: 'worlds.wt.commentaryEveryMs', title: '讲解间隔', description: '界面按秒显示，例如45秒；0关闭定时讲解，其余有效值至少5秒。', prop: { type: 'number', minimum: 0, multipleOf: 1, 'x-scale': 1000, 'x-suffix': '秒' } },
-  { key: 'worlds.wt.kbUrl', title: '知识库源', description: '一个返回 {version, entries} 的 JSON 地址;留空则只用内置词条。', prop: { type: 'string' } },
-  { key: 'worlds.wt.kbAllowPrivate', title: '允许内网知识库源', description: '关着时知识库源只能是公网 http(s);要连本机自建服务才打开。云元数据地址永远拒绝。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.kbAutoUpdateHours', title: '自动更新(小时)', description: '开机后每隔多少小时检查一次知识库源;0 表示只在手动调用时更新。', prop: { type: 'number' } },
-  { key: 'worlds.wt.kbMaxDownloadMiB', title: '知识库下载/本地文件上限', description: '默认64 MiB，最大256 MiB；同时受额外更新预算限制。超限拒绝新库、保留旧文件。', prop: { type: 'number', minimum: 1, maximum: 256, multipleOf: 1, 'x-suffix': 'MiB' } },
-  { key: 'worlds.wt.kbMaxEntries', title: '知识库远程条目上限', description: '默认10万，最大50万；内置词条另计。降额不会删除旧文件，重启加载与下次更新按新限额准入。', prop: { type: 'number', minimum: 1, maximum: 500000, multipleOf: 1, 'x-suffix': '条' } },
-  { key: 'worlds.wt.kbUpdateMemoryMiB', title: '知识库额外更新估算预算', description: '默认512 MiB，可调64–2048 MiB；旧库、桌宠和模型原有占用另计。不是RSS硬限制，不修改Node全局堆；内存不足请调低条目和下载上限。', prop: { type: 'number', minimum: 64, maximum: 2048, multipleOf: 1, 'x-suffix': 'MiB' } },
-  { key: 'worlds.wt.visionKeepShot', title: '保留截图', description: '默认关:OCR 用完就把整屏截图删掉,只留识别文本。打开后会一直留在 data/wt/ 下,方便自己回看。', prop: { type: 'boolean' } },
-  { key: 'worlds.wt.visionMode', title: '视觉降级', description: 'off 关闭;probe 允许截图与 OCR 自检,用于官方遥测不可用时。', prop: { type: 'string', enum: ['off', 'probe'] } },
-  { key: 'worlds.wt.chatLines', title: '对话翻译条数', description: '一次最多取多少条对局聊天交给模型翻译;越多越贵,12 条左右够看清上下文。', prop: { type: 'number', minimum: 1, maximum: 40 } },
-  { key: 'worlds.wt.chatSendMode', title: '发言方式', description: 'clipboard 复制到剪贴板,自己 Ctrl+V 再回车(最稳,不碰游戏);off 只出文本;confirm 先预演、再确认才用键盘直写发言栏;auto 直接直写。', prop: { type: 'string', enum: ['off', 'clipboard', 'confirm', 'auto'] } },
-  { key: 'worlds.wt.chatSendDelayMs', title: '发送等待间隔', description: '按秒显示，例如0.18秒；打开聊天框后等多久再逐字输入，游戏卡顿时调大。', prop: { type: 'number', minimum: 60, maximum: 2000, multipleOf: 1, 'x-scale': 1000, 'x-suffix': '秒' } },
-  { key: 'worlds.wt.chatTarget', title: '翻译成', description: '对局对话要翻成的语言;玩家名始终保持原文。', prop: { type: 'string', enum: ['zh', 'en', 'ja', 'ru'] } },
-  { key: 'worlds.wt.chatMaxInputChars', title: '翻译输入上限(字符)', description: '翻译对局聊天时单独给模型的字符预算。播报仍用「输入上限」那一项;两边都受每日 token 上限约束。', prop: { type: 'number', minimum: 200, maximum: 8000 } },
-  { key: 'worlds.wt.visionRegion', title: '截图区域', description: '形如 "x,y,w,h";留空表示整屏。缩到记分板或击杀提示能显著提速。', prop: { type: 'string' } },
-  { key: 'worlds.wt.chatterLevel', title: '播报档位', description: 'quiet 只报进局与结算;important 再报击毁、阵亡、逆风;commentary 才按间隔定时讲态势。', prop: { type: 'string', enum: ['quiet', 'important', 'commentary'] } },
-  { key: 'worlds.wt.llmMode', title: '文案模型', description: 'host 用宿主当前模型;openai 用下面的兼容接口;off 只用模板文案。', prop: { type: 'string', enum: ['host', 'openai', 'off'] } },
-  { key: 'worlds.wt.llmBaseUrl', title: '接口地址', description: 'OpenAI 兼容的 /v1 前缀地址,例如 https://api.deepseek.com。', prop: { type: 'string' } },
-  { key: 'worlds.wt.llmModel', title: '模型名', description: '接口里填的 model 字段。', prop: { type: 'string' } },
-  { key: 'worlds.wt.llmApiKey', title: '接口密钥', description: '仅 llmMode=openai 时使用;会明文存在 config.json,别填主账号密钥。', prop: { type: 'string' } },
-  { key: 'worlds.wt.maxInputChars', title: '输入上限(字符)', description: '拼给模型的素材超过这个长度就截断,用来压输入花费。', prop: { type: 'number' } },
-  { key: 'worlds.wt.maxOutputTokens', title: '输出上限(token)', description: '单次生成的最大 token 数,直接决定单条播报的上限花费。', prop: { type: 'number' } },
-  { key: 'worlds.wt.dailyBudgetYuan', title: '每日预算(元)', description: '到顶后自动退回模板文案,不再调用模型。', prop: { type: 'number' } },
-  { key: 'worlds.wt.maxCallsPerMinute', title: '每分钟调用上限', description: '一分钟内最多调几次模型;超出的那条直接用模板文案。防事件风暴把额度烧光。', prop: { type: 'number' } },
-  { key: 'worlds.wt.maxCallsPerDay', title: '每日调用上限(次)', description: '当天调用次数到顶后不再调模型。计价填 0 时靠这条兜底。', prop: { type: 'number' } },
-  { key: 'worlds.wt.maxTokensPerDay', title: '每日 token 上限', description: '当天输入加输出 token 的总量上限,到顶后退回模板文案。', prop: { type: 'number' } },
-  { key: 'worlds.wt.priceInPerM', title: '输入价(元/M)', description: '按每百万输入 token 计价,用于本地记账。', prop: { type: 'number' } },
-  { key: 'worlds.wt.priceOutPerM', title: '输出价(元/M)', description: '按每百万输出 token 计价,用于本地记账。', prop: { type: 'number' } },
-  { key: 'worlds.wt.language', title: '播报语言', description: '播报文案与模型提示使用的语言。', prop: { type: 'string', enum: ['zh', 'en'] } },
+  { key: 'worlds.wt.autoBrief', title: '自动播报', description: '开启后按下方逐项开关自动推送；关闭后仅在手动查询时输出。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.speechStyle', title: '口吻', description: '人格：由桌宠按自身人格改写；模板：按固定句式输出。两种表达使用同一份事实与数字。', prop: { type: 'string', enum: ['人格', '模板'] } },
+  { key: 'worlds.wt.broadcastLength', title: '播报详略', description: '详细：全量事实；重点：约 160 字，读数完整；简略：约 60 字，只报载具与敌我；自定义：按下一项。人格档把字数写成对桌宠的要求，由它自己压；模板档按档位选用详略定稿，不做半句截断。', prop: { type: 'string', enum: ['full', 'key', 'brief', 'custom'] } },
+  { key: 'worlds.wt.broadcastMaxChars', title: '字数上限', description: '0 表示按档位（详细不限 / 重点 160 / 简略 60 / 自定义 160）；填 20 至 500 则覆盖档位，各档都能改。', prop: { type: 'number', minimum: 0, maximum: 500, multipleOf: 10, 'x-suffix': '字' } },
+  { key: 'worlds.wt.chatterLevel', title: '播报档位', description: '安静：仅进出战局与结算；重要：增加击毁与阵亡；详解：另加定时态势。', prop: { type: 'string', enum: ['quiet', 'important', 'commentary'] } },
+  { key: 'worlds.wt.broadcastEntryExit', title: '进出战局', description: '进入与离开战局各一条。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.broadcastKills', title: '个人击毁', description: '战果日志中归因到本昵称的击毁。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.broadcastDeaths', title: '个人阵亡', description: '战果日志中的阵亡，以及按「阵亡补记」推断的阵亡。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.broadcastWarnings', title: '逆风提示', description: '观测阵亡数比击毁数多 2 次时提示一次。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.broadcastHud', title: '全场事件', description: '转发战果日志中的全场事件原文，来源标记为外部。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.broadcastCommentary', title: '定时态势', description: '按「讲解间隔」播报当前读数。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.commentaryEveryMs', title: '讲解间隔', description: '0 表示关闭定时态势；其余取值最小 5 秒。', prop: { type: 'number', minimum: 0, multipleOf: 1, 'x-scale': 1000, 'x-suffix': '秒' } },
+  { key: 'worlds.wt.battleHistoryKeep', title: '复盘保留', description: '离场时存档保留的局数，上限 5；0 表示不保留明细，仅推进编号。', prop: { type: 'number', minimum: 0, maximum: 5, multipleOf: 1, 'x-suffix': '局' } },
+  { key: 'worlds.wt.language', title: '语言', description: '播报与提示词使用的语言。', prop: { type: 'string', enum: ['zh', 'en'] } },
+  { key: 'worlds.wt.playerName', title: '游戏昵称', description: '仅归因此昵称的击毁，须与游戏内一致（含中队标签）；留空只统计阵亡。', prop: { type: 'string' } },
+  { key: 'worlds.wt.gameHost', title: '遥测地址', description: '8111 服务地址，本机为 127.0.0.1。', prop: { type: 'string' } },
+  { key: 'worlds.wt.gamePort', title: '遥测端口', description: '默认 8111。', prop: { type: 'number' } },
+  { key: 'worlds.wt.textEncoding', title: '文本编码', description: '中文客户端为 GBK；auto 先按 UTF-8 解码，出现替换字符改用 GBK。', prop: { type: 'string', enum: ['auto', 'utf-8', 'gbk'] } },
+  { key: 'worlds.wt.pollMs', title: '轮询间隔', description: '范围 0.8 至 30。', prop: { type: 'number', minimum: 800, maximum: 30000, multipleOf: 1, 'x-scale': 1000, 'x-suffix': '秒' } },
+  { key: 'worlds.wt.readTelemetry', title: '8111 总闸', description: '关闭后所有端点均不访问，也不使用缓存读数。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.readVehicle', title: '载具与仪表', description: '读 /state 与 /indicators：载具型号、速度、高度、车组、弹药与存活状态。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.readMap', title: '地图与标记', description: '读 /map_info.json 与 /map_obj.json：格网参数、自身坐标与图上敌我图标。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.readMission', title: '任务状态', description: '读 /mission.json：判定在局与离局。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.readHud', title: '战果日志', description: '读 /hudmsg：归因击毁与阵亡。关闭后战绩为未知。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.readChat', title: '对局聊天', description: '读 /gamechat：聊天原文与翻译。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.inferDeathFromIndicators', title: '阵亡补记', description: '战果日志无对应阵亡行时，按仪表由有效转失效的边沿补记一次；侦察无人机、炮手与观战视角不计。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.visionMode', title: '截图 OCR', description: '关闭：不截图。按需：只有调用 wt_vision_probe（例如被问占领情况）才截一次，平时不采集、不占性能。8111 没有占领端点，占点与计分板文字只能来自画面。', prop: { type: 'string', enum: ['off', 'probe'] } },
+  { key: 'worlds.wt.visionRegion', title: '截图区域', description: 'x,y,w,h；留空为整屏。', prop: { type: 'string' } },
+  { key: 'worlds.wt.chatLines', title: '翻译条数', description: '单次读取并翻译的聊天条数上限。', prop: { type: 'number', minimum: 1, maximum: 40 } },
+  { key: 'worlds.wt.chatTarget', title: '翻译语言', description: '翻译目标语言，玩家名保持原文。', prop: { type: 'string', enum: ['zh', 'en', 'ja', 'ru'] } },
+  { key: 'worlds.wt.chatSendMode', title: '发言落地', description: 'off 仅输出文本；clipboard 复制到剪贴板；confirm 预演后写入发言栏；auto 直接写入。', prop: { type: 'string', enum: ['off', 'clipboard', 'confirm', 'auto'] } },
+  { key: 'worlds.wt.nearbyRadiusM', title: '附近半径', description: '统计附近敌我与点位的半径（米）；超出该半径的只计入全场敌我。', prop: { type: 'number', minimum: 100, maximum: 5000, multipleOf: 50, 'x-suffix': 'm' } },
+  { key: 'worlds.wt.kbUrl', title: '知识库源', description: 'JSON 或网页地址，可填多个，按序尝试，首个可用即入库；网页按段落提取，sitemap 按页面展开。', prop: { type: 'string' } },
+  { key: 'worlds.wt.kbAllowPrivate', title: '允许内网源', description: '默认仅公网 http(s)；连接本机服务时开启。云元数据地址恒拒。', prop: { type: 'boolean' } },
+  { key: 'worlds.wt.kbAutoUpdateHours', title: '自动更新', description: '小时；0 表示仅手动更新。', prop: { type: 'number' } },
+  { key: 'worlds.wt.kbMaxDownloadMiB', title: '单源大小上限', description: '单个源响应体的大小上限。', prop: { type: 'number', minimum: 1, maximum: 256, multipleOf: 1, 'x-suffix': 'MiB' } },
+  { key: 'worlds.wt.kbMaxEntries', title: '远程条目上限', description: '远程词条数上限，内置词条另计。', prop: { type: 'number', minimum: 1, maximum: 500000, multipleOf: 1, 'x-suffix': '条' } },
+  { key: 'worlds.wt.kbUpdateMemoryMiB', title: '更新内存预算', description: '更新时的估算上限，非硬限制。', prop: { type: 'number', minimum: 64, maximum: 2048, multipleOf: 1, 'x-suffix': 'MiB' } },
+  { key: 'worlds.wt.kbIngestMaxChars', title: '单次素材上限', description: '给一个网址抓正文时，最多交给模型多少字；越大越完整，也越费上下文。', prop: { type: 'number', minimum: 2000, maximum: 40000, multipleOf: 500, 'x-suffix': '字' } },
+  { key: 'worlds.wt.kbIngestMaxEntries', title: '单次入库上限', description: '一次整理最多写进多少条，避免模型一口气吐出整站。', prop: { type: 'number', minimum: 1, maximum: 100, multipleOf: 1, 'x-suffix': '条' } },
+  { key: 'worlds.wt.llmMode', title: '文案模型', description: 'host 使用宿主模型；openai 使用下方兼容接口；off 仅用模板。', prop: { type: 'string', enum: ['host', 'openai', 'off'] } },
+  { key: 'worlds.wt.llmBaseUrl', title: '接口地址', description: 'OpenAI 兼容接口的基地址。', prop: { type: 'string' } },
+  { key: 'worlds.wt.llmModel', title: '模型名', description: '请求体中的 model 字段。', prop: { type: 'string' } },
+  { key: 'worlds.wt.llmApiKey', title: '接口密钥', description: '仅 openai 档使用，明文存于 config.json。', prop: { type: 'string' } },
+  { key: 'worlds.wt.maxInputChars', title: '单次输入上限', description: '字符数，超出截断。', prop: { type: 'number' } },
+  { key: 'worlds.wt.maxOutputTokens', title: '单次输出上限', description: 'token 数。', prop: { type: 'number' } },
+  { key: 'worlds.wt.dailyBudgetYuan', title: '每日预算', description: '元；超出后回退模板。0 表示不按金额限制。', prop: { type: 'number' } },
+  { key: 'worlds.wt.maxCallsPerMinute', title: '每分钟调用', description: '超出后回退模板。', prop: { type: 'number' } },
+  { key: 'worlds.wt.maxCallsPerDay', title: '每日调用次数', description: '次数上限。', prop: { type: 'number' } },
+  { key: 'worlds.wt.maxTokensPerDay', title: '每日 token 上限', description: '输入与输出合计。', prop: { type: 'number' } },
+  { key: 'worlds.wt.priceInPerM', title: '输入单价', description: '元 / 百万 token。', prop: { type: 'number' } },
+  { key: 'worlds.wt.priceOutPerM', title: '输出单价', description: '元 / 百万 token。', prop: { type: 'number' } },
 ];
 
-/** World 配置的 JSON Schema 声明;每个键都要在 defaults 里存在。 */
-export const WT_CONFIG_GROUP: ConfigGroup = {
+/**
+ * 配置页按用途拆成四组。
+ *
+ * 0.3.1 及以前把四十多项塞在一个 group 里，配置页就是一长条滚动列表，找不到东西。
+ * 宿主按 group 逐个渲染成独立分区（web/client/features/config/view.ts），所以这里
+ * 只要按用途切开：owner 一律 world:wt，path 一律落在 worlds.wt.* 前缀内，
+ * 每条都能在 WT_DEFAULTS 里找到同名键。
+ */
+const GROUP_KEYS = {
+  // 播报:开口时机、颗粒度、口吻,以及离场存档。
+  broadcast: ['autoBrief', 'speechStyle', 'broadcastLength', 'broadcastMaxChars', 'chatterLevel', 'broadcastEntryExit', 'broadcastKills', 'broadcastDeaths', 'broadcastWarnings', 'broadcastHud', 'broadcastCommentary', 'commentaryEveryMs', 'battleHistoryKeep', 'language'],
+  // 查询与读取:连接参数 + 六个端点开关 + 两档兜底(指标补记、截图 OCR) + 聊天翻译。
+  query: ['playerName', 'gameHost', 'gamePort', 'textEncoding', 'pollMs', 'readTelemetry', 'readVehicle', 'readMap', 'readMission', 'readHud', 'readChat', 'inferDeathFromIndicators', 'visionMode', 'visionRegion', 'chatLines', 'chatTarget', 'chatSendMode', 'nearbyRadiusM'],
+  kb: ['kbUrl', 'kbAllowPrivate', 'kbAutoUpdateHours', 'kbMaxDownloadMiB', 'kbMaxEntries', 'kbUpdateMemoryMiB', 'kbIngestMaxChars', 'kbIngestMaxEntries'],
+  model: ['llmMode', 'llmBaseUrl', 'llmModel', 'llmApiKey', 'maxInputChars', 'maxOutputTokens', 'dailyBudgetYuan', 'maxCallsPerMinute', 'maxCallsPerDay', 'maxTokensPerDay', 'priceInPerM', 'priceOutPerM'],
+} as const;
+
+const GROUP_META = {
+  broadcast: { id: 'world:wt', title: '播报', description: '开口时机、播报颗粒度与表述口吻。' },
+  query: { id: 'world:wt.query', title: '查询与读取', description: '8111 连接参数与各端点读取开关。' },
+  kb: { id: 'world:wt.kb', title: '知识库', description: '词条来源、更新频率与容量上限。' },
+  model: { id: 'world:wt.model', title: '模型与花费', description: '文案生成方式与各项费用上限。' },
+} as const;
+
+function buildGroup(kind: keyof typeof GROUP_KEYS): ConfigGroup {
+  const byKey = new Map(ENTRIES.map(e => [e.key, e]));
+  const properties: Record<string, ConfigProperty> = {};
+  for (const short of GROUP_KEYS[kind]) {
+    const entry = byKey.get('worlds.wt.' + short);
+    if (!entry) continue;
+    properties[entry.key] = { ...entry.prop, title: entry.title, description: entry.description, 'x-hot': true };
+  }
+  return {
+    id: GROUP_META[kind].id,
+    owner: 'world:wt',
+    schema: { type: 'object', title: GROUP_META[kind].title, description: GROUP_META[kind].description, properties },
+  };
+}
+
+/**
+ * 世界页面板里每个字段该用哪种控件。
+ *
+ * 面板自己画页面，宿主只管数据；这张表让「同一批配置」在两处呈现不同密度：
+ * 播报的两个总闸与 8111 总闸用滑块，逐项播报与逐项读取压成一张勾选卡片，
+ * 其余仍是一行一值。表里没有的键按普通行渲染。
+ */
+export const WT_FIELD_UI: Record<string, 'switch' | 'check'> = {
+  autoBrief: 'switch',
+  speechStyle: 'switch',
+  readTelemetry: 'switch',
+  broadcastEntryExit: 'check',
+  broadcastKills: 'check',
+  broadcastDeaths: 'check',
+  broadcastWarnings: 'check',
+  broadcastHud: 'check',
+  broadcastCommentary: 'check',
+  readVehicle: 'check',
+  readMap: 'check',
+  readMission: 'check',
+  readHud: 'check',
+  readChat: 'check',
+  inferDeathFromIndicators: 'check',
+};
+
+/** 配置页面板依次渲染的四组。 */
+export const WT_CONFIG_GROUPS: ConfigGroup[] = [buildGroup('broadcast'), buildGroup('query'), buildGroup('kb'), buildGroup('model')];
+
+/**
+ * 世界页面板:快速开始 + 每组一页 tab。
+ *
+ * 顺序即 tab 顺序,快速开始放最左,第一次装进来的人先看到「要填什么、怎么问」。
+ */
+export const WT_PANELS: WorldPanelDecl[] = [
+  { id: 'start', title: '快速开始', description: '首次使用：填游戏昵称、确认 8111 可用、了解提问方式。' },
+  ...(Object.keys(GROUP_KEYS) as Array<keyof typeof GROUP_KEYS>).map((kind) => ({
+    id: kind,
+    title: GROUP_META[kind].title,
+    description: GROUP_META[kind].description,
+  })),
+];
+
+/**
+ * 交给宿主「配置」tab 的精简组。
+ *
+ * 四页 tab 已经把同样的字段排好了,`配置` 页再平铺一遍只是重复;
+ * 但 ctx.setConfig 要求目标组已在配置面声明(服务端按组名找 schema),
+ * 所以这里保留一个只含总闸的组:面板写回仍落在 world:wt,配置页只剩一行。
+ */
+export const WT_CONFIG_SLIM: ConfigGroup[] = [{
   id: 'world:wt',
   owner: 'world:wt',
   schema: {
     type: 'object',
-    title: '战争雷霆百科',
-    properties: Object.fromEntries(
-      ENTRIES.map((e) => [e.key, { ...e.prop, title: e.title, description: e.description, 'x-hot': true }]),
-    ),
+    title: '启用',
+    description: '其余设置在世界页的各 tab 内，此处仅保留世界总闸。',
+    properties: {
+      'worlds.wt.enabled': { type: 'boolean', title: '启用这个世界', description: '关掉后整个世界停止工作。', 'x-hot': true },
+    },
   },
-};
+}];
+
+/** 第一组(播报)的别名,保留给只认单组的调用方。 */
+export const WT_CONFIG_GROUP: ConfigGroup = WT_CONFIG_GROUPS[0];
+
+/** 每组声明的键与全量键,供测试核对重构时没有键被漏掉。 */
+export function configGroupCoverage(): { groups: string[]; covered: string[]; missing: string[] } {
+  const covered: string[] = [];
+  for (const group of WT_CONFIG_GROUPS) for (const key of Object.keys(group.schema.properties)) covered.push(key);
+  const all = ENTRIES.map(e => e.key);
+  const missing = all.filter(key => !covered.includes(key));
+  return { groups: WT_CONFIG_GROUPS.map(g => g.id), covered, missing };
+}

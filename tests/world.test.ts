@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +17,8 @@ interface Routes {
   hud?: { events: Array<{ id: number; msg?: string }>; damage: Array<{ id: number; msg?: string }> };
   map?: unknown[];
   chat?: Array<{ id: number; msg?: string; sender?: string; enemy?: boolean; mode?: string }>;
+  mission?: unknown;
+  mapInfo?: unknown;
   broken?: boolean;
 }
 
@@ -42,6 +44,10 @@ function fakeFetch(read: () => Routes, capture?: string[]): typeof globalThis.fe
       body = routes.indicators ?? {};
     } else if (url.includes('/map_obj.json')) {
       body = routes.map ?? [];
+    } else if (url.includes('/mission.json')) {
+      body = routes.mission ?? {};
+    } else if (url.includes('/map_info.json')) {
+      body = routes.mapInfo ?? {};
     }
     return { ok: true, status: 200, text: async () => JSON.stringify(body) };
   }) as unknown as typeof globalThis.fetch;
@@ -84,6 +90,7 @@ afterEach(() => {
 });
 
 interface Rig {
+  dataDir: string;
   world: WtWorld;
   host: FakeHost & { cognition?: { request: (req: { brief: string }) => Promise<{ text: string } | { error: string }> } };
   cfg: WtConfigSection;
@@ -107,7 +114,7 @@ function rig(
     ...(spawnImpl ? { spawnImpl } : {}),
   });
   const host = new FakeHost() as Rig['host'];
-  return { world, host, cfg };
+  return { dataDir, world, host, cfg };
 }
 
 async function boot(
@@ -148,7 +155,7 @@ describe('装配契约', () => {
     expect(report.warnings.filter((line) => line.includes('enabled is not false'))).toEqual([]);
   });
 
-  it('id 与十一个工具名都对得上', async () => {
+  it('id 与十五个工具名都对得上', async () => {
     const { world } = rig();
     expect(world.id).toBe('wt');
     expect(world.tools().map((tool) => tool.name)).toEqual([
@@ -157,7 +164,11 @@ describe('装配契约', () => {
       'wt_vehicle',
       'wt_kb_status',
       'wt_kb_update',
+      'wt_kb_fetch',
+      'wt_kb_ingest',
       'wt_battle_state',
+      'wt_battle_log',
+      'wt_map_calib',
       'wt_commentary',
       'wt_chat',
       'wt_say',
@@ -213,7 +224,7 @@ describe('挂载与播报', () => {
       await vi.advanceTimersByTimeAsync(2100);
       const ready = host.events.find((event) => event.type === 'wt.ready');
       expect(ready?.meta?.online).toBe(online);
-      expect(ready?.text).toContain(online ? '遥测已连上' : '遥测没连上');
+      expect(ready?.text).toContain(online ? '遥测在线' : '遥测离线');
     } finally { await world.stop(); vi.useRealTimers(); }
   });
 
@@ -240,7 +251,7 @@ describe('挂载与播报', () => {
       state: { valid: false },
       indicators: { valid: true, army: 'tank', type: 'tankModels/us_m1a2_sep3_abrams', speed: 0 },
     }));
-    expect(host.events[0].text).toContain('遥测尚未采样');
+    expect(host.events[0].text).toContain('遥测未采样');
     expect(host.events[0].text).not.toContain('没连上');
     expect(host.events[0].meta?.online).toBeNull();
     await world.stop();
@@ -248,7 +259,7 @@ describe('挂载与播报', () => {
 
   it('首次采样前也不武断判定故障端点离线', async () => {
     const { world, host } = await boot({}, () => ({ broken: true }));
-    expect(host.events[0].text).toContain('遥测尚未采样');
+    expect(host.events[0].text).toContain('遥测未采样');
     expect(host.events[0].meta?.online).toBeNull();
     await world.stop();
   });
@@ -276,7 +287,7 @@ describe('挂载与播报', () => {
     const { world, host } = await boot({ playerName: 'Ace' }, () => routes);
     await pollOnce(world);
 
-    routes.hud = { events: [], damage: [{ id: 3, msg: 'Ace destroyed T-34' }] };
+    routes.hud = { events: [], damage: [{ id: 3, msg: 'Ace destroyed T-34 (M4A1)' }] };
     await pollOnce(world);
     expect(host.events.at(-1)?.type).toBe('wt.kill');
 
@@ -327,7 +338,7 @@ describe('工具', () => {
   it('wt_status 报出遥测、知识库与额度', async () => {
     const { world } = await boot();
     const text = await call(world, 'wt_status');
-    expect(text).toContain('战争雷霆百科');
+    expect(text).toContain('自检');
     expect(text).toContain('8111');
     expect(text).toContain('知识库:v1.0.0');
     expect(text).toContain('预算');
@@ -365,12 +376,14 @@ describe('工具', () => {
   });
 
   it('wt_kb_status 与 wt_kb_update 说明来源状态', async () => {
-    const { world } = await boot();
+    const { world } = await boot({ kbUrl: '' });
     const status = await call(world, 'wt_kb_status');
     expect(status).toContain('v1.0.0');
     expect(status).toContain('仅内置');
     const update = await call(world, 'wt_kb_update');
-    expect(update).toContain('知识库源没配');
+    // 留空不等于没源:回落到内置默认源(国内镜像优先),这次取不到也只影响这一次。
+    expect(update).not.toContain('知识库源没配');
+    expect(update).toContain('https://gh-proxy.com/');
     await world.stop();
   });
 
@@ -395,8 +408,9 @@ describe('工具', () => {
     expect(await call(offline.world, 'wt_battle_state')).toContain('遥测没连上');
     await offline.world.stop();
 
-    const menu = await boot({}, () => ({ state: inMenu, indicators: { valid: false } }));
-    expect(await call(menu.world, 'wt_battle_state')).toContain('当前不在战局');
+    // 机库真机实测：state 与 indicators 都 valid、mission 仍报 running，只有地图端点说没地图。
+    const menu = await boot({}, () => ({ state: inMenu, indicators: { valid: false }, mission: { status: 'running' }, mapInfo: { valid: false } }));
+    expect(await call(menu.world, 'wt_battle_state')).toContain('不在战局');
     await menu.world.stop();
   });
 
@@ -404,7 +418,7 @@ describe('工具', () => {
     const routes: Routes = { state: inBattle, indicators: flying };
     const { world, host } = await boot({}, () => routes);
     const text = await call(world, 'wt_commentary', { mode: 'cheer' });
-    expect(text).toContain('已推送到对话');
+    expect(text.length).toBeGreaterThan(0); expect(text).not.toContain('已推送到对话');
     expect(host.events.at(-1)?.type).toBe('wt.commentary');
     await world.stop();
   });
@@ -417,12 +431,12 @@ describe('滥用面的闸', () => {
     await pollOnce(world);
     routes.hud = {
       events: [],
-      damage: [1, 2, 3, 4, 5, 6].map((id) => ({ id, msg: 'Ace destroyed T-' + id })),
+      damage: [1, 2, 3, 4, 5, 6].map((id) => ({ id, msg: 'Ace destroyed T-' + id + ' (M4A1)' })),
     };
     await pollOnce(world);
     const kills = host.events.filter((event) => event.type === 'wt.kill');
     expect(kills).toHaveLength(3);
-    expect(await call(world, 'wt_battle_state')).toContain('本观测窗口累计:6 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('击毁 6');
   });
 
   it('清零账本要先确认,而且一天最多三次', async () => {
@@ -670,6 +684,29 @@ describe('隐私与副作用闸', () => {
     await world.stop();
   });
 
+  it('占领信息改为按需:轮询多轮都不截图', async () => {
+    const shots: string[] = [];
+    const fake = visionSpawn('A 点 占领中', shots);
+    const { world } = await boot({ visionMode: 'probe' }, () => ({ state: inBattle }), undefined, fake.impl);
+    await (world as any).pollOnce();
+    await (world as any).pollOnce();
+    expect(shots.length).toBe(0);
+    expect(fake.calls.length).toBe(0);
+    await world.stop();
+  });
+
+  it('按需截图后占点线索进入战况行', async () => {
+    const shots: string[] = [];
+    const fake = visionSpawn('A 点 占领中', shots);
+    const { world } = await boot({ visionMode: 'probe' }, () => ({ state: inBattle }), undefined, fake.impl);
+    await (world as any).pollOnce();
+    const probe = await call(world, 'wt_vision_probe');
+    expect(probe).toContain('占点线索:A 点 占领中');
+    const out = await call(world, 'wt_battle_state', { fields: 'situation' });
+    expect(out).toContain('占点 A 点 占领中');
+    await world.stop();
+  });
+
   it('预演与确认必须是同一句,换内容就不发', async () => {
     const fake = fakeSpawn({ out: 'WINDOW 9 aces.exe\nSENT 9' });
     const { world } = await boot({ chatSendMode: 'confirm' }, () => ({ state: inMenu }), undefined, fake.impl);
@@ -772,11 +809,47 @@ describe('播报档位', () => {
     const routes: Routes = { state: inBattle, indicators: flying, hud: { events: [], damage: [] } };
     const { world, host } = await boot({ chatterLevel: 'quiet', playerName: 'Ace' }, () => routes);
     await pollOnce(world);
-    routes.hud = { events: [], damage: [1, 2].map((id) => ({ id, msg: 'Ace destroyed T-' + id })) };
+    routes.hud = { events: [], damage: [1, 2].map((id) => ({ id, msg: 'Ace destroyed T-' + id + ' (M4A1)' })) };
     await pollOnce(world);
     expect(host.events.some((event) => event.type === 'wt.battle_started')).toBe(true);
     expect(host.events.some((event) => event.type === 'wt.kill')).toBe(false);
-    expect(await call(world, 'wt_battle_state')).toContain('本观测窗口累计:2 杀');
+    expect(await call(world, 'wt_battle_state')).toContain('击毁 2');
+    await world.stop();
+  });
+});
+
+describe('赛后复盘：离场存档、可辨认第几把', () => {
+  it('打完一把就存成 #1，之后在菜单里问状态能报出上一把，wt_battle_log 能列出', async () => {
+    const routes: Routes = { state: inBattle, indicators: flying, mission: { status: 'running' }, mapInfo: { valid: true }, map: [], hud: { events: [], damage: [] } };
+    const { dataDir, world } = await boot({ playerName: 'Ace', battleHistoryKeep: 3, autoBrief: false }, () => routes);
+    await pollOnce(world);
+
+    routes.hud = { events: [], damage: [1, 2, 3].map((id) => ({ id, time: id * 10, msg: 'Ace destroyed T-' + id + ' (M4A1)' })) };
+    await pollOnce(world);
+    routes.hud = { events: [], damage: [...[1, 2, 3].map((id) => ({ id, time: id * 10, msg: 'Ace destroyed T-' + id + ' (M4A1)' })), { id: 4, time: 40, msg: 'Enemy destroyed Ace (M4A1)' }] };
+    await pollOnce(world);
+    expect(await call(world, 'wt_battle_state')).toContain('击毁 3');
+
+    // 这一局结束:任务端点说结束,地图也不再给网格。
+    routes.mission = { status: 'ended' };
+    routes.mapInfo = { valid: false };
+    await pollOnce(world);
+
+    const saved = JSON.parse(String(readFileSync(join(dataDir, 'wt', 'battles.json'), 'utf8'))) as { seq: number; items: Array<{ seq: number; kills: number; deaths: number }> };
+    expect(saved.items).toHaveLength(1);
+    expect(saved.items[0].seq).toBe(1);
+    expect(saved.items[0].kills).toBe(3);
+    expect(saved.items[0].deaths).toBe(1);
+    expect(saved.seq).toBe(2);
+
+    const idle = await call(world, 'wt_battle_state');
+    expect(idle).toContain('不在战局');
+    expect(idle).toContain('上一把 #1');
+    expect(idle).toContain('3 杀 1 死');
+
+    const log = await call(world, 'wt_battle_log');
+    expect(log).toContain('#1');
+    expect(log).toContain('3 杀 1 死');
     await world.stop();
   });
 });

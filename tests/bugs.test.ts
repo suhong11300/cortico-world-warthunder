@@ -8,6 +8,8 @@ import { describe, it, expect } from 'vitest';
 import {
   BattleClient,
   BattleWatcher,
+  computeSelfDeaths,
+  computeSelfKills,
   isSelfKill,
   normalizePlayerName,
   parseKillLine,
@@ -19,6 +21,8 @@ interface Routes {
   indicators?: unknown;
   hud?: { events: Array<{ id: number; msg?: string }>; damage: Array<{ id: number; msg?: string }> };
   map?: unknown[];
+  mission?: unknown;
+  mapInfo?: unknown;
   chat?: Array<{ id: number; msg?: string; sender?: string; enemy?: boolean; mode?: string }>;
 }
 
@@ -39,6 +43,10 @@ function makeClient(read: () => Routes) {
       body = routes.state ?? {};
     } else if (url.includes('/indicators')) {
       body = routes.indicators ?? {};
+    } else if (url.includes('/mission.json')) {
+      body = routes.mission ?? {};
+    } else if (url.includes('/map_info.json')) {
+      body = routes.mapInfo ?? {};
     } else if (url.includes('/map_obj.json')) {
       body = routes.map ?? [];
     }
@@ -53,13 +61,13 @@ const flying = { valid: true, speed: 480, altitude: 2100, type: 'P-51D-30' };
 describe('P0 击杀归属:damage 是全场 kill feed', () => {
   it('中文播报拆得出发起者与被击毁者,并去掉载具括号', () => {
     const line = parseKillLine('迪特里希 (◄EMBT) 击毁了 勃兰特 (T-80BVM)');
-    expect(line).toEqual({ killer: '迪特里希', victim: '勃兰特' });
-    expect(parseKillLine('PlayerX destroyed PlayerY')).toEqual({ killer: 'PlayerX', victim: 'PlayerY' });
+    expect(line).toMatchObject({ killer: '迪特里希', victim: '勃兰特', killerTagged: true, victimTagged: true });
+    expect(parseKillLine('PlayerX destroyed PlayerY (M4A1)')).toMatchObject({ killer: 'PlayerX', victim: 'PlayerY', victimTagged: true });
   });
 
   it('没有终局动词、或动词出现在开头时不给结果', () => {
     expect(parseKillLine('注意战术地图!')).toBeNull();
-    expect(parseKillLine('击毁了 T-34')).toBeNull();
+    expect(parseKillLine(' 击毁了 T-34 (M4A1)')).toBeNull();
     expect(parseKillLine('')).toBeNull();
   });
 
@@ -82,8 +90,8 @@ describe('P0 击杀归属:damage 是全场 kill feed', () => {
     routes.hud = {
       events: [],
       damage: [
-        { id: 1, msg: 'Ace destroyed T-34' },
-        { id: 2, msg: 'PlayerX destroyed PlayerY' },
+        { id: 1, msg: 'Ace destroyed T-34 (M4A1)' },
+        { id: 2, msg: 'PlayerX destroyed PlayerY (M4A1)' },
         { id: 3, msg: '迪特里希 (◄EMBT) 击毁了 勃兰特 (T-80BVM)' },
       ],
     };
@@ -100,15 +108,15 @@ describe('P0 击杀归属:damage 是全场 kill feed', () => {
     routes.hud = {
       events: [],
       damage: [
-        { id: 1, msg: 'Ace destroyed T-34' },
-        { id: 2, msg: 'Ace 摧毁了 T-34' },
-        { id: 3, msg: 'Ace 击毁了 T-34' },
+        { id: 1, msg: 'Ace destroyed T-34 (M4A1)' },
+        { id: 2, msg: 'Ace 摧毁了 T-34 (M4A1)' },
+        { id: 3, msg: 'Ace 击毁了 T-34 (M4A1)' },
       ],
     };
     await watcher.poll();
     expect(watcher.tally.kills).toBe(1);
     // 换成另一个目标就照常计数
-    routes.hud = { events: [], damage: [{ id: 4, msg: 'Ace destroyed IS-2' }] };
+    routes.hud = { events: [], damage: [{ id: 4, msg: 'Ace destroyed IS-2 (M4A1)' }] };
     await watcher.poll();
     expect(watcher.tally.kills).toBe(2);
   });
@@ -162,12 +170,176 @@ describe('P2 小地图读数', () => {
     expect(objects[1].x).toBeCloseTo(0.1);
   });
 
-  it('0 敌只说明可见地图观测,不凭空判断游戏模式', () => {
+  it('可见对象数不进默认战局行,也不凭空判断游戏模式', () => {
     const zh = battleLine({ vehicle: 'T-80BVM', mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 17 }, 'zh');
-    expect(zh).toContain('地图可见 0 敌 / 17 友');
-    expect(zh).toContain('非全场总数');
+    expect(zh).toContain('T-80BVM');
+    expect(zh).not.toContain('图上');
+    expect(zh).not.toContain('非全场总数');
     expect(zh).not.toContain('该模式');
     const en = battleLine({ vehicle: 'T-80BVM', mode: '', army: '', speed: 0, altitude: 0, enemies: 3, allies: 17 }, 'en');
     expect(en).not.toContain('usually hides');
+  });
+});
+
+describe('P8 判重窗口：id 为主、time 为辅', () => {
+  const row = (id: number, time: number, msg: string) => ({ id, time, msg, type: '', sender: '' });
+
+  it('两个不同战局里同一对玩家在相近秒数互相击毁，不会被当成重复而漏计', () => {
+    // 真机实测：同一份全量 feed 里 time 跨局回绕(id 337 是 t333，id 343 却是 t153)，
+    // 旧实现只在 time 差 <8s 时判重，两个战局同一秒发生的同 pair 击毁就会被合并成一条。
+    const damage = [row(337, 300, 'Ace 击毁了 T-34 (M4A1)'), row(343, 300, 'Ace 击毁了 T-34 (M4A1)')];
+    const kills = computeSelfKills(damage, { afterId: -1, playerName: 'Ace' });
+    expect(kills).toHaveLength(2);
+  });
+
+  it('同一次击毁的多条播报 id 挨着且同一秒，仍然只算一条', () => {
+    const damage = [row(337, 300, 'Ace 击毁了 T-34 (M4A1)'), row(338, 300, 'Ace 击落了 T-34 (M4A1)')];
+    expect(computeSelfKills(damage, { afterId: -1, playerName: 'Ace' })).toHaveLength(1);
+  });
+});
+
+describe('P9 在局判定：地图端点说没地图就不算在局', () => {
+  it('mission 还报 running 但地图端点 valid:false，按不在局处理（机库就是这样）', async () => {
+    // 真机 2026-11-02 机库：/state 与 /indicators 都 valid:true、/mission.json 仍报
+    // status=running，只有 /map_info.json 是 {"valid":false}、/map_obj.json 是空数组。
+    // 早先"三选一"的口径会把机库判成在战局，于是气泡说"在战局里"还挂出上一局的战绩。
+    const routes: Routes = {
+      state: { valid: true, 'IAS, km/h': 0, 'H, m': 32 },
+      indicators: { valid: true, type: 'ah_64e', army: 'air' },
+      mission: { status: 'running', objectives: null },
+      mapInfo: { valid: false },
+      map: [],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: 'Ace' });
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual([]);
+    expect(watcher.inBattleNow).toBe(false);
+  });
+
+  it('地图端点读不到时（readMap 关），mission 的 running 仍算在局', async () => {
+    const routes: Routes = {
+      state: { valid: false },
+      indicators: { valid: true, type: 'su_30mk2v_venezuela', army: 'air' },
+      mission: { status: 'running', objectives: [{ text: '协助地面部队' }] },
+      map: [],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: 'Ace' });
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual(['enter']);
+  });
+
+  it('mission 已结束时，地图端点未就绪仍算离场，残留单位撑不起在局', async () => {
+    const routes: Routes = {
+      state: inBattle,
+      indicators: flying,
+      mission: { status: 'ended', objectives: [] },
+      mapInfo: { valid: false },
+      map: [],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: 'Ace' });
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual([]);
+    expect(watcher.inBattleNow).toBe(false);
+  });
+});
+
+describe('P10 零宽字符：真机 feed 的动词被 U+200B 拆开', () => {
+  // 2026-11-02 真机 /hudmsg 155 条里 139 条含 U+200B：「击毁了」在字节层是 击+ZWSP+毁+ZWSP+了。
+  // looksLikeKill 早先在原文上 includes("击毁了")，于是整份 feed 被判成没有击杀、战果恒 0/0。
+  const killer = '^MyGO^ 羽丘千早丰川祥';
+  const ZW = '\u200b';
+  it('击杀：被零宽拆开的动词仍能归因到自己', () => {
+    const msg = killer + " (▄\u200b苏-30MK2 AMV “侧\u200b卫-G”) 击\u200b毁\u200b了 昔涟 是爱 是桃子 (T-80BVM)";
+    const hits = computeSelfKills([{ id: 500, time: 46, msg, type: '', sender: '' }], { afterId: -1, playerName: '羽丘千早丰川祥' });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.victim).toBe('昔涟 是爱 是桃子');
+  });
+
+  it('AI 目标：同类真机行的 victim 只有载具名，不计入个人击杀', () => {
+    const msg = killer + " (▄\u200b苏-30MK2 AMV “侧\u200b卫-G”) 击\u200b毁\u200b了 IPM1";
+    const hits = computeSelfKills([{ id: 501, time: 47, msg, type: '', sender: '' }], { afterId: -1, playerName: '羽丘千早丰川祥' });
+    expect(hits).toHaveLength(0);
+  });
+  it('阵亡：被零宽拆开的击落同样计入自己', () => {
+    const msg = "Enemy (HSTV-L) 击" + ZW + "落" + ZW + "了 " + killer + " (HSTV-L)";
+    const deaths = computeSelfDeaths([{ id: 360, time: 12, msg, type: '', sender: '' }], { afterId: -1, playerName: '羽丘千早丰川祥' });
+    expect(deaths).toHaveLength(1);
+  });
+  it('无人机自行坠毁既不算击杀也不算阵亡', () => {
+    const msg = killer + " (微型侦察无人机) 已" + ZW + "坠" + ZW + "毁。";
+    const feed = [{ id: 504, time: 55, msg, type: '', sender: '' }];
+    expect(computeSelfKills(feed, { afterId: -1, playerName: '羽丘千早丰川祥' })).toHaveLength(0);
+    expect(computeSelfDeaths(feed, { afterId: -1, playerName: '羽丘千早丰川祥' })).toHaveLength(0);
+  });
+});
+
+describe('P12 接入前的不计：只认入局基线之后的新行', () => {
+  const row = (id: number, time: number, msg: string) => ({ id, time, msg, type: "", sender: "" });
+  const inBattleState = { valid: true, map_valid: true, vehicle_type: "fixture-plane" };
+  const runningMission = { status: "running" };
+
+  it("入局前已经打过的战绩一条都不算，之后的新行照常归因", async () => {
+    const damage = [
+      row(10, 200, "Ace destroyed Old1 (M4A1)"),
+      row(11, 230, "Ace destroyed Old2 (M4A1)"),
+      row(20, 5, "Ace destroyed T-34 (M4A1)"),
+      row(21, 9, "Enemy destroyed Ace (M4A1)"),
+      row(22, 20, "Ace destroyed T-62 (M4A1)"),
+    ];
+    const routes: Routes = {
+      state: inBattleState,
+      indicators: { valid: true, type: "fixture-plane" },
+      mission: runningMission,
+      mapInfo: { valid: true },
+      map: [],
+      hud: { events: [], damage },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: "Ace" });
+    const events = await watcher.poll();
+    expect(events.map((event) => event.kind)).toEqual(["enter"]);
+    expect(watcher.tally).toEqual({ kills: 0, deaths: 0, bestStreak: 0 });
+
+    (routes.hud as any).damage = [...damage, row(23, 30, "Ace destroyed IS-2 (M4A1)")];
+    const next = await watcher.poll();
+    expect(next.map((event) => event.kind)).toEqual(["kill"]);
+    expect(watcher.tally.kills).toBe(1);
+  });
+
+  it("没离场就换了局：time 回退把旧局封存，新局从零起算", async () => {
+    const first = [
+      row(30, 10, "Ace destroyed T-34 (M4A1)"),
+      row(31, 20, "Ace destroyed T-62 (M4A1)"),
+    ];
+    const routes: Routes = {
+      state: inBattleState,
+      indicators: { valid: true, type: "fixture-plane" },
+      mission: runningMission,
+      mapInfo: { valid: true },
+      map: [],
+      hud: { events: [], damage: [...first] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: "Ace" });
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual(["enter"]);
+
+    (routes.hud as any).damage = [...first, row(32, 30, "Ace destroyed IS-2 (M4A1)")];
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual(["kill"]);
+    expect(watcher.tally.kills).toBe(1);
+
+    // 第二局：time 从 0 重新计，id 继续涨，中间没抓到地图卸载那一瞬。
+    (routes.hud as any).damage = [
+      ...first,
+      row(32, 30, "Ace destroyed IS-2 (M4A1)"),
+      row(33, 4, "Ace destroyed M4 (M4A1)"),
+      row(34, 8, "Ace destroyed T-34 (M4A1)"),
+    ];
+    const rotate = await watcher.poll();
+    expect(rotate.map((event) => event.kind)).toEqual(["leave", "enter", "kill", "kill"]);
+    const left = rotate[0] as { kind: string; summary: { kills: number } };
+    expect(left.summary.kills).toBe(1);
+    expect(watcher.tally).toEqual({ kills: 2, deaths: 0, bestStreak: 2 });
+
+    // 切过之后旧行不再重复计入。
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual([]);
+    expect(watcher.tally.kills).toBe(2);
   });
 });

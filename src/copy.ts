@@ -37,104 +37,109 @@ export function clip(text: string, max: number): string {
   return clean.slice(0, Math.max(0, max - 1)) + '…';
 }
 
-/** 战局读数的单行摘要。 */
-export function battleLine(snapshot: BattleSnapshot, lang: Lang): string {
-  if (snapshot.readings) {
-    const { speed, altitude, mapKnown } = snapshot.readings;
-    const bits = [snapshot.vehicle || (snapshot.readings.vehiclePending
-      ? (lang === 'en' ? 'awaiting vehicle (placeholder ignored)' : '载具待生成(占位数据已忽略)')
-      : (lang === 'en' ? 'unknown vehicle ID' : '载具ID未知'))];
-    if (speed.value !== null) bits.push(speed.unit === 'km/h'
-      ? speed.kind + ' ' + Math.round(speed.value) + ' km/h'
-      : (lang === 'en' ? 'speed instrument raw ' : '速度仪表原始值 ') + speed.value + (lang === 'en' ? ' (unit unconfirmed)' : '(单位未确认)'));
-    if (altitude.value !== null) bits.push(altitude.unit === 'm'
-      ? (lang === 'en' ? 'altitude ' : '高度 ') + Math.round(altitude.value) + ' m'
-      : (lang === 'en' ? 'altitude instrument raw ' : '高度仪表原始值 ') + altitude.value + (lang === 'en' ? ' (unit unconfirmed)' : '(单位未确认)'));
-    if (speed.value === null && altitude.value === null) bits.push(lang === 'en' ? 'speed/altitude unavailable' : '速度/高度不可用');
-    bits.push(mapKnown
-      ? lang === 'en' ? `${snapshot.enemies} enemies / ${snapshot.allies} allies on the visible map (not the full battlefield)`
-        : `地图可见 ${snapshot.enemies} 敌 / ${snapshot.allies} 友(非全场总数)`
-      : lang === 'en' ? 'map data unavailable' : '地图数据不可用');
-    return bits.join(' · ');
-  }
-  if (lang === 'en') {
-    const bits = [snapshot.vehicle || 'unknown vehicle'];
-    if (snapshot.speed > 0) bits.push(Math.round(snapshot.speed) + ' km/h');
-    if (snapshot.altitude > 0) bits.push(Math.round(snapshot.altitude) + ' m');
-    if (snapshot.enemies > 0 || snapshot.allies > 0) {
-      // 陆战 RB 的小地图本来就不显示敌方单位，0 敌是真实读数而不是数据坏了，得说清。
-      const tail = ' (not the full battlefield)';
-      bits.push(snapshot.enemies + ' enemies / ' + snapshot.allies + ' allies on the visible map' + tail);
+/**
+ * 战局读数：载具（优先中文名）· 速度 ·（空战）高度 · 过载。
+ *
+ * 0.4.5 起不再报车组、待发弹、档位、稳定器、转速：这些在真机上帮不上判断战况，
+ * 却占掉整行位置。图上敌我、位置、附近单位同样默认不报——它们只在用户明确问起时出现
+ * （wt_battle_state 的 fields 参数，见 world.ts）。
+ * 简略档只留载具，重点档与详细档带状态读数。
+ */
+export function battleLine(snapshot: BattleSnapshot, lang: Lang, mode: BroadcastLength = 'full'): string {
+  const bits: string[] = [vehicleName(snapshot, lang)];
+  if (!isTerse(mode)) bits.push(stateOnly(snapshot, lang));
+  return bits.join(' · ');
+}
+
+/** 载具名：知识库命中时用中文名（world.ts 填 vehicleLabel），否则用客户端给的内部名。 */
+export function vehicleName(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  if (snapshot.vehicleLabel) return snapshot.vehicleLabel;
+  if (snapshot.vehicle) return snapshot.vehicle;
+  return snapshot.readings?.vehiclePending
+    ? (zh ? '载具待生成' : 'awaiting vehicle')
+    : (zh ? '载具未知' : 'unknown vehicle');
+}
+
+/**
+ * 仅状态读数：陆战（含海战）只报对地速度，空战报速度 + 高度 + 过载。
+ * 读数缺失就写「未读到」，不拿别的量顶替。
+ */
+export function stateOnly(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  const bits: string[] = [];
+  const readings = snapshot.readings;
+  if (snapshot.army === 'tank' || snapshot.army === 'ship') {
+    // 真机 /state 常是 {"valid": false}，indicators.speed 是矢量原始值；陆战速度只能用地图位移算。
+    if (snapshot.groundSpeedKmh !== undefined && Number.isFinite(snapshot.groundSpeedKmh)) {
+      bits.push(Math.round(snapshot.groundSpeedKmh) + ' km/h');
+    } else {
+      bits.push(zh ? '速度未读到' : 'speed unavailable');
     }
     return bits.join(' · ');
   }
-  const bits: string[] = [];
-  if (snapshot.vehicle) bits.push(snapshot.vehicle);
-  if (snapshot.speed > 0) bits.push('速度 ' + Math.round(snapshot.speed) + ' km/h');
-  if (snapshot.altitude > 0) bits.push('高度 ' + Math.round(snapshot.altitude) + ' m');
-  // 这两个数是 map_obj.json 里整张可见地图的敌方/友方对象计数,没有距离筛选,
-  // 写成「附近」会让人以为是雷达范围内的接触——那是另一件事,插件没这个数据。
-  if (snapshot.enemies > 0 || snapshot.allies > 0) {
-    // 陆战 RB 的小地图本来就不显示敌方单位，0 敌是真实读数，写清楚免得被当成插件坏了。
-    const tail = '(非全场总数)';
-    bits.push('地图可见 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友' + tail);
+  const speed = readings ? readings.speed : null;
+  const speedValue = speed ? speed.value : (snapshot.speed > 0 ? snapshot.speed : null);
+  if (speedValue === null || speedValue === undefined) {
+    bits.push(zh ? '速度未读到' : 'speed unavailable');
+  } else if (speed && speed.unit !== 'km/h') {
+    bits.push(zh ? '仪表 ' + speedValue + '(未确认单位)' : 'raw ' + speedValue + ' (unit unconfirmed)');
+  } else {
+    bits.push((speed ? speed.kind : 'IAS') + ' ' + Math.round(speedValue) + ' km/h');
   }
-  return bits.length > 0 ? bits.join(' · ') : '载具数据还没读全';
+  const altValue = readings ? readings.altitude.value : (snapshot.altitude > 0 ? snapshot.altitude : null);
+  if (altValue === null || altValue === undefined) {
+    bits.push(zh ? '高度未读到' : 'altitude unavailable');
+  } else if (readings && readings.altitude.unit !== 'm') {
+    bits.push(zh ? '高度仪表 ' + altValue + '(未确认单位)' : 'altitude raw ' + altValue + ' (unit unconfirmed)');
+  } else {
+    bits.push('H ' + Math.round(altValue) + ' m');
+  }
+  const load = readings?.load?.value ?? null;
+  if (load === null) bits.push(zh ? '过载未读到' : 'load unavailable');
+  else bits.push((zh ? '过载 ' : 'load ') + (Math.round(load * 10) / 10).toFixed(1) + 'G');
+  return bits.join(' · ');
 }
 
-export function enterText(snapshot: BattleSnapshot, lang: Lang): string {
-  if (lang === 'en') return 'Battle started: ' + battleLine(snapshot, lang) + '. I will call the highlights.';
-  return '⚔️ 进战局了：' + battleLine(snapshot, lang) + '。打起来我盯着，有高光就喊。';
+export function enterText(snapshot: BattleSnapshot, lang: Lang, mode: BroadcastLength = 'full'): string {
+  if (lang === 'en') return 'Battle started: ' + battleLine(snapshot, lang, mode) + '.';
+  return '⚔️ 进战局：' + battleLine(snapshot, lang, mode);
 }
 
 export function killText(total: number, streak: number, detail: string, lang: Lang): string {
-  const hit = detail ? '（' + clip(detail, 40) + '）' : '';
-  if (lang === 'en') {
-    const streakBit = streak >= 3 ? ' ' + streak + ' in a row!' : '';
-    return 'Kill confirmed, ' + total + ' this match' + hit + '.' + streakBit;
-  }
-  if (streak >= 5) return '🔥 五连以上！第 ' + total + ' 个击毁' + hit + '，这波是你在带节奏。';
-  if (streak >= 3) return '🔥 连拿 ' + streak + ' 个！本局第 ' + total + ' 杀' + hit + '，手感来了。';
-  if (streak === 2) return '✨ 两连击，本局第 ' + total + ' 个击毁' + hit + '，接着来。';
-  return '💥 击毁一个' + hit + '，本局第 ' + total + ' 个。';
+  const hit = detail ? '（' + clip(detail, 32) + '）' : '';
+  if (lang === 'en') return (streak >= 3 ? streak + ' in a row! ' : '') + 'Kill ' + hit + ' (' + total + ' this match).';
+  if (streak >= 3) return '🔥 ' + streak + ' 连！击毁' + hit + '（本局第 ' + total + '）';
+  return '💥 击毁' + hit + '（本局第 ' + total + '）';
 }
 
 export function deathText(total: number, lang: Lang): string {
-  if (lang === 'en') return 'You are down (' + total + ' this match). Reset and come back — the fight is not over.';
-  if (total >= 3) return '💀 第 ' + total + ' 次被击毁，先别急着冲，换个角度绕一下。';
-  return '💀 被击毁了（本局第 ' + total + ' 次），别上头，还有机会翻。';
+  if (lang === 'en') return 'Down (' + total + ' this match).';
+  return '💀 阵亡（本局第 ' + total + '）';
 }
 
 export function behindText(kills: number, deaths: number, lang: Lang): string {
-  if (lang === 'en') return 'Rough patch: ' + kills + ' kills against ' + deaths + ' losses. Play for position, not for score.';
-  return '🌧 有点逆风：' + kills + ' 杀 ' + deaths + ' 死。别硬换，先找掩体把节奏拉回来，稳住一波就有机会。';
+  if (lang === 'en') return 'Rough patch: ' + kills + 'K/' + deaths + 'D. Play for position.';
+  return '🌧 ' + kills + ' 杀 ' + deaths + ' 死，放稳一点。';
 }
 
-export function commentaryText(snapshot: BattleSnapshot, lang: Lang): string {
-  if (lang === 'en') return 'Sitrep: ' + battleLine(snapshot, lang) + '.';
-  return '📡 战况：' + battleLine(snapshot, lang) + '。';
+export function commentaryText(snapshot: BattleSnapshot, lang: Lang, mode: BroadcastLength = 'full'): string {
+  return (lang === 'en' ? '' : '📡 ') + battleLine(snapshot, lang, mode);
 }
 
 export function resultText(summary: BattleSummary, lang: Lang): string {
   const minutes = summary.seconds > 0 ? Math.max(1, Math.round(summary.seconds / 60)) : 0;
-  if (lang === 'en') {
-    const time = minutes > 0 ? ' in ' + minutes + ' min' : '';
-    return 'Left the observed battle: ' + (summary.killsKnown === false ? 'kills unknown (HUD reads disabled)' : summary.kills + ' attributed kills') + ', ' + (summary.deathsKnown === false ? 'losses unknown (reads disabled)' : summary.deaths + ' observed/inferred losses') + time + '; official result unknown.';
-  }
-  const time = minutes > 0 ? '，打了约 ' + minutes + ' 分钟' : '';
-  return '🏁 已离开战局：观测累计 ' + (summary.killsKnown === false ? '击毁未知(战果日志读取关闭)' : summary.kills + ' 杀') + ' ' + (summary.deathsKnown === false ? '阵亡未知(读取关闭)' : summary.deaths + ' 次阵亡/指标失效推断') + time + '；未取得官方胜负结算,仅供复盘。';
+  const time = minutes > 0 ? (lang === 'en' ? ' · ' + minutes + ' min' : ' · ' + minutes + ' 分钟') : '';
+  const kills = summary.killsKnown === false ? (lang === 'en' ? 'kills unknown' : '击杀未知') : summary.kills + (lang === 'en' ? 'K' : ' 杀');
+  const deaths = summary.deathsKnown === false ? (lang === 'en' ? 'deaths unknown' : '阵亡未知') : summary.deaths + (lang === 'en' ? 'D' : ' 死');
+  return (lang === 'en' ? 'Left battle: ' : '🏁 离场：') + kills + ' / ' + deaths + time;
 }
 
 export function readyText(online: boolean | null, kbCount: number, lang: Lang): string {
-  if (lang === 'en') {
-    const state = online === null ? 'telemetry not sampled yet' : online ? 'local telemetry reachable' : 'local telemetry offline (game not running?)';
-    return 'War Thunder companion ready: ' + state + ', ' + kbCount + ' entries in the knowledge base.';
-  }
-  const state = online === null ? '遥测尚未采样' : online ? '遥测已连上' : '遥测没连上（游戏没开？）';
-  return '🐯 战争雷霆百科就位：' + state + '，知识库 ' + kbCount + ' 条。问我概念、载具或打法都行。';
+  const state = online === null ? (lang === 'en' ? 'not sampled' : '遥测未采样') : online ? (lang === 'en' ? 'telemetry online' : '遥测在线') : (lang === 'en' ? 'telemetry offline' : '遥测离线');
+  return (lang === 'en' ? 'Ready: ' : '🐯 就位：') + state + ' · ' + (lang === 'en' ? kbCount + ' entries' : '知识库 ' + kbCount + ' 条');
 }
 
-/** 交给模型改写时的素材包装:先钉住数字,再给口吻要求。 */
 export function personaWrap(material: string, instruction: string, lang: Lang): string {
   if (lang === 'en') {
     return [
@@ -310,4 +315,253 @@ export function chatDraftHint(target: string, degraded: boolean, lang: Lang): st
   return (degraded ? "（模型通道关着或额度用完了，这句来自内置短语表）\n" : "") +
     "自己复制到游戏聊天框发送：桌宠只读遥测、只输出文本，不代发、不注入、不碰鼠标。" +
     "目标语言：" + label + "。";
+}
+
+/** 自身在地图端点里的读数坐标；量纲随地图变，只当报点参考。 */
+export function positionLine(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  const wx = snapshot.worldX;
+  const wy = snapshot.worldY;
+  if (typeof wx === 'number' && typeof wy === 'number' && Number.isFinite(wx) && Number.isFinite(wy)) {
+    const col = snapshot.gridCol;
+    const row = snapshot.gridRow;
+    const cell = typeof col === 'number' && typeof row === 'number' && Number.isFinite(col) && Number.isFinite(row)
+      ? ' · ' + gridLabel(col, row, zh)
+      : '';
+    return 'X ' + wx + ' / Y ' + wy + (zh ? ' m' : ' m') + cell;
+  }
+  const x = snapshot.selfX;
+  const y = snapshot.selfY;
+  if (typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y)) {
+    return (zh ? '地图 ' + Math.round(x) + '/' + Math.round(y) : 'map ' + Math.round(x) + '/' + Math.round(y)) + (zh ? '(未换算出世界坐标)' : ' (raw)');
+  }
+  return zh ? '未读到(地图端点没有自身标记)' : 'map marker unavailable';
+}
+
+/** 播报长度档位：详细、重点、简略、自定义。 */
+export type BroadcastLength = 'full' | 'key' | 'brief' | 'custom';
+
+/** 各档位的内置上限（字符）。full 不截断，custom 用配置值。 */
+const LENGTH_LIMIT: Record<BroadcastLength, number> = { full: 0, key: 160, brief: 60, custom: 160 };
+
+/**
+ * 本次播报的实际字数上限。
+ *
+ * 「长度上限」栏填了正数就覆盖档位内置值，填 0 表示按档位走（详细不限 / 重点 160 / 简略 60 /
+ * 自定义 160）。0.4.3 之前只有自定义档能吃这个数字，选简略却仍被 160 字框住。
+ */
+export function lengthLimit(mode: BroadcastLength, customMax: number): number {
+  // 详细档就是「全量」，不接受字数覆盖：它存在的意义是给手动查询与复盘留完整素材。
+  if (mode === 'full') return 0;
+  const raw = Math.round(customMax);
+  if (raw > 0) return Math.min(500, Math.max(20, raw));
+  return LENGTH_LIMIT[mode];
+}
+
+/** 简略档：模板只报骨架（载具与敌我），细节留给手动查询。 */
+function isTerse(mode: BroadcastLength): boolean {
+  return mode === 'brief' || mode === 'custom';
+}
+
+/**
+ * 按档位裁剪播报正文。
+ *
+ * 只在句子边界截断并补省略号：数字、单位与括号限定都可能被拦腰切断，
+ * 一旦切断就变成错误读数。完整事实块不进这里，它留在事件的 meta.factText 里。
+ */
+export function clampBroadcast(text: string, mode: BroadcastLength, customMax: number): string {
+  const limit = lengthLimit(mode, customMax);
+  if (!limit || text.length <= limit) return text;
+  const parts = text.split(/(?<=[。！？；\n])/u);
+  let out = '';
+  for (const part of parts) {
+    if ((out + part).length > limit) break;
+    out += part;
+  }
+  if (!out.trim()) out = text.slice(0, Math.max(1, limit - 1));
+  return out.trimEnd() + '…';
+}
+
+/** 客户端图标名的中文对照；没收录的原样返回。 */
+const ICON_LABELS: Record<string, string> = {
+  Player: '自己',
+  MediumTank: '中坦',
+  HeavyTank: '重坦',
+  LightTank: '轻坦',
+  TankDestroyer: '坦歼',
+  SPAA: '防空',
+  AirCraft: '飞机',
+  Airfield: '机场',
+  Bomber: '轰炸机',
+  Fighter: '战斗机',
+  Attacker: '攻击机',
+  Helicopter: '直升机',
+  Ship: '舰船',
+  TorpedoBoat: '鱼雷艇',
+};
+
+/** 图标名换成中文；未知图标保留原名，不猜。 */
+export function iconLabel(icon: string): string {
+  return ICON_LABELS[icon] ?? icon;
+}
+
+/**
+ * 附近敌我一行。
+ *
+ * 半径来自配置（默认 500 m，陆战历史模式的常见交战距离）。地图端点只给归一化坐标，
+ * 必须先由 /map_info.json 的 map_min/map_max 换成米，缺任一参数就只能报"未读到"，
+ * 不拿全场敌我数冒充附近。
+ */
+export function nearbyLine(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  const nearby = snapshot.nearby;
+  if (!nearby) {
+    return zh ? '附近 未读到(缺自身坐标或地图参数)' : 'nearby unavailable';
+  }
+  const head = zh
+    ? nearby.radiusM + ' m 内：' + nearby.enemies + ' 敌 / ' + nearby.allies + ' 友 / ' + nearby.points + ' 点'
+    : 'within ' + nearby.radiusM + ' m: ' + nearby.enemies + 'E / ' + nearby.allies + 'F / ' + nearby.points + ' marks';
+  const list = recentContacts(snapshot, 3);
+  if (list.length === 0) return head;
+  return head + (zh ? ' · 最近 ' : ' · nearest ') + list.map((item) => contactLabel(item, zh)).join(zh ? '；' : ', ');
+}
+
+/** 半径内最近的几条目标（跳过 5 m 以内的自身镜像噪点），按距离升序。 */
+function recentContacts(snapshot: BattleSnapshot, limit: number): NonNullable<BattleSnapshot['contacts']> {
+  return (snapshot.contacts ?? []).filter((item) => item.distM > 5).slice(0, limit);
+}
+
+/**
+ * 相对车头的方位读法。正负对应哪一侧取决于客户端 y 轴朝向（尚未定标），
+ * 所以这里只给前后与偏角，不写左/右，避免报错边。
+ */
+export function bearingLabel(deg: number, zh: boolean): string {
+  const a = Math.abs(deg);
+  if (a <= 20) return zh ? '正前' : 'ahead';
+  if (a <= 70) return zh ? '前偏 ' + a + '°' : a + '° fore';
+  if (a <= 110) return zh ? '侧方 ' + a + '°' : a + '° beam';
+  if (a <= 160) return zh ? '后偏 ' + a + '°' : a + '° aft';
+  return zh ? '正后' : 'astern';
+}
+
+/** 单条目标的读法：阵营 + 图标 + 距离 + 方位 + 格号（缺哪项省哪项）。 */
+function contactLabel(item: NonNullable<BattleSnapshot['contacts']>[number], zh: boolean): string {
+  const side = item.side === 'enemy'
+    ? (zh ? '敌' : 'enemy')
+    : item.side === 'ally' ? (zh ? '友' : 'ally') : (zh ? '点' : 'mark');
+  const brg = typeof item.bearingDeg === 'number' ? ' ' + bearingLabel(item.bearingDeg, zh) : '';
+  const cell = typeof item.col === 'number' && typeof item.row === 'number' ? ' ' + gridLabel(item.col, item.row, zh) : '';
+  return side + ' ' + iconLabel(item.icon) + ' ' + item.distM + ' m' + brg + cell;
+}
+
+/** 最近的几个目标，最多三条；距离由近到远。 */
+export function contactsLine(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  const list = recentContacts(snapshot, 3);
+  if (list.length === 0) return '';
+  const items = list.map((item) => contactLabel(item, zh));
+  return (zh ? '最近目标：' : 'nearest: ') + items.join(zh ? '、' : ', ');
+}
+
+/** /indicators 的 army 只有 tank / air 两种，翻成中文给播报用。 */
+export function armyLabel(army: string, lang: Lang): string {
+  const zh = lang !== 'en';
+  if (army === 'tank') return zh ? '陆战' : 'ground';
+  if (army === 'ship') return zh ? '海战' : 'naval';
+  if (army === 'air') return zh ? '空战' : 'air';
+  return army;
+}
+
+/**
+ * 战局态势一行：图上敌我 + 本局目标（占点）。
+ *
+ * 8111 没有服务端记分板：/mission.json 的 objectives 真机多数时候是 null。
+ * 占领信息只能按需截图 OCR（wt_vision_probe），没采过就写"未采集"，
+ * 不能拿图上单位数冒充占点情况。
+ */
+export function situationLine(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  const bits: string[] = [
+    zh ? '图上 ' + snapshot.enemies + ' 敌 / ' + snapshot.allies + ' 友' : snapshot.enemies + 'E / ' + snapshot.allies + 'F on map',
+  ];
+  if (snapshot.points !== undefined && snapshot.points > 0) {
+    bits.push((zh ? '目标点 ' : 'objective marks ') + snapshot.points);
+  }
+  const objectives = snapshot.objectives;
+  if (objectives && objectives.length > 0) {
+    const text = objectives.slice(0, 3).map((item) => clip(item, 32)).join(' / ');
+    bits.push((zh ? '目标 ' : 'objectives ') + text);
+  } else if (snapshot.zoneHints && snapshot.zoneHints.length > 0) {
+    bits.push((zh ? '占点 ' : 'capture ') + clip(snapshot.zoneHints[0] as string, 32));
+  } else {
+    bits.push(zh ? '占点 未采集' : 'capture points not scanned');
+  }
+  return bits.join(' · ');
+}
+
+/**
+ * 列号转字母：0→A、25→Z、26→AA。
+ *
+ * 0.4.7 及以前写死 'ABCDEFGH'，但真机陆战图 map 0..4096、grid_steps 225，
+ * 一列一格就有 18 列，第 9 列起会掉成数字（"格 12 3"），与游戏内小地图的字母完全对不上。
+ * 格数是地图属性，不是常量，所以按需要展开，不在 8 列处截断。
+ */
+export function gridLetters(col: number): string {
+  if (!Number.isFinite(col) || col < 0) return String(col);
+  let n = Math.floor(col);
+  let out = '';
+  for (;;) {
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+    if (n < 0) break;
+  }
+  return out;
+}
+
+/**
+ * 行号转小写字母：0→a、25→z、26→aa。
+ *
+ * 游戏内小地图的轴标是「横向 1..7 数字、纵向 a..g 小写字母」，与列号字母正好相反；
+ * 0.4.8 及以前按「列字母 + 行数字」输出（格 C1），和玩家在图上看到的读法对不上。
+ */
+export function gridRowLetters(row: number): string {
+  if (!Number.isFinite(row) || row < 0) return String(row);
+  let n = Math.floor(row);
+  let out = '';
+  for (;;) {
+    out = String.fromCharCode(97 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+    if (n < 0) break;
+  }
+  return out;
+}
+
+/** 格号按小地图轴标写：横向列用 1 起的数字，纵向行用 a 起的小写字母（如 格 4c）。 */
+export function gridLabel(col: number, row: number, zh: boolean): string {
+  return (zh ? '格 ' : 'grid ') + (Math.floor(col) + 1) + gridRowLetters(row);
+}
+
+/**
+ * 载具状态一行：车组、待发弹、档位、稳定器、转速。
+ *
+ * 只报 /indicators 真给了的字段：/state 在实战里经常只回 {"valid":false}，
+ * 那时速度高度都读不到，能拿到的"载具状态"就是这些。
+ */
+export function vehicleStateLine(snapshot: BattleSnapshot, lang: Lang): string {
+  const zh = lang !== 'en';
+  const s = snapshot.vehicleState;
+  const bits: string[] = [];
+  if (s) {
+    if (s.crewCurrent !== undefined && s.crewTotal !== undefined) bits.push((zh ? '车组 ' : 'crew ') + Math.round(s.crewCurrent) + '/' + Math.round(s.crewTotal));
+    if (s.ammo !== undefined) bits.push((zh ? '待发弹 ' : 'ready ammo ') + Math.round(s.ammo));
+    if (s.gear !== undefined && s.gear > 0) bits.push((zh ? '档位 ' : 'gear ') + Math.round(s.gear));
+    if (s.stabilizer !== undefined) bits.push((zh ? '稳定器 ' : 'stabilizer ') + (s.stabilizer ? (zh ? '开' : 'on') : (zh ? '关' : 'off')));
+    if (s.rpm !== undefined) bits.push((zh ? '转速 ' : 'rpm ') + Math.round(s.rpm));
+  }
+  if (bits.length === 0) {
+    const readings = snapshot.readings;
+    if (readings && readings.speed.value !== null && readings.speed.unit === 'km/h') bits.push(readings.speed.kind + ' ' + Math.round(readings.speed.value) + ' km/h');
+    if (readings && readings.altitude.value !== null && readings.altitude.unit === 'm') bits.push('H ' + Math.round(readings.altitude.value) + ' m');
+  }
+  return bits.length > 0 ? bits.join(' · ') : (zh ? '未读到载具状态' : 'vehicle state unavailable');
 }

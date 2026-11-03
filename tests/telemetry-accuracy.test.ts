@@ -31,7 +31,7 @@ function rig() {
     return new Response(JSON.stringify(routes[path] ?? {}), { headers: { 'content-type': 'application/json; charset=utf-8' } });
   };
   const client = new BattleClient({ host: '127.0.0.1', port: 8111, fetchImpl });
-  const watcher = new BattleWatcher({ client, now: () => now, playerName: 'Ace' });
+  const watcher = new BattleWatcher({ inferDeathFromIndicators: true, client, now: () => now, playerName: 'Ace' });
   return { routes, client, watcher, fetchImpl, now: () => now, tick: (ms = 1500) => { now += ms; } };
 }
 const row = (id: number, time: number, msg: string) => ({ id, time, msg, type: '', sender: '' });
@@ -39,7 +39,7 @@ const row = (id: number, time: number, msg: string) => ({ id, time, msg, type: '
 describe('实战入场占位数据', () => {
   it.each([true, false])('占位与feed同拍=%s 时，真实重生后的新失效边沿仍可计数', async (samePoll) => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'] = { events: [], damage: [row(1, 101, 'Bob destroyed Ace')] };
+    r.routes['/hudmsg'] = { events: [], damage: [row(1, 101, 'Bob destroyed Ace (M4A1)')] };
     if (samePoll) r.routes['/indicators'] = { valid: true, type: 'dummy_plane' };
     r.tick(); await r.watcher.poll();
     expect(r.watcher.tally.deaths).toBe(1);
@@ -106,33 +106,33 @@ describe('8111 attribution and replay fidelity', () => {
     expect(isSelfKill({ killer: '[SQ] Ace', victim: 'Bob' }, 'Ace')).toBe(true);
   });
   it('does not split an English verb inside a player name', () => {
-    expect(parseKillLine('NotDestroyedAce destroyed Bob')).toEqual({ killer: 'NotDestroyedAce', victim: 'Bob' });
+    expect(parseKillLine('NotDestroyedAce destroyed Bob (M4A1)')).toMatchObject({ killer: 'NotDestroyedAce', victim: 'Bob', victimTagged: true });
   });
   it('uses explicit time rather than adjacent IDs for distinct kills', () => {
-    expect(computeSelfKills([row(1, 10, 'Ace destroyed Bob'), row(2, 60, 'Ace destroyed Bob')], { afterId: -1, playerName: 'Ace' })).toHaveLength(2);
+    expect(computeSelfKills([row(1, 10, 'Ace destroyed Bob (M4A1)'), row(2, 60, 'Ace destroyed Bob (M4A1)')], { afterId: -1, playerName: 'Ace' })).toHaveLength(2);
   });
   it('counts a new same-pair kill after the full feed window slides', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(100, 100, 'Ace destroyed Bob')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(200, 200, 'Ace destroyed Bob')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(100, 100, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(200, 200, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
     expect(r.watcher.tally.kills).toBe(2);
   });
   it('counts a same-pair event after server IDs and time restart', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(100, 100, 'Ace destroyed Bob')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed Bob')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(100, 100, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
     expect(r.watcher.tally.kills).toBe(2);
   });
   it('applies kills and deaths in the original feed order', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(10, 20, 'Ace destroyed Bob'), row(11, 21, 'Enemy destroyed Ace'), row(20, 40, 'Ace destroyed Carol'), row(30, 60, 'Ace destroyed Dave')];
+    r.routes['/hudmsg'].damage = [row(10, 20, 'Ace destroyed Bob (M4A1)'), row(11, 21, 'Enemy destroyed Ace (M4A1)'), row(20, 40, 'Ace destroyed Carol (M4A1)'), row(30, 60, 'Ace destroyed Dave (M4A1)')];
     const events = await r.watcher.poll();
     expect(events.filter(x => x.kind === 'kill' || x.kind === 'death').map(x => x.kind)).toEqual(['kill', 'death', 'kill', 'kill']);
     expect(r.watcher.tally).toEqual({ kills: 3, deaths: 1, bestStreak: 2 });
   });
   it('does not re-arm from a stale true indicator in the feed-death sample', async () => {
     const r = rig(); await r.watcher.poll(); r.tick();
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Enemy destroyed Ace')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Enemy destroyed Ace (M4A1)')]; await r.watcher.poll();
     r.tick(); r.routes['/indicators'] = { valid: false }; await r.watcher.poll();
     expect(r.watcher.tally.deaths).toBe(1);
     r.tick(); r.routes['/indicators'] = { valid: true }; await r.watcher.poll();
@@ -146,20 +146,20 @@ describe('8111 attribution and replay fidelity', () => {
   });
   it('does not end a match or reset the tally just because telemetry disconnects', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
     r.routes.offline = true; expect(await r.watcher.poll()).toEqual([]);
     r.routes.offline = false; await r.watcher.poll();
     expect(r.watcher.tally.kills).toBe(1);
   });
   it('does not replay a previously seen older subset as a new server epoch', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed Bob'), row(100, 100, 'Ace destroyed Carol')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed Bob')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed Bob (M4A1)'), row(100, 100, 'Ace destroyed Carol (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
     expect(r.watcher.tally.kills).toBe(2);
   });
   it('keeps match state when only indicators is available', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
     r.routes.failPaths = ['/state', '/mission.json', '/map_info.json', '/map_obj.json'];
     expect(await r.watcher.poll()).toEqual([]);
     r.routes.failPaths = []; await r.watcher.poll(); expect(r.watcher.tally.kills).toBe(1);
@@ -167,14 +167,14 @@ describe('8111 attribution and replay fidelity', () => {
   it('still breaks the chronological streak when a feed death confirms an earlier indicator inference', async () => {
     const r = rig(); await r.watcher.poll(); r.tick();
     r.routes['/indicators'] = { valid: false }; await r.watcher.poll(); r.tick();
-    r.routes['/hudmsg'].damage = [row(10, 10, 'Ace destroyed Bob'), row(11, 11, 'Enemy destroyed Ace')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(10, 10, 'Ace destroyed Bob (M4A1)'), row(11, 11, 'Enemy destroyed Ace (M4A1)')]; await r.watcher.poll();
     r.tick(); r.routes['/indicators'] = { valid: true }; await r.watcher.poll();
-    r.tick(); r.routes['/hudmsg'].damage.push(row(20, 30, 'Ace destroyed Carol')); await r.watcher.poll();
+    r.tick(); r.routes['/hudmsg'].damage.push(row(20, 30, 'Ace destroyed Carol (M4A1)')); await r.watcher.poll();
     expect(r.watcher.tally).toEqual({ kills: 2, deaths: 1, bestStreak: 1 });
   });
   it('does not hold the feed-first invalid latch across arbitrarily long valid observations', async () => {
     const r = rig(); await r.watcher.poll(); r.tick();
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Enemy destroyed Ace')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Enemy destroyed Ace (M4A1)')]; await r.watcher.poll();
     r.tick(10000); await r.watcher.poll();
     r.tick(); r.routes['/indicators'] = { valid: false }; await r.watcher.poll();
     expect(r.watcher.tally.deaths).toBe(2);
@@ -182,22 +182,22 @@ describe('8111 attribution and replay fidelity', () => {
   it('does not erase post-death kills when an older death confirmation arrives late', async () => {
     const r = rig(); await r.watcher.poll(); r.tick(); r.routes['/indicators'] = { valid: false }; await r.watcher.poll();
     r.tick(); r.routes['/indicators'] = { valid: true }; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(10, 20, 'Ace destroyed Bob')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage.unshift(row(1, 10, 'Enemy destroyed Ace')); await r.watcher.poll();
-    r.routes['/hudmsg'].damage.push(row(20, 30, 'Ace destroyed Carol')); await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(10, 20, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage.unshift(row(1, 10, 'Enemy destroyed Ace (M4A1)')); await r.watcher.poll();
+    r.routes['/hudmsg'].damage.push(row(20, 30, 'Ace destroyed Carol (M4A1)')); await r.watcher.poll();
     expect(r.watcher.tally).toEqual({ kills: 2, deaths: 1, bestStreak: 2 });
   });
   it('retains the cross-response dedupe anchor when an old subset is replayed', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob'), row(100, 100, 'Other destroyed Carol')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(2, 11, 'Ace destroyed Bob')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob (M4A1)'), row(100, 100, 'Other destroyed Carol (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(2, 11, 'Ace destroyed Bob (M4A1)')]; await r.watcher.poll();
     expect(r.watcher.tally.kills).toBe(1);
   });
   it('keeps new low-ID kills after old deaths in a restarted feed segment', async () => {
     const r = rig(); await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(90, 90, 'Ace destroyed OldTarget'), row(100, 100, 'Enemy destroyed Ace')]; await r.watcher.poll();
-    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed NewTarget')];
+    r.routes['/hudmsg'].damage = [row(90, 90, 'Ace destroyed OldTarget (M4A1)'), row(100, 100, 'Enemy destroyed Ace (M4A1)')]; await r.watcher.poll();
+    r.routes['/hudmsg'].damage = [row(1, 1, 'Ace destroyed NewTarget (M4A1)')];
     const events = await r.watcher.poll();
     expect(events.find(x => x.kind === 'kill')).toMatchObject({ streak: 1 });
     expect(r.watcher.tally).toEqual({ kills: 2, deaths: 1, bestStreak: 1 });
@@ -212,12 +212,12 @@ describe('8111 readings and Coopanion-facing facts', () => {
   });
   it('does not assign km/h to a unitless indicators.speed value', async () => {
     const r = rig(); await r.watcher.refresh(); const text = battleLine(r.watcher.currentSnapshot, 'zh');
-    expect(text).toContain('100'); expect(text).toContain('单位未确认'); expect(text).not.toContain('100 km/h');
+    expect(text).toContain('100'); expect(text).toContain('未确认单位'); expect(text).not.toContain('100 km/h');
   });
   it('does not infer the game mode from zero visible enemy objects', async () => {
     const r = rig(); r.routes['/map_obj.json'] = [{ type: 'tank', color: '23,77,255' }];
     await r.watcher.refresh(); const text = battleLine(r.watcher.currentSnapshot, 'zh');
-    expect(text).toContain('0 敌'); expect(text).not.toContain('该模式');
+    expect(text).not.toContain('0 敌'); expect(text).not.toContain('该模式');
   });
   it('never invents the first kill when cheer is requested at zero kills', async () => {
     const r = await worldRig(); const text = await r.call('wt_commentary', { mode: 'cheer' });
@@ -276,14 +276,14 @@ describe('8111 readings and Coopanion-facing facts', () => {
     const r = await worldRig(); (r.cfg as any).llmMode = 'host'; let calls = 0;
     (r.host as any).cognition = { request: async () => { calls++; return { text: '速度100 km/h,本局100杀,这局赢了！' }; } };
     const text = await r.call('wt_commentary');
-    expect(text).toContain('单位未确认'); expect(text).not.toContain('100杀'); expect(text).not.toContain('赢了'); expect(calls).toBe(0);
+    expect(text).toContain('未确认单位'); expect(text).not.toContain('100杀'); expect(text).not.toContain('赢了'); expect(calls).toBe(0);
   });
   it('discards an old identity poll that finishes after a hot nickname change', async () => {
     const r = await worldRig(); await (r.world as any).pollOnce(); await Promise.resolve(); r.host.events = [];
     let release!: () => void; let started!: () => void;
     const entered = new Promise<void>(resolve => { started = resolve; });
     r.routes.hudGate = new Promise<void>(resolve => { release = resolve; }); r.routes.onHud = started;
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob')];
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob (M4A1)')];
     const oldPoll = (r.world as any).pollOnce(); await entered;
     r.cfg.playerName = 'Bob'; await r.call('wt_battle_state');
     release(); await oldPoll; await Promise.resolve();
@@ -294,7 +294,7 @@ describe('8111 readings and Coopanion-facing facts', () => {
     let release!: () => void; let started!: () => void;
     const entered = new Promise<void>(resolve => { started = resolve; });
     r.routes.hudGate = new Promise<void>(resolve => { release = resolve; }); r.routes.onHud = started;
-    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob')];
+    r.routes['/hudmsg'].damage = [row(1, 10, 'Ace destroyed Bob (M4A1)')];
     const oldPoll = (r.world as any).pollOnce(); await entered;
     r.cfg.playerName = 'Bob'; release(); await oldPoll; await Promise.resolve();
     expect(r.host.events.some(x => x.type === 'wt.kill')).toBe(false);

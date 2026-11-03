@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { spawn as spawnChild } from 'node:child_process';
-import { ensureVisionScript, extractVisionHints, probeVision, visionScriptPath } from '../src/vision.ts';
+import { ensureVisionScript, extractVisionHints, extractZoneHints, probeVision, visionScriptPath } from '../src/vision.ts';
 
 let dir: string;
 beforeEach(() => {
@@ -118,5 +118,22 @@ describe('从 OCR 文本里挑线索', () => {
 
   it('空文本返回空数组', () => {
     expect(extractVisionHints('')).toEqual([]);
+  });
+});
+
+describe('占领线索只取画面里的占领行', () => {
+  it('挑出占领与防守行，滤掉普通播报', () => {
+    const text = ['占领 A 点 60%', '你击毁了 T-62', '敌方正在占领 C 点', '得分 1200', '据点已夺回'].join('\n');
+    expect(extractZoneHints(text)).toEqual(['占领 A 点 60%', '敌方正在占领 C 点', '据点已夺回']);
+  });
+
+  it('去重、限流并丢弃过长行', () => {
+    const long = '占领'.repeat(40);
+    const text = ['占领 A 点', '占领 A 点', long, '防守 B 点'].join('\n');
+    expect(extractZoneHints(text, 2)).toEqual(['占领 A 点', '防守 B 点']);
+  });
+
+  it('没有占领词就返回空数组', () => {
+    expect(extractZoneHints('你击毁了 T-62\n得分 1200')).toEqual([]);
   });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   battleLine,
+  clampBroadcast,
   behindText,
   chatBlock,
   chatDelegated,
@@ -75,63 +76,64 @@ describe('词条文案', () => {
 });
 
 describe('战局文案', () => {
-  it('battleLine 把速度高度与敌我数量拼成一行', () => {
+  it('battleLine 只报载具与状态读数，敌我不进默认播报', () => {
     const line = battleLine(snapshot, 'zh');
     expect(line).toContain('P-51D-30 野马');
-    expect(line).toContain('速度 412 km/h');
-    expect(line).toContain('高度 1831 m');
-    expect(line).toContain('地图可见 3 敌 / 2 友');
+    expect(line).toContain('412 km/h');
+    expect(line).toContain('H 1831 m');
+    expect(line).toContain('过载');
+    expect(line).not.toContain('图上');
   });
 
   it('读数全空时给出明确占位,不是空串', () => {
-    expect(battleLine(empty, 'zh')).toBe('载具数据还没读全');
-    expect(battleLine(empty, 'en')).toBe('unknown vehicle');
+    expect(battleLine(empty, 'zh')).toBe('载具未知 · 速度未读到 · 高度未读到 · 过载未读到');
+    expect(battleLine(empty, 'en')).toBe('unknown vehicle · speed unavailable · altitude unavailable · load unavailable');
   });
 
   it('killText 按连击分档', () => {
-    expect(killText(1, 1, '', 'zh')).toContain('击毁一个');
-    expect(killText(2, 2, '', 'zh')).toContain('两连击');
-    expect(killText(3, 3, '', 'zh')).toContain('连拿 3 个');
-    expect(killText(6, 5, '', 'zh')).toContain('五连以上');
+    expect(killText(1, 1, '', 'zh')).toContain('本局第 1');
+    expect(killText(2, 2, '', 'zh')).toContain('本局第 2');
+    expect(killText(3, 3, '', 'zh')).toContain('3 连');
+    expect(killText(6, 5, '', 'zh')).toContain('5 连');
     expect(killText(4, 4, '击毁 T-34', 'zh')).toContain('击毁 T-34');
   });
 
   it('deathText 在多次阵亡后换措辞', () => {
-    expect(deathText(1, 'zh')).toContain('别上头');
-    expect(deathText(3, 'zh')).toContain('第 3 次');
+    expect(deathText(1, 'zh')).toContain('阵亡');
+    expect(deathText(3, 'zh')).toContain('本局第 3');
   });
 
   it('behindText 同时报击杀与阵亡数', () => {
     const text = behindText(2, 5, 'zh');
     expect(text).toContain('2 杀 5 死');
-    expect(text).toContain('逆风');
+    expect(text).toContain('放稳一点');
   });
 
   it('enterText / commentaryText 复用读数', () => {
-    expect(enterText(snapshot, 'zh')).toContain('进战局了');
-    expect(commentaryText(snapshot, 'zh')).toContain('战况');
-    expect(commentaryText(snapshot, 'zh')).toContain('速度 412 km/h');
+    expect(enterText(snapshot, 'zh')).toContain('进战局');
+    expect(commentaryText(snapshot, 'zh')).toContain('📡');
+    expect(commentaryText(snapshot, 'zh')).toContain('412 km/h');
   });
 
   it('resultText 报观测累计,不以KD臆断胜负或收益', () => {
     const win: BattleSummary = { vehicle: 'P-51', kills: 4, deaths: 2, seconds: 620 };
     const even: BattleSummary = { vehicle: 'P-51', kills: 3, deaths: 3, seconds: 300 };
     const lose: BattleSummary = { vehicle: 'P-51', kills: 1, deaths: 4, seconds: 0 };
-    expect(resultText(win, 'zh')).toContain('观测累计 4 杀');
-    expect(resultText(win, 'zh')).toContain('打了约 10 分钟');
-    expect(resultText(even, 'zh')).toContain('未取得官方胜负结算');
-    expect(resultText(lose, 'zh')).toContain('未取得官方胜负结算');
+    expect(resultText(win, 'zh')).toContain('4 杀');
+    expect(resultText(win, 'zh')).toContain('10 分钟');
+    expect(resultText(even, 'zh')).toContain('离场');
+    expect(resultText(lose, 'zh')).not.toContain('胜');
   });
 
   it('readyText 未采样时不声称在线或离线', () => {
-    expect(readyText(null, 53, 'zh')).toContain('遥测尚未采样');
-    expect(readyText(null, 53, 'en')).toContain('telemetry not sampled yet');
+    expect(readyText(null, 53, 'zh')).toContain('遥测未采样');
+    expect(readyText(null, 53, 'en')).toContain('not sampled');
   });
 
   it('readyText 分在线与离线两种说法', () => {
-    expect(readyText(true, 53, 'zh')).toContain('遥测已连上');
+    expect(readyText(true, 53, 'zh')).toContain('遥测在线');
     expect(readyText(true, 53, 'zh')).toContain('知识库 53 条');
-    expect(readyText(false, 53, 'zh')).toContain('遥测没连上');
+    expect(readyText(false, 53, 'zh')).toContain('遥测离线');
   });
 
   it('degradeNote 标注降级原因', () => {
@@ -211,5 +213,59 @@ describe('对局聊天文案', () => {
     expect(chatDraftDelegated('nice shot', 'zh', 'en')).toContain('nice shot');
     expect(chatDraftHint('en', true, 'zh')).toContain('内置短语表');
     expect(chatDraftHint('en', false, 'zh')).toContain('不代发');
+  });
+});
+
+describe('陆战读数：车组与弹药代替速度高度', () => {
+  it('速度原始值是无意义矢量时不显示「仪表 -14」', () => {
+    const tank: BattleSnapshot = {
+      vehicle: 'us_hstv_l', mode: '', army: 'tank', speed: 0, altitude: 0, enemies: 7, allies: 0,
+      readings: {
+        speed: { value: -14, kind: 'IAS', unit: 'unconfirmed', source: '/indicators' },
+        altitude: { value: null, unit: 'm', source: '/state' },
+        mapKnown: true,
+        observedAt: 1,
+      },
+      vehicleState: { crewCurrent: 3, crewTotal: 3, gear: 1, ammo: 20, stabilizer: true, rpm: 2675 },
+    };
+    const line = battleLine(tank, 'zh');
+    expect(line).toContain('us_hstv_l');
+    expect(line).toContain('速度未读到');
+    expect(line).not.toContain('仪表');
+    expect(line).not.toContain('车组');
+    const commentary = commentaryText(tank, 'zh');
+    expect(commentary).toContain('速度未读到');
+    expect(commentary).not.toContain('车组');
+  });
+});
+
+describe('播报长度档位', () => {
+  const long = '第一句话在这里。'.repeat(30);
+  it('详细档不裁剪', () => {
+    expect(clampBroadcast(long, 'full', 20)).toBe(long);
+  });
+  it('重点档在上限处截断，简略档更短', () => {
+    const key = clampBroadcast(long, 'key', 0);
+    const brief = clampBroadcast(long, 'brief', 0);
+    expect(key.endsWith('…')).toBe(true);
+    expect(key.length).toBeLessThanOrEqual(162);
+    expect(brief.length).toBeLessThan(key.length);
+  });
+  it('字数上限覆盖各档内置值（详细档除外）', () => {
+    expect(clampBroadcast(long, 'key', 0).length).toBeLessThanOrEqual(162);
+    expect(clampBroadcast(long, 'key', 400).length).toBeGreaterThan(200);
+    expect(clampBroadcast(long, 'brief', 200).length).toBeGreaterThan(100);
+    expect(clampBroadcast(long, 'full', 40)).toBe(long);
+  });
+  it('自定义档用配置上限并夹在 20 至 500 之间', () => {
+    expect(clampBroadcast('短句。', 'custom', 20)).toBe('短句。');
+    const clamped = clampBroadcast(long, 'custom', 12);
+    expect(clamped.length).toBeLessThanOrEqual(30);
+    expect(clamped).not.toBe(long);
+  });
+  it('不切断数字与括号限定', () => {
+    const text = '击毁 2 · 阵亡 1 · 得分 未知(8111 不提供)。下一句。';
+    const out = clampBroadcast(text, 'brief', 160);
+    expect(out).toContain('8111 不提供');
   });
 });

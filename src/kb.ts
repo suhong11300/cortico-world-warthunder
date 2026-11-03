@@ -1,10 +1,10 @@
 import { mkdirSync, openSync, closeSync, fstatSync, readSync, writeSync, fsyncSync, renameSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { fetchGuarded } from './guard.ts';
+import { fetchGuarded, normalizeKbSource } from './guard.ts';
 import { join } from 'node:path';
 import { KB_SEED, KB_SEED_VERSION } from './kb-seed.ts';
 import type { KbEntry, KbKind } from './kb-types.ts';
-import { resolveKbLimits, checkKbBudget, preflightKbJson, type KbLimitInput } from './kb-limits.ts';
+import { resolveKbLimits, checkKbBudget, preflightKbJson, type KbLimitInput, type KbLimits } from './kb-limits.ts';
 export { resolveKbLimits, KB_MAX_BYTES, KB_MAX_ENTRIES, type KbLimitInput } from './kb-limits.ts';
 
 /** 知识库落在 <dataDir>/wt/kb.json 的内容,只有远程更新成功才写。 */
@@ -104,10 +104,21 @@ export function writeKbFile(dataDir: string, file: KbFile, input?: KbLimitInput)
 /** 远程同 id 覆盖内置,远程独有的追加在后面。 */
 export function mergeKb(remote: KbEntry[] | null): KbEntry[] {
   if (!remote || remote.length === 0) return KB_SEED.slice();
-  const byId = new Map<string, KbEntry>();
-  for (const entry of KB_SEED) byId.set(entry.id, entry);
-  for (const entry of remote) byId.set(entry.id, entry);
-  return [...byId.values()];
+  // 名字归一化：AI 整理的「虎式 H1」与内置「虎式H1」是同一个东西，不能并存两条。
+  const keyOf = (entry: KbEntry): string => entry.kind + '|' + entry.name.replace(/[\s\u3000]+/g, '').toLowerCase();
+  const merged: KbEntry[] = KB_SEED.slice();
+  const idIndex = new Map<string, number>();
+  merged.forEach((entry, index) => idIndex.set(entry.id, index));
+  const appended: KbEntry[] = [];
+  for (const entry of remote) {
+    const at = idIndex.get(entry.id);
+    if (at !== undefined) merged[at] = entry;
+    else appended.push(entry);
+  }
+  const byKey = new Map<string, KbEntry>();
+  for (const entry of merged) byKey.set(keyOf(entry), entry);
+  for (const entry of appended) byKey.set(keyOf(entry), entry);
+  return [...byKey.values()];
 }
 
 export function kbView(file: KbFile | null, loadError?: string): KbView {
@@ -291,6 +302,80 @@ export interface FetchKbOptions {
   allowPrivate?: boolean;
   limits?: KbLimitInput;
   signal?: AbortSignal;
+  /** sitemap 源最多展开多少页；默认 20，上限 200。 */
+  maxPages?: number;
+}
+
+/**
+ * 把一张网页变成词条。
+ *
+ * 目的很朴素:用户填的是「一个能读到内容的网址」,不该要求对方先做成自家 JSON 格式。
+ * 这里剥掉脚本与样式,按段落/小标题/列表项切块,每块一条 concept 词条,
+ * 词条名取该块开头一小段,正文就是块本身——搜「攻顶弹」「修理费」这类词时
+ * 命中段落比命中整个页面有用。
+ *
+ * 页面重复抓取不会产生重复词条:id 由「规范化 URL + 块序号」决定,合并时按 id 覆盖。
+ */
+export function parseHtmlKb(html: string, url: string, input?: KbLimitInput): RemoteKb {
+  const limits = resolveKbLimits(input);
+  const title = decodeHtmlEntities((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? '').trim()).slice(0, 80);
+  // 纯前端渲染站（如 wiki.warthunder.com）的 HTML 只有菜单与页脚：
+  // 抽出来的段落看着像正文，其实全是导航项，入库只会污染词库。
+  const anchorCount = (html.match(/<a[\s>]/gi) ?? []).length;
+  const paragraphCount = (html.match(/<p[\s>]/gi) ?? []).length;
+  if (anchorCount > 80 && paragraphCount * 6 < anchorCount) {
+    throw new Error('这个地址是导航页:正文由前端脚本渲染,直接抓 HTML 只能拿到菜单;请改填该站的 JSON 接口或具体词条页');
+  }
+  const cleaned = html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, ' ')
+    .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, ' ');
+  const blocks: string[] = [];
+  const pattern = /<(?:p|h[1-4]|li|dd|blockquote)[^>]*>([\s\S]*?)<\/(?:p|h[1-4]|li|dd|blockquote)>/gi;
+  for (const match of cleaned.matchAll(pattern)) {
+    const text = decodeHtmlEntities(match[1]!.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+    if (text.length < 12) continue;
+    blocks.push(text.slice(0, 600));
+    if (blocks.length >= 60) break;
+  }
+  if (blocks.length === 0) throw new Error('网页里没有可读的段落(可能是纯脚本页或需要登录)');
+  const host = (() => {
+    try {
+      return new URL(url).host;
+    } catch {
+      return 'web';
+    }
+  })();
+  const stem = host + new URL(url, 'http://x/').pathname + '#' + String(title || 'page');
+  const entries: KbEntry[] = blocks.map((text, index) => ({
+    id: 'web-' + hashKey(stem + '|' + String(index)),
+    kind: 'concept',
+    name: (title ? title + ' · ' : '') + text.slice(0, 24),
+    summary: text,
+    tags: ['网页', host],
+  }));
+  checkKbBudget(0, entries.length, limits);
+  return { version: 'web:' + host + '@' + String(entries.length), entries, skipped: 0 };
+}
+
+/** 32 位字符串散列,只用来做稳定 id。 */
+export function hashKey(input: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', '#39': "'" };
+
+export function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&([a-zA-Z#0-9]+);/g, (whole, name: string) => ENTITIES[name.toLowerCase()] ?? whole)
+    .replace(/&#(\d+);/g, (_whole, code: string) => String.fromCodePoint(Number(code)))
+    .trim();
 }
 
 /**
@@ -327,29 +412,113 @@ async function readBodyCapped(res: Response, maxBytes: number, signal: AbortSign
 }
 
 /** 有界流拉取后，结构预检再JSON.parse；默认60秒。 */
-export async function fetchRemoteKb(url: string, opts: FetchKbOptions = {}): Promise<RemoteKb> {
+const SITEMAP_MAX_LOCS = 500;
+const SITEMAP_MAX_CHILD_MAPS = 5;
+const SITEMAP_PAGE_CONCURRENCY = 4;
+const SITEMAP_ASSET_RE = /\.(?:xml|jpe?g|png|gif|svg|webp|zip|gz|pdf|mp4|mp3)(?:[?#].*)?$/i;
+
+/** 从 sitemap 或 urlset 里取出页面地址；去重、只留 http(s)、默认最多 500 条。 */
+export function parseSitemapLocs(xml: string, limit = SITEMAP_MAX_LOCS): string[] {
+  const out: string[] = [];
+  for (const match of xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
+    const loc = decodeHtmlEntities(match[1]!.trim());
+    if (!/^https?:/i.test(loc)) continue;
+    if (out.includes(loc)) continue;
+    out.push(loc);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** 判断响应是不是 sitemap：XML 内容类型，或以 <?xml / <sitemapindex / <urlset 开头。 */
+export function isSitemapPayload(mime: string, text: string): boolean {
+  if (mime.includes('xml')) return true;
+  return /^\s*<(?:\?xml|sitemapindex|urlset)/i.test(text);
+}
+
+/** 有界拉取一个源，返回文本与 MIME。 */
+export async function fetchSourceText(url: string, opts: FetchKbOptions, limits: KbLimits, signal: AbortSignal): Promise<{ text: string; mime: string }> {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
-  if (!url.trim()) throw new Error('没有配置知识库源');
+  const res = await fetchGuarded(url, {
+    ...(opts.allowPrivate === true ? { allowPrivate: true } : {}),
+    fetchImpl,
+    signal,
+    headers: { accept: 'application/json, text/html, application/xml;q=0.9, */*;q=0.5' },
+  });
+  if (!res.ok) throw new Error('知识库源返回 HTTP ' + res.status);
+  signal.throwIfAborted();
+  const text = await readBodyCapped(res, limits.maxBytes, signal);
+  return { text, mime: (res.headers.get('content-type') || '').toLowerCase() };
+}
+
+/**
+ * sitemap 源：把一个 sitemap 展开成若干页面，逐页抽段落入库。
+ *
+ * 文档站常有 sitemap.xml，但每一页仍是普通网页；这里只展开一层子图，
+ * 页面并发 4，单页失败跳过，全空才算失败。
+ */
+async function fetchSitemapKb(url: string, rootText: string, opts: FetchKbOptions, limits: KbLimits): Promise<RemoteKb> {
+  const maxPages = Math.min(200, Math.max(1, Math.trunc(opts.maxPages ?? 20)));
+  const controller = new AbortController();
+  const signal = opts.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal;
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 60000);
+  try {
+    let locs = parseSitemapLocs(rootText);
+    const nested = /<sitemapindex/i.test(rootText) || (locs.length > 0 && locs.every((loc) => /\.xml(?:[?#].*)?$/i.test(loc)));
+    if (nested) {
+      const merged: string[] = [];
+      for (const child of locs.slice(0, SITEMAP_MAX_CHILD_MAPS)) {
+        try {
+          const got = await fetchSourceText(child, opts, limits, signal);
+          for (const loc of parseSitemapLocs(got.text)) if (!merged.includes(loc)) merged.push(loc);
+        } catch { /* 单个子图失败不影响其它 */ }
+      }
+      locs = merged;
+    }
+    const pages = locs.filter((loc) => !SITEMAP_ASSET_RE.test(loc)).slice(0, maxPages);
+    if (pages.length === 0) throw new Error('sitemap 里没有可抓取的页面');
+    const entries: KbEntry[] = [];
+    let index = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const at = index++;
+        if (at >= pages.length) return;
+        const page = pages[at]!;
+        try {
+          const got = await fetchSourceText(page, opts, limits, signal);
+          entries.push(...parseHtmlKb(got.text, page, limits).entries);
+        } catch { /* 单页失败跳过 */ }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(SITEMAP_PAGE_CONCURRENCY, pages.length) }, () => worker()));
+    if (entries.length === 0) throw new Error('sitemap 各页面都没有可读段落');
+    const kept = entries.slice(0, limits.maxEntries);
+    checkKbBudget(0, kept.length, limits);
+    const host = (() => { try { return new URL(url).host; } catch { return 'web'; } })();
+    return { version: 'sitemap:' + host + '@' + String(pages.length) + '页/' + String(kept.length) + '条', entries: kept, skipped: entries.length - kept.length };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 有界流拉取后，按内容类型分派：sitemap / 网页 / JSON；默认 60 秒。 */
+export async function fetchRemoteKb(url: string, opts: FetchKbOptions = {}): Promise<RemoteKb> {
+  const source = normalizeKbSource(url);
+  if (!source.trim()) throw new Error('没有配置知识库源');
   const controller = new AbortController();
   const limits = resolveKbLimits(opts.limits);
   const signal = opts.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal;
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 60000);
   try {
-    // 走带闸门的 fetch:每一跳重定向都重新校验协议、私网与 DNS 解析结果。
-    const res = await fetchGuarded(url, {
-      ...(opts.allowPrivate === true ? { allowPrivate: true } : {}),
-      fetchImpl,
-      signal,
-      headers: { accept: 'application/json' },
-    });
-    if (!res.ok) throw new Error('知识库源返回 HTTP ' + res.status);
-    signal.throwIfAborted();
-    const text = await readBodyCapped(res, limits.maxBytes, signal);
-    // 先拒绝高复杂度载荷，避免JSON.parse展开巨型嵌套数组。
-    preflightKbJson(text, Buffer.byteLength(text, 'utf8'), limits);
+    const got = await fetchSourceText(source, opts, limits, signal);
+    if (isSitemapPayload(got.mime, got.text)) return fetchSitemapKb(source, got.text, opts, limits);
+    if (got.mime.includes('html') || (!got.mime.includes('json') && /^\s*</.test(got.text))) {
+      return parseHtmlKb(got.text, source, limits);
+    }
+    preflightKbJson(got.text, Buffer.byteLength(got.text, 'utf8'), limits);
     let payload: unknown;
     try {
-      payload = JSON.parse(text);
+      payload = JSON.parse(got.text);
     } catch {
       throw new Error('知识库源返回的不是 JSON');
     }

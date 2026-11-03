@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BattleClient } from '../src/battle.ts';
-import { WT_CONFIG_GROUP, WT_DEFAULTS } from '../src/config.ts';
+import { WT_CONFIG_GROUPS, WT_DEFAULTS } from '../src/config.ts';
 import { WtWorld } from '../src/world.ts';
 import { FakeHost } from './helpers/fake-host.ts';
 const worlds: WtWorld[] = [], dirs: string[] = [];
@@ -22,8 +22,8 @@ function rig(patch: Record<string, unknown> = {}) {
   return { cfg, seen, routes, fetchImpl, world, host, call, poll, tick: () => { now += 1500; } };
 }
 describe('人类时间显示与原值兼容', () => {
-  it.each([['pollMs', 1.5], ['commentaryEveryMs', 45], ['chatSendDelayMs', 0.18]] as const)('%s 使用宿主秒换算而不改存储单位', (key, seconds) => {
-    const prop = WT_CONFIG_GROUP.schema.properties['worlds.wt.' + key];
+  it.each([['pollMs', 1.5], ['commentaryEveryMs', 45]] as const)('%s 使用宿主秒换算而不改存储单位', (key, seconds) => {
+    const prop = Object.assign({}, ...WT_CONFIG_GROUPS.map((group) => group.schema.properties))['worlds.wt.' + key];
     expect(prop['x-scale']).toBe(1000);
     expect(prop['x-suffix']).toBe('秒');
     expect(prop.multipleOf).toBe(1);
@@ -84,7 +84,7 @@ describe('读取范围是实际请求闸门', () => {
     if (outlet === 'result') {
       r.routes['/mission.json'] = { status: 'ended' }; r.tick(); await r.poll();
       const event = r.host.events.find(e => e.type === 'wt.result');
-      expect(event?.text).toContain('击毁未知'); expect(event?.meta?.kills).toBeNull();
+      expect(event?.text).toContain('击杀未知'); expect(event?.meta?.kills).toBeNull();
     }
     expect(r.seen).not.toContain('/hudmsg');
   });
@@ -134,7 +134,7 @@ describe('读取范围是实际请求闸门', () => {
   it('禁用战果日志不把未读取的个人击毁显示成已测零', async () => {
     const r = rig({ readHud: false }); await r.world.start(r.host); await r.poll();
     const text = await r.call('wt_battle_state');
-    expect(text).toContain('击毁未知');
+    expect(text).toContain('战果日志读取关闭');
     expect(r.seen).not.toContain('/hudmsg');
   });
   it('热关闭读取废弃旧缓存，下一次手动查询不再发请求', async () => {
@@ -188,7 +188,7 @@ describe('主动播报与手动读取分离', () => {
   });
   it.each([
     ['broadcastEntryExit', { kind: 'enter' }], ['broadcastEntryExit', { kind: 'leave', summary: { kills: 0, deaths: 0, seconds: 1 } }],
-    ['broadcastKills', { kind: 'kill', total: 1, streak: 1, detail: 'Ace destroyed Bob' }], ['broadcastDeaths', { kind: 'death', total: 1 }],
+    ['broadcastKills', { kind: 'kill', total: 1, streak: 1, detail: 'Ace destroyed Bob (M4A1)' }], ['broadcastDeaths', { kind: 'death', total: 1 }],
     ['broadcastWarnings', { kind: 'behind', kills: 0, deaths: 3 }], ['broadcastHud', { kind: 'hud', detail: '占领了战区A' }],
   ])('%s 关闭只禁对应主动事件', async (key, event) => {
     const r = rig({ [key as string]: false, chatterLevel: 'commentary' }); await r.world.start(r.host); r.host.events.length = 0;
@@ -201,5 +201,44 @@ describe('主动播报与手动读取分离', () => {
     const r = rig({ broadcastCommentary: false, chatterLevel: 'commentary' }); await r.world.start(r.host); await r.poll(); r.host.events.length = 0;
     await (r.world as any).commentaryOnce(); expect(r.host.events).toEqual([]);
     expect(await r.call('wt_commentary')).toContain('fixture-plane');
+  });
+});
+
+describe('战局状态只报事实', () => {
+  it('不传 fields 只报基础三项，声明了哪几项就只报哪几项', async () => {
+    const r = rig(); await r.world.start(r.host); await r.poll();
+    const text = await r.call('wt_battle_state');
+    const lines = text.split('\n');
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/^🎮 载具：/);
+    expect(lines[1]).toMatch(/^📊 状态：/);
+    expect(lines[2]).toMatch(/^🎯 战绩：/);
+    for (const gone of ['读取范围', '未接入', '归因', '限制', '读于', '位置', '战局']) expect(text).not.toContain(gone);
+    expect(text).toContain('得分 未知');
+    for (const hidden of ['载具状态', '车组']) expect(text).not.toContain(hidden);
+
+    // 声明两项就只回这两项：不再挂上默认的载具/状态/战绩。
+    const more = (await r.call('wt_battle_state', { fields: 'position,situation' })).split('\n');
+    expect(more).toHaveLength(2);
+    expect(more[0]).toMatch(/^📍 位置：/);
+    expect(more[1]).toMatch(/^⚔️ 战局：/);
+
+    // 单个细项同理：只回载具状态这一行。
+    const detail = (await r.call('wt_battle_state', { fields: 'detail' })).split('\n');
+    expect(detail).toHaveLength(1);
+    expect(detail[0]).toMatch(/^🛠 载具状态：/);
+
+    // 「状态」这类泛化词仍给基础三项。
+    const generic = (await r.call('wt_battle_state', { fields: '状态' })).split('\n');
+    expect(generic).toHaveLength(3);
+    expect(generic[0]).toMatch(/^🎮 载具：/);
+
+    // 点名问成员：给车组人数，并说明队友名单不在 8111 的返回里。
+    const crew = (await r.call('wt_battle_state', { fields: '成员' })).split('\n');
+    expect(crew[0]).toMatch(/^🛠 载具状态：/);
+    expect(crew.join('\n')).toContain('队友名单');
+
+    // 认不出的词不猜，直接给可选项。
+    expect(await r.call('wt_battle_state', { fields: '天气' })).toContain('没认出要报哪一项');
   });
 });
