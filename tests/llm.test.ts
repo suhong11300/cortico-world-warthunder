@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  chargeSpend,
   chatEndpoint,
   contradictsFacts,
   compose,
@@ -74,15 +73,6 @@ describe('计费与端点', () => {
     expect(readSpend(dir, today).yuan).toBeCloseTo(0.5);
     expect(readSpend(dir, '2026-10-28').yuan).toBe(0);
     expect(readSpend(dir, '2026-10-28').calls).toBe(0);
-  });
-
-  it('chargeSpend 按百万 token 单价累加', () => {
-    const book = chargeSpend({ date: today, inTokens: 0, outTokens: 0, yuan: 0, calls: 0, blocked: 0, resets: 0 }, 1_000_000, 500_000, price);
-    expect(book.inTokens).toBe(1_000_000);
-    expect(book.outTokens).toBe(500_000);
-    expect(book.yuan).toBeCloseTo(2);
-    expect(book.calls).toBe(1);
-    expect(spendPath(dir).endsWith(join('wt', 'spend.json'))).toBe(true);
   });
 });
 

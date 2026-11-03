@@ -14,7 +14,6 @@ import {
   clip,
   commentaryText,
   deathText,
-  degradeNote,
   enterText,
   formatEntry,
   formatHit,
@@ -23,6 +22,7 @@ import {
   personaWrap,
   readyText,
   resultText,
+  situationLine,
 } from '../src/copy.ts';
 import type { BattleSnapshot, BattleSummary } from '../src/battle.ts';
 import type { KbEntry } from '../src/kb-types.ts';
@@ -60,12 +60,12 @@ describe('词条文案', () => {
     expect(text).toContain('标签:美系、战斗机');
   });
 
-  it('formatHit 一行显示,摘要超过 60 字被截断', () => {
+  it('formatHit 给完整摘要，不再截到 60 字（0.5.1 素材完整性）', () => {
     const long: KbEntry = { ...p51, summary: '啊'.repeat(200) };
     const line = formatHit(long, 'zh');
     expect(line.startsWith('· 载具｜P-51D-30 野马 (RB 5.0)｜')).toBe(true);
-    expect(line.length).toBeLessThan(100);
-    expect(line.endsWith('…')).toBe(true);
+    expect(line.endsWith('啊'.repeat(200))).toBe(true);
+    expect(line.endsWith('…')).toBe(false);
   });
 
   it('clip 压平空白并加省略号', () => {
@@ -90,6 +90,21 @@ describe('战局文案', () => {
     expect(battleLine(empty, 'en')).toBe('unknown vehicle · speed unavailable · altitude unavailable · load unavailable');
   });
 
+  it('situationLine 把目标与占点全列，不再只取前三条并切 32 字', () => {
+    const objectives = ['A 点（废墟车站）', 'B 点（山坡碉堡）', 'C 点（码头油库）', 'D 点（机场跑道）', 'E 点（补给站）'];
+    const line = situationLine({ ...snapshot, objectives }, 'zh');
+    for (const one of objectives) expect(line).toContain(one);
+    expect(line).not.toContain('…');
+    // 目标文本与 OCR 线索是两类素材：用户要的是信息给全，不能二选一。
+    const hints = situationLine({ ...snapshot, objectives: ['A'], zoneHints: ['z1', 'z2'] }, 'zh');
+    expect(hints).toContain('目标 A');
+    expect(hints).toContain('z1');
+    // 两条 zoneHints 也要都在
+    const zones = situationLine({ ...snapshot, zoneHints: ['A D 有敌', 'C 空着'] }, 'zh');
+    expect(zones).toContain('A D 有敌');
+    expect(zones).toContain('C 空着');
+  });
+
   it('killText 按连击分档', () => {
     expect(killText(1, 1, '', 'zh')).toContain('本局第 1');
     expect(killText(2, 2, '', 'zh')).toContain('本局第 2');
@@ -98,9 +113,22 @@ describe('战局文案', () => {
     expect(killText(4, 4, '击毁 T-34', 'zh')).toContain('击毁 T-34');
   });
 
+  it('killText 把整条战报原文原样带走，名字不再被切', () => {
+    // 真机形如「羽丘千早丰川祥 (米格-29"狙击手/支点-D") 击毁了 Kapitan Haddock (▄F-14A (伊朗) 雄猫)」
+    const feed = '羽丘千早丰川祥 (米格-29"狙击手/支点-D") 击毁了 Kapitan Haddock (▄F-14A (伊朗) "雄猫")';
+    const text = killText(4, 1, feed, 'zh');
+    expect(text).toContain(feed);
+    expect(text).not.toContain('…');
+    expect(killText(4, 1, feed, 'en')).toContain(feed);
+  });
+
   it('deathText 在多次阵亡后换措辞', () => {
     expect(deathText(1, 'zh')).toContain('阵亡');
     expect(deathText(3, 'zh')).toContain('本局第 3');
+    // 知道是谁打掉的就把名字带上（素材里已有的事实）
+    expect(deathText(2, 'zh', '勃兰特')).toBe('💀 阵亡（本局第 2 · 被 勃兰特 打掉）');
+    expect(deathText(2, 'zh')).toBe('💀 阵亡（本局第 2）');
+    expect(deathText(2, 'en', 'Brandt')).toBe('Down (2 this match), by Brandt.');
   });
 
   it('behindText 同时报击杀与阵亡数', () => {
@@ -134,11 +162,6 @@ describe('战局文案', () => {
     expect(readyText(true, 53, 'zh')).toContain('遥测在线');
     expect(readyText(true, 53, 'zh')).toContain('知识库 53 条');
     expect(readyText(false, 53, 'zh')).toContain('遥测离线');
-  });
-
-  it('degradeNote 标注降级原因', () => {
-    expect(degradeNote('预算用完', 'zh')).toContain('预算用完');
-    expect(degradeNote('no key', 'en')).toContain('no key');
   });
 });
 

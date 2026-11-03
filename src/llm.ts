@@ -135,19 +135,6 @@ export function writeSpend(dataDir: string, book: SpendBook): void {
   }
 }
 
-export function chargeSpend(book: SpendBook, inTokens: number, outTokens: number, price: PriceTable): SpendBook {
-  const cost = (inTokens / 1_000_000) * price.inPerM + (outTokens / 1_000_000) * price.outPerM;
-  return {
-    date: book.date,
-    inTokens: book.inTokens + inTokens,
-    outTokens: book.outTokens + outTokens,
-    yuan: Math.round((book.yuan + cost) * 1e6) / 1e6,
-    calls: book.calls + 1,
-    blocked: book.blocked,
-    resets: book.resets,
-  };
-}
-
 /** 把 base 规范成 chat completions 端点:带 /v1 的不再重复加。 */
 export function chatEndpoint(baseUrl: string): string {
   const base = baseUrl.trim().replace(/\/+$/, '');

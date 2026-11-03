@@ -106,6 +106,12 @@ export interface MapObject {
    */
   dx?: number;
   dy?: number;
+  /**
+   * 占领点专用：/map_obj.json 的 capture_zone 对象带 zone_id 与 zone_label（A/B/C）。
+   * 这是端口唯一直接给出的占领点标识；占领进度与占领方它不给。
+   */
+  zoneId?: number;
+  zoneLabel?: string;
 }
 
 /** 地图端点里的一个单位或点位，已换算成世界米数并算出与自己的直线距离。 */
@@ -130,6 +136,37 @@ export interface MapContact {
    * 正负对应哪一侧取决于客户端 y 轴朝向，尚未定标，所以文案里不写左右。
    */
   bearingDeg?: number;
+}
+
+/**
+ * 地图端点里的一个占领点（capture_zone）。
+ *
+ * 端口直接给出编号、字母标签与坐标，这是占领点位置的唯一权威来源；
+ * 占领进度、占领方与「谁在占」它一律不给，那部分只能按需截图 OCR 兜底。
+ */
+export interface MapZone {
+  /** 客户端给的 zone_id。 */
+  id: number;
+  /** 字母标签（A/B/C）；客户端没给时退回编号。 */
+  label: string;
+  /** 客户端给的图标名与对象类型，原样保留。 */
+  icon: string;
+  type: string;
+  /** 客户端配色 "r,g,b"（真实样本：A 敌红 250,12,0 / B 友蓝 23,77,255 / C 敌红）。 */
+  color: string;
+  /**
+   * 按配色判定的控制方：敌方红、我方蓝。判不出来时留空，不猜。
+   * 这是端口给的「点归谁」，与「占领进度/谁正在占」不是一回事，后者端口不给。
+   */
+  side: 'enemy' | 'ally' | 'self' | '';
+  /** 归一化坐标，与其它地图对象同一坐标系。 */
+  x: number;
+  y: number;
+  /** 由 map_min/map_max 换出的世界米数与格号；地图端点没给参数时不出现。 */
+  worldX?: number;
+  worldY?: number;
+  col?: number;
+  row?: number;
 }
 
 export interface BattleSnapshot {
@@ -168,7 +205,9 @@ export interface BattleSnapshot {
   };
   /** 半径内最近的目标，按距离升序，最多 8 条。 */
   contacts?: MapContact[];
-  /** 画面 OCR 得到的占领线索；8111 没有占领端点。 */
+  /** 地图端点给出的占领点（capture_zone）：编号、字母标签、坐标与格号。 */
+  zones?: MapZone[];
+  /** 画面 OCR 得到的占领线索：端口不给占领进度与占领方，这才是那部分的来源。 */
   zoneHints?: string[];
   /** /mission.json 的 objectives：本局目标文本。真机多数时候是 null，空了就不出现。 */
   objectives?: string[];
@@ -205,8 +244,8 @@ export interface BattleSummary {
 export type BattleEvent =
   | { kind: 'enter'; snapshot: BattleSnapshot }
   | { kind: 'leave'; summary: BattleSummary }
-  | { kind: 'kill'; total: number; streak: number; detail: string; snapshot: BattleSnapshot }
-  | { kind: 'death'; total: number; snapshot: BattleSnapshot }
+  | { kind: 'kill'; total: number; streak: number; detail: string; victim: string; victimRaw: string; snapshot: BattleSnapshot }
+  | { kind: 'death'; total: number; snapshot: BattleSnapshot; killer?: string; feedText?: string }
   | { kind: 'behind'; kills: number; deaths: number; snapshot: BattleSnapshot }
   | { kind: 'hud'; detail: string };
 
@@ -389,6 +428,14 @@ const MAX_HUD_EVENTS = 12;
  * 短时间内的二次阵亡。现在由"存活边沿"负责去重，这里只留一个极小的防抖窗。
  */
 const DEATH_DEBOUNCE_MS = 200;
+/**
+ * 指示灯要连续失效多少轮才当阵亡。
+ *
+ * 切视角、换载具、进出菜单与加载画面都会让 /indicators 抖一两拍 valid:false。
+ * 只看单拍就记阵亡时，这些操作会各记一次（真机反馈：切视角与换车都误报）。
+ * 连续两轮仍然失效，才算这一命真的结束。
+ */
+const DEATH_CONFIRM_POLLS = 2;
 /**
  * 全战场播报里值得当素材的动词。
  *
@@ -680,14 +727,19 @@ export class BattleClient {
         : '';
       const dx = typeof item.dx === 'number' && Number.isFinite(item.dx) ? item.dx : undefined;
       const dy = typeof item.dy === 'number' && Number.isFinite(item.dy) ? item.dy : undefined;
+      const zoneId = typeof item.zone_id === 'number' && Number.isFinite(item.zone_id) ? item.zone_id : undefined;
+      const zoneLabel = typeof item.zone_label === 'string' && item.zone_label.trim() ? item.zone_label.trim() : undefined;
       out.push({
         icon: str(item.icon),
         type: str(item.type),
-        // 真机给的是 sx/sy（起点）与 ex/ey（终点），x/y 只在老客户端出现。
-        x: num(item.sx, num(item.x)),
-        y: num(item.sy, num(item.y)),
+        // 官方 openapi：x/y 是点的归一化坐标（地图外目标会超出 0..1）；
+        // sx/sy/ex/ey 是区域的起始/结束角点，只有机场这类区域对象才给。
+        x: num(item.x, num(item.sx)),
+        y: num(item.y, num(item.sy)),
         color: rgb || str(item.color),
         ...(dx !== undefined && dy !== undefined ? { dx, dy } : {}),
+        ...(zoneId !== undefined ? { zoneId } : {}),
+        ...(zoneLabel !== undefined ? { zoneLabel } : {}),
       });
     }
     return { objects: out, known: true };
@@ -719,7 +771,7 @@ export class BattleClient {
     const item = raw as Record<string, unknown>;
     const objectives: string[] = [];
     if (Array.isArray(item.objectives)) {
-      for (const entry of item.objectives.slice(0, 4)) {
+      for (const entry of item.objectives.slice(0, 12)) {
         if (typeof entry !== 'object' || entry === null) continue;
         const text = str((entry as Record<string, unknown>).text).trim();
         if (text) objectives.push(text.replace(/\s+/g, ' '));
@@ -884,6 +936,8 @@ export interface SelfKillHit {
   detail: string;
   /** 目标昵称(已去掉尾部的载具括号)。 */
   victim: string;
+  /** 目标段的原始文本，含「(载具)」标注；播报要用全就给这一份。 */
+  victimRaw: string;
   /** 这次击毁在 feed 里最大的那条 id。 */
   id: number;
   /** 在本轮 feed 范围内,同一对玩家之间的第几次击毁。 */
@@ -1004,6 +1058,8 @@ export function computeSelfKills(
       key: row.pair + '@' + row.id,
       detail: row.detail,
       victim: row.line.victim,
+      // 老客户端不带 victimRaw 时退回目标昵称，别让播报少一段。
+      victimRaw: row.line.victimRaw ?? row.line.victim,
       id: row.id,
       occurrence: row.occurrence,
     }));
@@ -1105,8 +1161,12 @@ export class BattleWatcher {
   private lastFix: { x: number; y: number; at: number } | undefined;
   /** 在局判定是否必须看到地图证据，见 BattleWatcherOptions。 */
   private readonly strictInBattle: boolean;
-  /** 连续多少轮看到指示灯有效但 invalid；兜底阵亡要求 >=2，避开切视角那一拍。 */
+  /** 连续多少轮看到指示灯有效但 invalid；兜底阵亡要求 >=DEATH_CONFIRM_POLLS。 */
   private invalidStreak = 0;
+  /** 本拍地图里有没有自己的图标：true/false 为确定值，null = 地图端点这一拍读不到。 */
+  private selfOnMap: boolean | null = null;
+  /** feed 已确认这一命结束；置位后指示灯失效不再重复计，直到自己的图标回到地图。 */
+  private selfDead = false;
   /** 最近一次「自己的侦察机损毁」的时刻；兜底推断在这个窗口内不计阵亡。 */
   private observerCrashAt = 0;
   /** 已经入账的击杀幂等键（发起者>目标#第几次），全量重放多少次都只算一次。 */
@@ -1189,13 +1249,20 @@ export class BattleWatcher {
     this.bestStreak = best;
   }
 
-  private applyDeath(out: BattleEvent[], feed?: { identity: string; id: number }): void {
+  private applyDeath(out: BattleEvent[], feed?: { identity: string; id: number; killer?: string; detail?: string }): void {
     this.deaths += 1;
     const identity = feed?.identity ?? 'inferred:' + (++this.inferredSequence);
     this.combatTimeline.push({ identity, kind: 'death', id: feed?.id ?? this.lastDmgMax + 0.5, epoch: this.combatEpoch });
     if (!feed) this.pendingIndicatorEntry = identity;
     this.recomputeStreaks();
-    out.push({ kind: 'death', total: this.deaths, snapshot: this.snapshot });
+    // 0.5.1：谁把我打掉的、原文怎么说，都随事件一起给出去；推断路径没有 feed，这两个字段就缺省。
+    out.push({
+      kind: 'death',
+      total: this.deaths,
+      snapshot: this.snapshot,
+      ...(feed?.killer ? { killer: feed.killer } : {}),
+      ...(feed?.detail ? { feedText: feed.detail } : {}),
+    });
     if (!this.behindRaised && this.deaths >= this.kills + 2) {
       this.behindRaised = true;
       out.push({ kind: 'behind', kills: this.kills, deaths: this.deaths, snapshot: this.snapshot });
@@ -1222,6 +1289,8 @@ export class BattleWatcher {
     this.awaitingInvalidAfterFeed = false;
     this.pendingIndicatorDeath = false;
     this.observerCrashAt = 0;
+    this.selfOnMap = null;
+    this.selfDead = false;
     this.combatTimeline = [];
     this.combatEpoch = 0;
     this.pendingIndicatorEntry = null;
@@ -1351,7 +1420,45 @@ export class BattleWatcher {
       }
       near.sort((a, b) => a.distM - b.distM);
       nearby = { radiusM: this.nearbyRadiusM, enemies: nearEnemies, allies: nearAllies, points: nearPoints };
-      contacts = near.slice(0, 8);
+      // 0.5.1：半径内的目标不再掐到 8 条。地图端点在真机能给到两百多条，
+      // 「附近有什么」是素材，取舍留给播报层，不再由这里替桌宠筛掉。
+      contacts = near.slice(0, 40);
+    }
+    // 占领点：capture_zone 对象带 zone_id / zone_label（A/B/C），这是端口唯一直接给出占领点的通道。
+    // 世界坐标与格号跟其它对象同一套换算；地图参数缺失时仍保留归一化坐标，不把点丢掉。
+    // 占领进度、占领方、谁在占，端口一概不给，那部分才由按需截图 OCR 兜底。
+    const zones: MapZone[] = [];
+    if (probe.mapKnown) {
+      const zMin = mapInfo?.valid ? mapInfo.mapMin : undefined;
+      const zMax = mapInfo?.valid ? mapInfo.mapMax : undefined;
+      const zero = mapInfo?.gridZero;
+      const step = mapInfo?.gridSteps;
+      for (const object of objects) {
+        if (!object.type.toLowerCase().includes('capture_zone')) continue;
+        const fallback = zones.length + 1;
+        const zone: MapZone = {
+          id: object.zoneId ?? fallback,
+          label: object.zoneLabel || String(object.zoneId ?? fallback),
+          icon: object.icon,
+          type: object.type,
+          color: object.color,
+          side: sideOf(object),
+          x: object.x,
+          y: object.y,
+        };
+        if (zMin && zMax) {
+          const ox = Math.round(zMin[0] + object.x * (zMax[0] - zMin[0]));
+          const oy = Math.round(zMin[1] + object.y * (zMax[1] - zMin[1]));
+          zone.worldX = ox;
+          zone.worldY = oy;
+          if (zero && step && step[0] > 0 && step[1] > 0) {
+            zone.col = Math.floor((ox - zero[0]) / step[0]);
+            zone.row = Math.floor((zero[1] - oy) / step[1]);
+          }
+        }
+        zones.push(zone);
+      }
+      zones.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
     }
     const vehicle = (state?.valid && state.vehicle) || (ind?.known && ind.valid ? vehicleFromType(ind.type) : '');
     const vehicleState = ind && ind.known && ind.valid
@@ -1372,6 +1479,8 @@ export class BattleWatcher {
       altitude: altitude.value ?? 0,
       enemies,
       allies,
+      // points 从 0.5.4 起就一直在算（防守点/轰炸点/机场），但漏了写进快照，situationLine 的「目标点 N」因此永远不出现。
+      ...(points > 0 ? { points } : {}),
       ...(selfX !== undefined && selfY !== undefined ? { selfX, selfY } : {}),
       ...(selfDx !== undefined && selfDy !== undefined ? { selfDx, selfDy } : {}),
       ...(worldX !== undefined && worldY !== undefined ? { worldX, worldY } : {}),
@@ -1380,7 +1489,8 @@ export class BattleWatcher {
       ...(groundSpeedKmh !== undefined ? { groundSpeedKmh } : {}),
       ...(nearby ? { nearby } : {}),
       ...(contacts && contacts.length > 0 ? { contacts } : {}),
-      ...(probe.mission && probe.mission.objectives.length > 0 ? { objectives: probe.mission.objectives.slice(0, 6) } : {}),
+      ...(zones.length > 0 ? { zones } : {}),
+      ...(probe.mission && probe.mission.objectives.length > 0 ? { objectives: probe.mission.objectives.slice(0, 12) } : {}),
       readings: {
         speed,
         altitude,
@@ -1390,6 +1500,9 @@ export class BattleWatcher {
         ...(vehiclePending ? { vehiclePending: true } : {}),
       },
     };
+    // 地图端点这一拍读不到时记 null：没有图标不能当死亡证据，只能算"不知道"。
+    this.selfOnMap = probe.mapKnown ? selfX !== undefined && selfY !== undefined : null;
+    if (this.selfOnMap === true) this.selfDead = false;
   }
 
   /** 五路并发观察：在线与战局状态分别判断；缺少强信号时保留“未知”。 */
@@ -1600,7 +1713,10 @@ export class BattleWatcher {
         }
         feedDeathThisPoll = true;
         this.awaitingInvalidAfterFeed = !!(probe.indicators?.known && probe.indicators.valid && !probe.indicators.placeholder);
-        this.aliveArmed = false; this.lastDeathAt = this.now(); this.applyDeath(out, { identity, id: hit.id });
+        this.aliveArmed = false; this.lastDeathAt = this.now(); this.invalidStreak = 0;
+        // 这一命已由 feed 确认：观战视角下指示灯会一直失效，不能每切一次视角就再记一次。
+        this.selfDead = true;
+        this.applyDeath(out, { identity, id: hit.id, killer: line.killer, detail: hit.detail });
         continue;
       }
       // 幂等键 = 发起者>目标#第几次。全量重放多少轮都只入账一次，服务端 id 回退
@@ -1619,6 +1735,8 @@ export class BattleWatcher {
         total: this.kills,
         streak: this.streak,
         detail: hit.detail,
+        victim: hit.victim,
+        victimRaw: hit.victimRaw,
         snapshot: this.snapshot,
       });
     }
@@ -1640,7 +1758,9 @@ export class BattleWatcher {
       if (ind.valid) {
         if (this.awaitingInvalidAfterFeed && this.now() - this.lastDeathAt >= DEATH_VIA_FEED_WINDOW_MS) this.awaitingInvalidAfterFeed = false;
         // 看到一次有效存活：武装边沿，下一次失效才算阵亡。
+        // /indicators 只报"自己载具"的仪表：有效即说明这一命还在（观战/无人机走 placeholder）。
         this.invalidStreak = 0;
+        this.selfDead = false;
         if (!feedDeathThisPoll && !this.awaitingInvalidAfterFeed) this.aliveArmed = true;
       } else if (this.awaitingInvalidAfterFeed) {
         this.awaitingInvalidAfterFeed = false;
@@ -1657,16 +1777,28 @@ export class BattleWatcher {
         if (crashRecent || observerNow) {
           this.aliveArmed = false;
           this.invalidStreak = 0;
+        } else if (this.selfOnMap === true) {
+          // 地图上还画着自己的图标 = 这一命还在。切视角、换载具、开菜单都会让指示灯
+          // 抖一拍失效；地图端点这一拍是明确的"活着"，直接否掉，不计阵亡。
+          this.invalidStreak = 0;
+          this.selfDead = false;
+          if (!feedDeathThisPoll) this.aliveArmed = true;
+        } else if (this.selfDead) {
+          // feed 已经确认过这一命结束：观战视角下指示灯会一直失效，
+          // 不能每切一次视角就再记一次阵亡。重生由"自己的图标回到地图"解除。
+          this.invalidStreak = 0;
         } else {
           this.invalidStreak += 1;
-          // 兜底推断可以用配置关掉（关掉后只认 feed 里"victim 是我"）；开着时沿用
-          // "有效→失效"边沿 + 去抖，只把无人机 / 炮手 / 观战视角排除在外。
+          // 兜底推断可以用配置关掉（关掉后只认 feed 里"victim 是我"）；开着时要求
+          // "有效→失效"边沿 + 连续 DEATH_CONFIRM_POLLS 轮失效 + 去抖，单拍抖动不算。
           if (this.inferDeathFromIndicators && this.aliveArmed
+            && this.invalidStreak >= DEATH_CONFIRM_POLLS
             && this.now() - this.lastDeathAt >= DEATH_DEBOUNCE_MS) {
             this.aliveArmed = false;
             this.lastIndicatorDeathAt = this.now();
             this.pendingIndicatorDeath = true;
             this.lastDeathAt = this.now();
+            this.selfDead = true;
             this.applyDeath(out);
           }
         }
@@ -1714,7 +1846,8 @@ export class BattleWatcher {
 }
 
 /** 聊天正文与昵称都可能被人塞控制字符或超长文本，先洗再收。 */
-const MAX_CHAT_MSG = 400;
+// 0.5.1：对局聊天是素材原话，原来切到 400 字，长句与引用会被截半。
+const MAX_CHAT_MSG = 2000;
 const MAX_CHAT_SENDER = 40;
 
 function toChatLine(raw: unknown): ChatLine | null {

@@ -136,8 +136,10 @@ describe('战局状态机', () => {
     const watcher = new BattleWatcher({ inferDeathFromIndicators: true, client: makeClient(() => routes), now: () => clock });
     await watcher.poll();
 
-    // 存活 -> 失效 是一次边沿,记一次阵亡。
+    // 存活 -> 失效 是一次边沿,记一次阵亡。要看两拍：切视角/换车只抖一拍。
     routes.indicators = { valid: false, speed: 0, altitude: 0, type: 'P-51' };
+    expect(await watcher.poll()).toEqual([]);
+    clock += 1_500;
     const first = await watcher.poll();
     expect(first.map((event) => event.kind)).toEqual(['death']);
 
@@ -153,6 +155,8 @@ describe('战局状态机', () => {
     expect(await watcher.poll()).toEqual([]);
     routes.indicators = { valid: false, speed: 0, altitude: 0, type: 'P-51' };
     clock += 3_000;
+    expect(await watcher.poll()).toEqual([]);
+    clock += 1_500;
     const second = await watcher.poll();
     expect(second.map((event) => event.kind)).toEqual(['death', 'behind']);
     expect(watcher.tally.deaths).toBe(2);

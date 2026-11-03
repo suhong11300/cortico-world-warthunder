@@ -36,13 +36,25 @@ export const WT: WorldDefinition<WtConfigSection> = {
         zh: '从配置的地址拉一次知识库更新。',
         en: 'Pull one knowledge base update from the configured URL.',
       },
+      wt_kb_fetch: {
+        zh: '把一个网址抓成可读素材：按小标题分节、去掉导航，sitemap 展开前几页；结果交给 wt_kb_ingest 写入。',
+        en: 'Fetch a page as readable material: split by headings, strip navigation, expand a sitemap; hand the result to wt_kb_ingest.',
+      },
+      wt_kb_ingest: {
+        zh: '把整理好的词条写入本地知识库；同类型同名覆盖，不产生重复。',
+        en: 'Write prepared entries into the local knowledge base; the same kind and name overwrite instead of duplicating.',
+      },
       wt_battle_state: {
-        zh: '读取当前观测、字段来源与可见地图；战绩为观测归因累计,非官方记分板。',
-        en: 'Read current observations and visible-map objects; attributed tally is not the official scoreboard.',
+        zh: '读取当前观测、字段来源与可见地图；占领点取自 /map_obj.json 的 capture_zone，战绩为观测归因累计,非官方记分板。',
+        en: 'Read current observations and visible-map objects; capture zones come from /map_obj.json, and the attributed tally is not the official scoreboard.',
       },
       wt_map_calib: {
         zh: '地图坐标标定：原始归一化值、地图范围、格网参数与三种格号并列，用来与小地图对照。',
         en: 'Map coordinate calibration: raw normalized values, map bounds, grid params and three grid-label variants for checking against the minimap.',
+      },
+      wt_battle_log: {
+        zh: '列出最近几把打完的战局复盘：编号、载具、杀、死与时长。',
+        en: 'List recent finished battles with index, vehicle, kills, deaths and duration.',
       },
       wt_commentary: {
         zh: '确定性生成当前观测播报:态势、喝彩或打气;未知状态不复用旧读数。',

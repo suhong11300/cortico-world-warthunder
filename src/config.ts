@@ -160,7 +160,9 @@ export const WT_DEFAULTS: WtConfigSection = {
   llmBaseUrl: 'https://api.deepseek.com',
   llmModel: 'deepseek-chat',
   llmApiKey: '',
-  maxInputChars: 1200,
+  // 0.5.1：素材层不再截断，这个数字只限制「发给独立模型接口的那一份」。
+  // 1200 会把一整把的战报与聊天挤掉，默认提到 4000，仍可在配置页下调控费。
+  maxInputChars: 4000,
   maxOutputTokens: 160,
   dailyBudgetYuan: 1,
   maxCallsPerMinute: 6,
@@ -229,7 +231,7 @@ const ENTRIES: Entry[] = [
   { key: 'worlds.wt.llmBaseUrl', title: '接口地址', description: 'OpenAI 兼容接口的基地址。', prop: { type: 'string' } },
   { key: 'worlds.wt.llmModel', title: '模型名', description: '请求体中的 model 字段。', prop: { type: 'string' } },
   { key: 'worlds.wt.llmApiKey', title: '接口密钥', description: '仅 openai 档使用，明文存于 config.json。', prop: { type: 'string' } },
-  { key: 'worlds.wt.maxInputChars', title: '单次输入上限', description: '字符数，超出截断。', prop: { type: 'number' } },
+  { key: 'worlds.wt.maxInputChars', title: '单次输入上限', description: '字符数。只限制发给独立模型接口的那一份素材，事件与查询本身不截断；宿主 cognition 通道不经过这里。', prop: { type: 'number' } },
   { key: 'worlds.wt.maxOutputTokens', title: '单次输出上限', description: 'token 数。', prop: { type: 'number' } },
   { key: 'worlds.wt.dailyBudgetYuan', title: '每日预算', description: '元；超出后回退模板。0 表示不按金额限制。', prop: { type: 'number' } },
   { key: 'worlds.wt.maxCallsPerMinute', title: '每分钟调用', description: '超出后回退模板。', prop: { type: 'number' } },

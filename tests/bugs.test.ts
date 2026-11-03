@@ -157,17 +157,24 @@ describe('P1 中文事件与对局聊天', () => {
 });
 
 describe('P2 小地图读数', () => {
-  it('坐标读 sx/sy,老客户端的 x/y 当兜底', async () => {
+  it('坐标读 x/y,只有区域对象才退回 sx/sy', async () => {
     const client = makeClient(() => ({
       map: [
-        { icon: 'fighter', type: 'fighter', sx: 0.25, sy: 0.5, color: '#67D756' },
-        { icon: 'fighter', type: 'fighter', x: 0.1, y: 0.2, color: '#67D756' },
+        // 单位：真机只给 x/y，地图外目标会超出 0..1。
+        { icon: 'fighter', type: 'aircraft', x: 2.333, y: 4.667, color: '#67D756' },
+        // 两种字段同时在时以 x/y 为准，不能拿机场角点当单位坐标。
+        { icon: 'fighter', type: 'aircraft', x: 0.1, y: 0.2, sx: 0.9, sy: 0.8, color: '#67D756' },
+        // 机场这类区域对象没有 x/y，只有起始角点。
+        { icon: 'none', type: 'airfield', sx: 0.25, sy: -1.6, ex: 0.24, ey: -1.5, color: '#174DFF' },
       ],
     }));
     const objects = await client.mapObjects();
-    expect(objects[0].x).toBeCloseTo(0.25);
-    expect(objects[0].y).toBeCloseTo(0.5);
+    expect(objects[0].x).toBeCloseTo(2.333);
+    expect(objects[0].y).toBeCloseTo(4.667);
     expect(objects[1].x).toBeCloseTo(0.1);
+    expect(objects[1].y).toBeCloseTo(0.2);
+    expect(objects[2].x).toBeCloseTo(0.25);
+    expect(objects[2].y).toBeCloseTo(-1.6);
   });
 
   it('可见对象数不进默认战局行,也不凭空判断游戏模式', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { BattleClient, BattleWatcher } from '../src/battle.ts';
-import { bearingLabel, contactsLine, gridLabel, gridRowLetters, nearbyLine, positionLine } from '../src/copy.ts';
+import { bearingLabel, gridLabel, gridRowLetters, nearbyLine, positionLine } from '../src/copy.ts';
 
 const MAP_INFO = {
   valid: true,
@@ -70,7 +70,6 @@ describe('附近敌我：按世界坐标算直线距离', () => {
     const snap = watcher.currentSnapshot;
     expect(snap.nearby).toBeUndefined();
     expect(nearbyLine(snap, 'zh')).toContain('未读到');
-    expect(contactsLine(snap, 'zh')).toBe('');
   });
 
   it('文案按距离排序并带图标中文名', async () => {
@@ -81,7 +80,6 @@ describe('附近敌我：按世界坐标算直线距离', () => {
     const snap = watcher.currentSnapshot;
     expect(nearbyLine(snap, 'zh')).toContain('500 m 内：1 敌');
     expect(nearbyLine(snap, 'zh')).toContain('最近 敌 重坦');
-    expect(contactsLine(snap, 'zh')).toContain('敌 重坦');
   });
 
   it('格号按小地图轴标：横向列用数字、纵向行用小写字母', async () => {

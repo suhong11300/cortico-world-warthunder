@@ -51,6 +51,7 @@ describe('实战入场占位数据', () => {
     r.tick(); await r.watcher.poll();
     r.routes['/indicators'] = { valid: false };
     r.tick(); await r.watcher.poll();
+    r.tick(); await r.watcher.poll();
     expect(r.watcher.tally.deaths).toBe(2);
   });
 
@@ -137,6 +138,7 @@ describe('8111 attribution and replay fidelity', () => {
     expect(r.watcher.tally.deaths).toBe(1);
     r.tick(); r.routes['/indicators'] = { valid: true }; await r.watcher.poll();
     r.tick(); r.routes['/indicators'] = { valid: false }; await r.watcher.poll();
+    r.tick(); await r.watcher.poll();
     expect(r.watcher.tally.deaths).toBe(2);
   });
   it('does not interpret null as a confirmed invalid indicator', async () => {
@@ -177,6 +179,7 @@ describe('8111 attribution and replay fidelity', () => {
     r.routes['/hudmsg'].damage = [row(1, 10, 'Enemy destroyed Ace (M4A1)')]; await r.watcher.poll();
     r.tick(10000); await r.watcher.poll();
     r.tick(); r.routes['/indicators'] = { valid: false }; await r.watcher.poll();
+    r.tick(); await r.watcher.poll();
     expect(r.watcher.tally.deaths).toBe(2);
   });
   it('does not erase post-death kills when an older death confirmation arrives late', async () => {

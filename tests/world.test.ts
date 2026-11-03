@@ -291,7 +291,9 @@ describe('挂载与播报', () => {
     await pollOnce(world);
     expect(host.events.at(-1)?.type).toBe('wt.kill');
 
+    // 连拍两轮才确认阵亡：单拍失效可能只是切视角或换载具。
     routes.indicators = { valid: false, speed: 0, altitude: 0, type: 'P-51D-30' };
+    await pollOnce(world);
     await pollOnce(world);
     expect(host.events.at(-1)?.type).toBe('wt.death');
     await world.stop();
@@ -643,19 +645,41 @@ describe('隐私与副作用闸', () => {
     chat: [{ id: 70, msg: 'nice shot', sender: 'pecusgaming', enemy: false, mode: 'All' }],
   });
 
-  /** 假 spawn 里造出脚本本该产出的两个文件:截图与识别文本。 */
+  /** 假 spawn:常驻 OCR 协议(先 READY,再按请求行造出截图与识别文本)。 */
   function visionSpawn(outText: string, shots: string[]) {
-    return fakeSpawn({
-      out: 'VISION_OK 2',
-      onSpawn: (args) => {
-        const at = (flag: string): number => args.indexOf(flag);
-        const png = String(args[at('-Out') + 1] ?? '');
-        const txt = String(args[at('-TextOut') + 1] ?? '');
-        writeFileSync(png, 'png');
-        writeFileSync(txt, outText);
-        shots.push(png);
-      },
-    });
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const impl = ((cmd: string, args: string[]) => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+        stdin: { write: (chunk: string) => void };
+        kill: () => void;
+      };
+      const stdout = new EventEmitter() as EventEmitter & { setEncoding: (enc: string) => void };
+      stdout.setEncoding = () => undefined;
+      const stderr = new EventEmitter() as EventEmitter & { setEncoding: (enc: string) => void };
+      stderr.setEncoding = () => undefined;
+      child.stdout = stdout;
+      child.stderr = stderr;
+      child.kill = () => undefined;
+      child.stdin = {
+        write: (chunk: string) => {
+          const line = String(chunk).trim();
+          if (line === 'quit') return;
+          const [id = '', savePath = '', textPath = ''] = line.split('|');
+          if (savePath) {
+            writeFileSync(savePath, 'png');
+            shots.push(savePath);
+          }
+          writeFileSync(textPath, outText);
+          setImmediate(() => stdout.emit('data', 'VISION_OK ' + id + ' capture=1 save=0 bitmap=1 ocr=2 total=3 lines=2\n'));
+        },
+      };
+      calls.push({ cmd, args });
+      setImmediate(() => stdout.emit('data', 'VISION_READY\n'));
+      return child;
+    }) as unknown as typeof import('node:child_process').spawn;
+    return { impl, calls };
   }
 
   it('视觉探测默认删掉整屏截图,只留识别文本', async () => {
@@ -665,7 +689,8 @@ describe('隐私与副作用闸', () => {
     const out = await call(world, 'wt_vision_probe');
     expect(out).toContain('已删');
     expect(out).toContain('击毁');
-    expect(existsSync(shots[0])).toBe(false);
+    // 默认连 PNG 都不落盘：像素直接交给 OCR。
+    expect(shots.length).toBe(0);
     await world.stop();
   });
 
@@ -704,6 +729,26 @@ describe('隐私与副作用闸', () => {
     expect(probe).toContain('占点线索:A 点 占领中');
     const out = await call(world, 'wt_battle_state', { fields: 'situation' });
     expect(out).toContain('占点 A 点 占领中');
+    await world.stop();
+  });
+
+  it('占领点由端口直接给出,不需要截图', async () => {
+    const shots: string[] = [];
+    const fake = visionSpawn('A 点 占领中', shots);
+    const map = [
+      { icon: 'Player', type: 'ground_model', x: 0.5, y: 0.5, 'color[]': [250, 200, 30] },
+      { icon: 'capture_zone', type: 'capture_zone', x: 0.2, y: 0.5, 'color[]': [250, 12, 0], zone_id: 0, zone_label: 'A' },
+      { icon: 'capture_zone', type: 'capture_zone', x: 0.8, y: 0.5, 'color[]': [23, 77, 255], zone_id: 1, zone_label: 'B' },
+    ];
+    const mapInfo = { valid: true, map_min: [0, 0], map_max: [1000, 1000], grid_zero: [0, 1000], grid_steps: [100, 100] };
+    const { world } = await boot({ visionMode: 'probe' }, () => ({ state: inBattle, map, mapInfo }), undefined, fake.impl);
+    const out = await call(world, 'wt_battle_state', { fields: 'zones' });
+    expect(out).toContain('占领点 2 个');
+    expect(out).toContain('敌方控制');
+    expect(out).toContain('我方控制');
+    expect(out).toContain('格 ');
+    // 端口已经给的点位不该再触发截图。
+    expect(fake.calls.length).toBe(0);
     await world.stop();
   });
 

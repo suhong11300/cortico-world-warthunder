@@ -145,8 +145,11 @@ describe('BattleWatcher:阵亡计数不再漏也不再重', () => {
     clock = 101_500;
     routes.indicators = dead;
     await watcher.poll();
-    expect(watcher.tally.deaths).toBe(1);
+    // 兜底要连续两拍失效才确认，第一拍只记边沿。
     clock = 103_000;
+    await watcher.poll();
+    expect(watcher.tally.deaths).toBe(1);
+    clock = 104_500;
     routes.hud = { events: [], damage: [{ id: 5, time: 10, msg: 'Enemy1 击毁了 Ace (M1A1)' }] };
     await watcher.poll();
     expect(watcher.tally.deaths).toBe(1);
@@ -173,8 +176,11 @@ describe('BattleWatcher:阵亡计数不再漏也不再重', () => {
     clock = 101_500;
     routes.indicators = dead;
     await watcher.poll();
-    expect(watcher.tally.deaths).toBe(1);
+    // 单拍失效只当抖动（切视角、换车），连续两拍才记这一次阵亡。
     clock = 103_000;
+    await watcher.poll();
+    expect(watcher.tally.deaths).toBe(1);
+    clock = 104_500;
     routes.indicators = alive;
     await watcher.poll();
     expect(watcher.tally.deaths).toBe(1);

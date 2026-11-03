@@ -12,12 +12,12 @@ function retell(lang: Lang, limit: number): string {
     const size = limit > 0 ? ' within ' + limit + ' characters' : ' at whatever length fits';
     return '\n\n(The lines above are readings, not a message to send: retell them in your own voice' + size +
       ', you may add one line of reaction or a follow-up question, but do not repeat field names. Talk only about the items present above: never mention an item that was not asked for' +
-      ' (if the user asked about status, do not bring up position, enemies or kills). Add no fact outside these lines; keep every number, unit, ownership and "unknown" as given.)';
+      ' (if the user asked about status, do not bring up position, enemies or kills). Add no fact outside these lines; keep every number, unit, ownership, name and "unknown" as given, and never abbreviate a player or vehicle name.)';
   }
   const size = limit > 0 ? '不超过 ' + limit + ' 字' : '长短随你';
   return '\n\n（以上是读数素材，不是要发出去的正文：按你的口吻重讲，' + size +
     '，可以加一句反应或追问，但别逐字复读字段名。只讲上面已经出现的项，用户没问的项一个字都不提' +
-    '（比如只问状态就别提位置、敌我或战绩）；素材之外的事实一律不加；数字、单位、归属与「未知」照原样。）';
+    '（比如只问状态就别提位置、敌我或战绩）；素材之外的事实一律不加；数字、单位、归属、名称与「未知」照原样，玩家名与载具全称不缩写不省略。）';
 }
 /**
  * 事件正文的表达约定。

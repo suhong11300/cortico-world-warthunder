@@ -4,47 +4,58 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { spawn as spawnChild } from 'node:child_process';
-import { ensureVisionScript, extractVisionHints, extractZoneHints, probeVision, visionScriptPath } from '../src/vision.ts';
+import { ensureVisionScript, extractVisionHints, extractZoneHints, probeVision, stopVisionHost, visionScriptPath } from '../src/vision.ts';
 
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wt-vision-'));
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  stopVisionHost(dir);
+  rmSync(dir, { recursive: true, force: true });
+});
 
-/** 假 spawn:按需写 OCR 文本文件,然后按给定退出码收尾。 */
-function fakeSpawn(options: { text?: string | null; code?: number | null; stderr?: string; hang?: boolean }) {
-  return (() => {
-    const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter; kill: () => void };
-    child.stderr = new EventEmitter();
-    child.kill = () => {};
-    if (options.hang) return child;
-    setTimeout(() => {
-      if (typeof options.text === 'string') {
-        const args = (child as unknown as { spawnargs?: string[] }).spawnargs;
-        void args;
-      }
-      if (options.stderr) child.stderr.emit('data', options.stderr);
-      child.emit('close', options.code ?? 0);
-    }, 5);
-    return child;
-  }) as unknown as typeof spawnChild;
+interface FakeChild extends EventEmitter {
+  stdout: EventEmitter & { setEncoding: (encoding: string) => void };
+  stderr: EventEmitter & { setEncoding: (encoding: string) => void };
+  stdin: { write: (chunk: string) => boolean };
+  kill: () => void;
 }
 
-/** 会写文本文件的假 spawn:从参数里取 -TextOut 的路径。 */
-function writingSpawn(text: string, code = 0, stderr = '') {
-  return ((_cmd: string, args: string[]) => {
-    const child = new EventEmitter() as EventEmitter & { stderr: EventEmitter; kill: () => void };
-    child.stderr = new EventEmitter();
+/**
+ * 假常驻进程:起来就报就绪,收到一条请求后写 OCR 文本并回一行结果。
+ * 请求行格式 <id>|<savePath>|<textPath>|<region>。
+ */
+function hostSpawn(options: { text?: string; fail?: string; hang?: boolean } = {}) {
+  const children: FakeChild[] = [];
+  const spawnFn = (() => {
+    const child = new EventEmitter() as FakeChild;
+    child.stdout = Object.assign(new EventEmitter(), { setEncoding: () => {} });
+    child.stderr = Object.assign(new EventEmitter(), { setEncoding: () => {} });
     child.kill = () => {};
-    setTimeout(() => {
-      const at = args.indexOf('-TextOut');
-      if (at >= 0 && args[at + 1]) writeFileSync(args[at + 1], text, 'utf8');
-      if (stderr) child.stderr.emit('data', stderr);
-      child.emit('close', code);
-    }, 5);
+    child.stdin = {
+      write: (chunk: string) => {
+        const line = chunk.trim();
+        if (options.hang || line === 'quit') return true;
+        const parts = line.split('|');
+        const id = parts[0];
+        const textPath = parts[2] ?? '';
+        setTimeout(() => {
+          if (options.fail) {
+            child.stdout.emit('data', 'VISION_ERR ' + id + ' ' + options.fail + '\n');
+            return;
+          }
+          if (typeof options.text === 'string') writeFileSync(textPath, options.text, 'utf8');
+          child.stdout.emit('data', 'VISION_OK ' + id + ' total=1 lines=0\n');
+        }, 5);
+        return true;
+      },
+    };
+    setTimeout(() => child.stdout.emit('data', 'VISION_READY\n'), 1);
+    children.push(child);
     return child;
   }) as unknown as typeof spawnChild;
+  return { spawnFn, children };
 }
 
 describe('视觉脚本', () => {
@@ -57,6 +68,7 @@ describe('视觉脚本', () => {
     expect(existsSync(target)).toBe(true);
     const script = readFileSync(target, 'utf8');
     expect(script).toContain('VISION_OK');
+    expect(script).toContain('VISION_READY');
     expect(script).toContain('Windows.Media.Ocr');
     expect(script).toContain('CopyFromScreen');
     for (const ch of script) expect(ch.charCodeAt(0)).toBeLessThan(128);
@@ -65,7 +77,8 @@ describe('视觉脚本', () => {
 
 describe('探测', () => {
   it('成功时返回识别行数与文本', async () => {
-    const result = await probeVision({ dataDir: dir, spawnImpl: writingSpawn('击毁 T-34\n胜利', 0) });
+    const fake = hostSpawn({ text: '击毁 T-34\n胜利' });
+    const result = await probeVision({ dataDir: dir, spawnImpl: fake.spawnFn });
     expect(result.ok).toBe(true);
     expect(result.lines).toBe(2);
     expect(result.text).toContain('击毁 T-34');
@@ -75,21 +88,43 @@ describe('探测', () => {
     expect(result.ms).toBeGreaterThanOrEqual(0);
   });
 
-  it('非零退出码时给出失败原因,不抛异常', async () => {
-    const result = await probeVision({ dataDir: dir, spawnImpl: writingSpawn('', 1, 'Access denied') });
+  it('默认不留截图,要留时才落盘', async () => {
+    const plain = hostSpawn({ text: '击毁 T-34' });
+    const without = await probeVision({ dataDir: dir, spawnImpl: plain.spawnFn });
+    expect(without.ok).toBe(true);
+    expect(existsSync(without.pngPath)).toBe(false);
+
+    stopVisionHost(dir);
+    const keep = hostSpawn({ text: '击毁 T-34' });
+    const saved = await probeVision({ dataDir: dir, spawnImpl: keep.spawnFn, keepPng: true });
+    expect(saved.ok).toBe(true);
+  });
+
+  it('同一数据目录复用常驻进程', async () => {
+    const fake = hostSpawn({ text: '击毁 T-34' });
+    await probeVision({ dataDir: dir, spawnImpl: fake.spawnFn });
+    await probeVision({ dataDir: dir, spawnImpl: fake.spawnFn });
+    expect(fake.children.length).toBe(1);
+  });
+
+  it('失败时给出原因,不抛异常', async () => {
+    const fake = hostSpawn({ fail: 'Access denied' });
+    const result = await probeVision({ dataDir: dir, spawnImpl: fake.spawnFn });
     expect(result.ok).toBe(false);
     expect(result.error).toContain('截图或 OCR 失败');
     expect(result.error).toContain('Access denied');
   });
 
-  it('进程不退出时按超时收尾', async () => {
-    const result = await probeVision({ dataDir: dir, timeoutMs: 40, spawnImpl: fakeSpawn({ hang: true }) });
+  it('进程不回应时按超时收尾', async () => {
+    const fake = hostSpawn({ hang: true });
+    const result = await probeVision({ dataDir: dir, timeoutMs: 40, spawnImpl: fake.spawnFn });
     expect(result.ok).toBe(false);
     expect(result.error).toBeTruthy();
   });
 
   it('识别文本为空时 ok 仍为真但行数为 0', async () => {
-    const result = await probeVision({ dataDir: dir, spawnImpl: writingSpawn('   \n  ', 0) });
+    const fake = hostSpawn({ text: '   \n  ' });
+    const result = await probeVision({ dataDir: dir, spawnImpl: fake.spawnFn });
     expect(result.ok).toBe(true);
     expect(result.lines).toBe(0);
   });
