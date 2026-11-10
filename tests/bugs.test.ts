@@ -349,4 +349,39 @@ describe('P12 接入前的不计：只认入局基线之后的新行', () => {
     expect((await watcher.poll()).map((event) => event.kind)).toEqual([]);
     expect(watcher.tally.kills).toBe(2);
   });
+
+  it("上一局 enter 还挂着就切到下一局：只发一条 enter，也不补一条 leave", async () => {
+    const first = [
+      row(30, 10, "Ace destroyed T-34 (M4A1)"),
+      row(31, 20, "Ace destroyed T-62 (M4A1)"),
+    ];
+    const routes: Routes = {
+      state: inBattleState,
+      // 加载画面：载具还是占位模型，这一拍不该播 enter
+      indicators: { valid: true, type: "dummy_plane" },
+      mission: runningMission,
+      mapInfo: { valid: true },
+      map: [],
+      hud: { events: [], damage: [...first] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000, playerName: "Ace" });
+    expect(await watcher.poll()).toEqual([]);
+
+    // 还没播 enter 就又切局：真载具读出来了，feed 里 time 回退
+    (routes as any).indicators = { valid: true, type: "fixture-plane" };
+    (routes.hud as any).damage = [
+      ...first,
+      row(32, 30, "Ace destroyed IS-2 (M4A1)"),
+      row(33, 4, "Ace destroyed M4 (M4A1)"),
+      row(34, 8, "Ace destroyed T-34 (M4A1)"),
+    ];
+    const kinds = (await watcher.poll()).map((event) => event.kind);
+    // 上一局根本没进过场，补一条 leave 就是凭空报离场
+    expect(kinds).not.toContain("leave");
+    // 一局只能有一条 enter：切局那条走挂起，不会再补出第二条
+    expect(kinds.filter((kind) => kind === "enter")).toHaveLength(1);
+    expect(kinds[0]).toBe("enter");
+    // 下一条拍也不许再补
+    expect((await watcher.poll()).map((event) => event.kind)).not.toContain("enter");
+  });
 });

@@ -18,6 +18,7 @@ import {
   clip,
   commentaryText,
   deathText,
+
   enterText,
   formatEntry,
   formatHit,
@@ -678,7 +679,10 @@ export class WtWorld implements World {
         if (!cfg.autoBrief || cfg.broadcastEntryExit === false) return;
         const snapshot = this.labelled(event.snapshot);
         const text = enterText(snapshot, lang, this.broadcastLength());
-        await push('wt.battle_started', text, 'flush', { vehicle: snapshot.vehicle, observation: snapshot.readings });
+        await push('wt.battle_started', text, 'flush', {
+          vehicle: snapshot.vehicle,
+          observation: snapshot.readings,
+        });
         return;
       }
       case 'kill': {
@@ -1564,9 +1568,16 @@ export class WtWorld implements World {
     const baseGroup = has('状态', '情况', '战况', '概览', '怎么样', '现在', 'status', 'overview');
     const declared = all || want.size > 0;
     const crewAsked = has('成员', '乘员', '队员', '队友', '小队', 'crew', 'squad');
+    // 工具描述把 vehicle / state 当成对外契约的键名（这一条在 world.ts 的 parameters 里写着），
+    // 实现必须同样认。早先只认中文，模型照描述传 fields=vehicle 时一个判据都不命中，整段落到
+    // 末尾的「没认出要报哪一项」，看上去就像载具那一项压根没有回话。
+    const vehicleAsked = has('vehicle', '载具', '机型', '机体', 'aircraft');
+    const stateAsked = has('state', '读数', '仪表', '飞行数据');
     const lines: string[] = [];
-    if (all || baseGroup || !declared) {
+    if (all || baseGroup || !declared || vehicleAsked) {
       lines.push('🎮 载具：' + vehicleName(viewed, 'zh') + armySuffix(viewed.army));
+    }
+    if (all || baseGroup || !declared || stateAsked) {
       lines.push('📊 状态：' + stateOnly(viewed, 'zh'));
     }
     if (all || baseGroup || !declared || has('战绩', '击杀', '击毁', '杀', '阵亡', '死亡', '得分', 'kills', 'tally')) {

@@ -63,6 +63,7 @@ describe('侦察机损毁不算玩家阵亡', () => {
     let now = 1_000;
     const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => now, playerName: 'Ace', inferDeathFromIndicators: true });
 
+    // /indicators 自带 speed（坦克上是 km/h），进局第一拍就有对地速度，不必等地图点，所以当场发 enter。
     const first = await watcher.poll();
     expect(first.map((e) => e.kind)).toEqual(['enter']);
 

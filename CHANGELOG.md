@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.6
+
+### 入局播报等到载具就绪，不再发半句
+
+进局那一拍客户端还在加载画面：`/indicators.type` 是 `dummy_plane`，而 `/state` 已经给出一整套「有效」的飞机仪表。旧逻辑在固定拍数后兜底发一句「⚔️ 进战局」，一局只有一次 enter，发空了就无法更正（2026-11-10 20:22 真机复现，玩家原话「感觉越改越倒退了」）。
+
+- **占位期不设上限**：只要 `/indicators.type === 'dummy_plane'`（快照里 `readings.vehiclePending`），挂起的入局播报原样留着，计数器根本不走；加载 40 秒就等 40 秒。
+- **删掉半句兜底**：`enterBriefText` 与事件的 `brief` 字段一并移除。宁可这一局不发，也不发「⚔️ 进战局」。
+- **上限只兜速度长尾**：`ENTER_WAIT_POLLS` 20 → 60，且只在「载具名已有、陆战/海战但对地速度还算不出来」时生效；过了上限照发完整一行（速度写未读到）。名字一直解析不出的局就不发 enter，离场也不补 leave。
+- **占位判据只认 `dummy_plane`**：300ms 连抓 25 分钟证实加载期的 `/state` 是全套有效读数（IAS/H/TAS/Ny 齐全），拿它放行等于更早把空行发出去。
+- **切局不再倒置**：切局那一拍 `out` 里已有 `leave`，进入事件改为插在 `leave` 之后（原先 `unshift` 会摆成「离场 → 进战局」）；`resetBattle` 顺手清掉上一局挂起的入局播报。
+
+### 陆战/海战对地速度：先读 `/indicators.speed`
+
+- **三级取法**：`army` 为 `tank`/`ship` 且 `/indicators` 给出 `speed` 时直接 `Math.round(speed)`（真机 84 拍对拍证实该字段在坦克上就是 km/h）；缺字段才回落地图位移；两样都没有才写未读到。空战不受影响，仍报 IAS/TAS。
+- **自机认不出的两个真机写法**：`/map_obj.json` 的 `color` 有时是字符串 `"#faC81E"` 而不是 `color[]` 数组，`icon` 也可能是 `"Player"`。旧解析只认数组且大小写敏感，于是认不出自机 → 位移法无源 → 整局「速度未读到」（Carpathians 局 Centauro RGO 复现）。
+- 新增 `normalizeColor()` 把 `#rrggbb` 拆成 `r,g,b`；`sideOf` 补 `icon.toLowerCase() === 'player'`。
+- **用例**：`tests/battle.test.ts` 两个 describe 共 6 项（十六进制颜色、静止报 0、icon 兜底、indicators 优先、缺字段回落、空战不受影响），入局等待 3 项（连占 100 拍不设上限、速度长尾照发完整行、未发 enter 就离场不补 leave）。
+- **验证**：`typecheck` 干净；26 个测试文件 **459 项**全过；三处反证（放宽颜色解析、去掉 icon 兜底、去掉占位期等待）均如期转红。
+
 ## 0.5.5
 
 ### 占领点接进端口，OCR 只兜底进度

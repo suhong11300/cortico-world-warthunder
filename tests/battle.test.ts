@@ -340,3 +340,229 @@ describe('真机形状的在局判定', () => {
     expect(watcher.tally.kills).toBe(1);
   });
 });
+
+/**
+ * 入局播报原来在加载画面那一拍就发出去：/indicators.type 还是 dummy_plane，
+ * 于是整条成了「载具待生成 · 速度未读到 · 高度未读到 · 过载未读到」，
+ * 而一局只有一次 enter，之后再没有更正的机会。下面三条盯着「等就绪 / 最多等 20 拍且超时只报一句 / 没进就别报离场」。
+ */
+describe('入局播报等载具就绪再发', () => {
+  const loadingState = { valid: true, map_valid: true };
+  const placeholder = { valid: true, speed: 0, altitude: 0, type: 'dummy_plane' };
+  const realIndicators = { valid: true, speed: 0, altitude: -49, type: 'tankModels/ussr_t_80ue1_sm' };
+
+  function makeRoutes(indicators: unknown): Routes {
+    return {
+      state: loadingState,
+      indicators,
+      mapInfo: { valid: true },
+      map: [],
+      hud: { events: [], damage: [] },
+    };
+  }
+
+  it('加载画面里还是 dummy_plane 时先压住 enter,读出来再发', async () => {
+    let clock = 100_000;
+    const routes = makeRoutes(placeholder);
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+
+    expect(await watcher.poll()).toEqual([]);
+    // 人已经在局里了,只是载具名还没出来
+    expect(watcher.inBattleNow).toBe(true);
+
+    clock += 1500;
+    routes.indicators = realIndicators;
+    const second = await watcher.poll();
+    expect(second.map((event) => event.kind)).toEqual(['enter']);
+    expect(watcher.currentSnapshot.vehicle).toBe('ussr_t_80ue1_sm');
+    // 只发一次
+    expect(await watcher.poll()).toEqual([]);
+  });
+
+  it('占位期不设上限：连占 100 拍也压着，等真载具出来再发完整一条', async () => {
+    let clock = 100_000;
+    const routes = makeRoutes(placeholder);
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+
+    // 2026-11-10 真机：20:22 那局加载超过 30 秒仍是 dummy_plane。占位期不计拍，等多久都等。
+    for (let i = 0; i < 100; i += 1) {
+      expect(await watcher.poll()).toEqual([]);
+      clock += 1500;
+    }
+    routes.indicators = realIndicators;
+    const after = await watcher.poll();
+    expect(after.map((event) => event.kind)).toEqual(['enter']);
+    expect(watcher.currentSnapshot.vehicle).toBe('ussr_t_80ue1_sm');
+    expect(await watcher.poll()).toEqual([]);
+  });
+
+  it('载具名有了但陆战速度还算不出来：等满上限后照发完整一行，不发半句', async () => {
+    let clock = 300_000;
+    // /indicators 不给 speed 字段、地图参数也没有 → 位移法无源，速度确实算不出来。
+    const routes: Routes = {
+      state: { valid: false },
+      indicators: { valid: true, type: 'tankModels/it_centauro_rgo_120', army: 'tank' },
+      // 地图端点说在局（strict 模式靠它判在局），但自机点还没上图 → 位移法没有源。
+      mapInfo: { valid: true, map_min: [0, 0], map_max: [2048, 2048], grid_zero: [0, 0], grid_steps: [225, 225] },
+      map: [],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+
+    let rounds = 0;
+    let events: Awaited<ReturnType<typeof watcher.poll>> = [];
+    while (rounds < 80) {
+      rounds += 1;
+      clock += 1500;
+      events = await watcher.poll();
+      if (events.length > 0) break;
+    }
+    expect(events.map((event) => event.kind)).toEqual(['enter']);
+    // 上限 60 拍：确实压了很久，但不是永远不发。
+    expect(rounds).toBeGreaterThan(50);
+    expect(rounds).toBeLessThanOrEqual(62);
+    // 发的是完整一行：载具名在，速度写未读到（不再有「⚔️ 进战局」半句）。
+    expect(watcher.currentSnapshot.vehicle).toBe('it_centauro_rgo_120');
+    expect(watcher.currentSnapshot.groundSpeedKmh).toBeUndefined();
+  });
+
+  it('enter 还没发出去就离场时不补一条 leave', async () => {
+    const routes = makeRoutes(placeholder);
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => 100_000 });
+
+    expect(await watcher.poll()).toEqual([]);
+    // 真机离场信号是 map_info.valid=false（strict 模式下地图还在就算在局）
+    routes.state = { valid: true, map_valid: false };
+    routes.mapInfo = { valid: false };
+    expect(await watcher.poll()).toEqual([]);
+    expect(watcher.inBattleNow).toBe(false);
+  });
+});
+
+/**
+ * 陆战真机（2026-11-10，Carpathians 局）：/state 是 {valid:false}，/map_info.json 与 /map_obj.json
+ * 都在，但自机颜色给的是 "#faC81E" 十六进制串，而 sideOf 只按逗号串解析——自己认不出来，
+ * worldX/worldY 一直是 undefined，对地速度就永远「未读到」。下面三条钉住颜色解析与入局那一拍的等待。
+ */
+describe('陆战对地速度：颜色写法与入局等待', () => {
+  // 端点是蛇形字段（真机 /map_info.json 原样），客户端再转驼峰。
+  const mapInfo = { valid: true, map_min: [0, 0], map_max: [2048, 2048], grid_zero: [186.2, 1904.35], grid_steps: [225, 225] };
+  const tankInd = { valid: true, type: 'it_freccia_hitfist_ows', army: 'tank' };
+  // icon 默认用真机的 "Player"；验证颜色解析那条故意换掉，免得被 icon 兜底救过去。
+  const selfRow = (color?: string, icon = 'Player') => ({
+    type: 'ground_model',
+    icon,
+    x: 0.5,
+    y: 0.5,
+    dx: 0,
+    dy: 1,
+    ...(color ? { color } : {}),
+  });
+  const groundRoutes = (map: unknown[], indicators: unknown = tankInd): Routes => ({
+    state: { valid: false },
+    indicators,
+    mapInfo,
+    map,
+    hud: { events: [], damage: [] },
+  });
+
+  it('自机颜色是十六进制串（#faC81E）也认得出，第二拍算出对地速度', async () => {
+    let clock = 100_000;
+    const routes = groundRoutes([selfRow('#faC81E', 'unit')]);
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    // 第一拍：载具名已经读到，但没有上一拍位移可比，仍压住不发。
+    expect(await watcher.poll()).toEqual([]);
+    clock += 1500;
+    // 0.005 个地图宽 = 10.24 m / 1.5 s ≈ 24.6 km/h
+    (routes.map as Array<{ x: number }>)[0].x = 0.505;
+    const second = await watcher.poll();
+    expect(second.map((event) => event.kind)).toEqual(['enter']);
+    const speed = watcher.currentSnapshot.groundSpeedKmh;
+    expect(typeof speed).toBe('number');
+    expect(speed as number).toBeGreaterThan(20);
+    expect(speed as number).toBeLessThan(40);
+  });
+
+  it('站着不动报 0 km/h，不是「速度未读到」', async () => {
+    let clock = 100_000;
+    const routes = groundRoutes([selfRow('#faC81E')]);
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    expect(await watcher.poll()).toEqual([]);
+    clock += 1500;
+    expect((await watcher.poll()).map((event) => event.kind)).toEqual(['enter']);
+    expect(watcher.currentSnapshot.groundSpeedKmh).toBe(0);
+  });
+
+  it('颜色完全给不出来时，icon 是 Player 也认自机', async () => {
+    let clock = 100_000;
+    const routes = groundRoutes([selfRow()]);
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    expect(await watcher.poll()).toEqual([]);
+    clock += 1500;
+    (routes.map as Array<{ x: number }>)[0].x = 0.51;
+    await watcher.poll();
+    expect(typeof watcher.currentSnapshot.groundSpeedKmh).toBe('number');
+  });
+});
+
+/**
+ * 陆战真机（2026-11-10 Centauro RGO 那局）：自机点要等 20 多秒才进 /map_obj，
+ * 那段时间位移法无源可算；但 /indicators.speed 从进图第一拍就有值，而且坦克上就是 km/h。
+ * 所以陆战/海战优先取它，位移法只当兜底。
+ */
+describe('陆战速度优先取 /indicators.speed', () => {
+  const mapInfo = { valid: true, map_min: [0, 0], map_max: [2048, 2048], grid_zero: [186.2, 1904.35], grid_steps: [225, 225] };
+  const movingInd = { valid: true, known: true, type: 'tankModels/it_centauro_rgo_120', army: 'tank', speed: 58.4 };
+
+  it('自机点还没进地图也能报速度，第一拍就发进局', async () => {
+    let clock = 200_000;
+    const routes: Routes = {
+      state: { valid: false },
+      indicators: movingInd,
+      mapInfo,
+      // 真机样本：141 个对象里只有 capture_zone / respawn_base_*，没有 Player。
+      map: [{ type: 'capture_zone', icon: 'none', x: 0.3, y: 0.6 }],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    const first = await watcher.poll();
+    expect(first.map((event) => event.kind)).toEqual(['enter']);
+    expect(watcher.currentSnapshot.groundSpeedKmh).toBe(58);
+    // 载具名也认上了（indicators.type 有值），不再走「载具待生成」。
+    expect(watcher.currentSnapshot.readings?.vehiclePending).not.toBe(true);
+  });
+
+  it('/indicators.speed 缺字段时回落地图位移法', async () => {
+    let clock = 210_000;
+    const routes: Routes = {
+      state: { valid: false },
+      indicators: { valid: true, known: true, type: 'tankModels/it_centauro_rgo_120', army: 'tank' },
+      mapInfo,
+      map: [{ type: 'ground_model', icon: 'Player', x: 0.5, y: 0.5 }],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    await watcher.poll();
+    clock += 1500;
+    (routes.map as Array<{ x: number }>)[0].x = 0.505;
+    await watcher.poll();
+    const speed = watcher.currentSnapshot.groundSpeedKmh as number;
+    expect(speed).toBeGreaterThan(20);
+    expect(speed).toBeLessThan(40);
+  });
+
+  it('空战不拿 /indicators.speed 当对地速度', async () => {
+    let clock = 220_000;
+    const routes: Routes = {
+      state: { valid: true, 'IAS, km/h': 573, 'H, m': 576 },
+      indicators: { valid: true, known: true, type: 'jf_17', army: 'air', speed: 500 },
+      mapInfo,
+      map: [],
+      hud: { events: [], damage: [] },
+    };
+    const watcher = new BattleWatcher({ client: makeClient(() => routes), now: () => clock });
+    await watcher.poll();
+    expect(watcher.currentSnapshot.groundSpeedKmh).toBeUndefined();
+    expect(watcher.currentSnapshot.army).toBe('air');
+  });
+});

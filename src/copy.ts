@@ -71,7 +71,8 @@ export function stateOnly(snapshot: BattleSnapshot, lang: Lang): string {
   const bits: string[] = [];
   const readings = snapshot.readings;
   if (snapshot.army === 'tank' || snapshot.army === 'ship') {
-    // 真机 /state 常是 {"valid": false}，indicators.speed 是矢量原始值；陆战速度只能用地图位移算。
+    // 真机 /state 常是 {"valid": false}；陆战速度优先取 /indicators.speed（坦克上就是 km/h），
+    // 缺字段时才回落地图位移法——两样都没有才写「未读到」。
     if (snapshot.groundSpeedKmh !== undefined && Number.isFinite(snapshot.groundSpeedKmh)) {
       bits.push(Math.round(snapshot.groundSpeedKmh) + ' km/h');
     } else {

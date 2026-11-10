@@ -437,6 +437,17 @@ const DEATH_DEBOUNCE_MS = 200;
  */
 const DEATH_CONFIRM_POLLS = 2;
 /**
+ * 入局后最多等几拍再发 enter 播报。
+ *
+ * 加载画面里 /indicators.type 还是 dummy_plane，这一拍推 enter 会得到「载具待生成 ·
+ * 速度未读到 · 高度未读到 · 过载未读到」；而一局只有一次 enter，之后再没有更正的机会。
+ * 加载画面长短不定（2026-11-10 真机见过超过 30 秒仍在 dummy_plane），所以：
+ * ① 占位期（/indicators.type = dummy_plane）压根不计拍、不设上限，等到出真载具再发；
+ * ② 这个上限只兜「载具名已可读、但陆战对地速度还没算出来」的长尾，按 1.5 秒一拍算 60 拍约 90 秒；
+ * ③ 过了上限照发完整一行（载具名 + 速度未读到），不再有「⚔️ 进战局」那种半句兜底。
+ */
+const ENTER_WAIT_POLLS = 60;
+/**
  * 全战场播报里值得当素材的动词。
  *
  * 必须有中文：中文客户端的 events 是「占领了战区」这种，只留英文关键字时 includes 全部
@@ -654,6 +665,9 @@ export class BattleClient {
     return {
       valid: bool(item.valid),
       mapValid: bool(item.map_valid),
+      // 2026-11-10 真机复核：/state 的 32 个字段里没有 vehicle_type / game_mode / army /
+      // map_valid，只有飞行仪表。这三行照旧保留（客户端升级可能加回来），但不要指望它有值：
+      // 载具身份与 army 实际来自 /indicators，game_mode 两端都不给。
       vehicle: str(item.vehicle_type),
       mode: str(item.game_mode),
       army: str(item.army),
@@ -722,9 +736,15 @@ export class BattleClient {
     for (const entry of raw) {
       if (typeof entry !== 'object' || entry === null) continue;
       const item = entry as Record<string, unknown>;
-      const rgb = Array.isArray(item['color[]'])
-        ? (item['color[]'] as unknown[]).map((part) => Math.trunc(num(part))).join(',')
-        : '';
+      // 真机颜色有几种写法：color[] 数组、color 逗号串、color 井号十六进制（形如 faC81E）。
+      // 统一成 "r,g,b"，因为 sideOf() 只认这一种，而陆战自机正是靠颜色认出来的
+      // （icon 是 "Player"，不带 enemy/friend 字样）。
+      const colorRaw = item['color[]'] ?? item.color;
+      const rgb = Array.isArray(colorRaw)
+        ? colorRaw.map((part) => Math.trunc(num(part))).join(',')
+        : typeof colorRaw === 'string'
+          ? normalizeColor(colorRaw)
+          : '';
       const dx = typeof item.dx === 'number' && Number.isFinite(item.dx) ? item.dx : undefined;
       const dy = typeof item.dy === 'number' && Number.isFinite(item.dy) ? item.dy : undefined;
       const zoneId = typeof item.zone_id === 'number' && Number.isFinite(item.zone_id) ? item.zone_id : undefined;
@@ -894,9 +914,26 @@ function isUnitObject(object: MapObject): boolean {
 }
 
 /**
+ * 把 8111 的颜色写法归一成 "r,g,b"。
+ *
+ * 同一台客户端两种都见过：#faC81E 这种十六进制串与 [250,200,30] 数组。数组在
+ * mapObjectsResult 里直接 join，字符串走这里。认不出来就原样返回，交给 sideOf 回退。
+ */
+function normalizeColor(value: string): string {
+  const text = value.trim();
+  const hex = /^#?([0-9a-fA-F]{6})$/.exec(text);
+  if (hex) {
+    const packed = parseInt(hex[1], 16);
+    return [(packed >> 16) & 255, (packed >> 8) & 255, packed & 255].join(',');
+  }
+  return text;
+}
+
+/**
  * 敌我判定。真机的小地图单位不带 enemy/friend 字样，靠颜色区分：
  * 友方 [23,77,255] / 敌方 [250,12,0] / 自己 [250,200,30]。
- * 老客户端的 icon 里可能带 enemy/friend，所以颜色判不出来时回退看 icon。
+ * 老客户端的 icon 里可能带 enemy/friend，所以颜色判不出来时回退看 icon；
+ * icon 直接是 "Player" 的也一定是自己（陆战真机就长这样）。
  */
 function sideOf(object: MapObject): 'enemy' | 'ally' | 'self' | '' {
   const parts = object.color.split(',').map((part) => Number(part.trim()));
@@ -908,6 +945,7 @@ function sideOf(object: MapObject): 'enemy' | 'ally' | 'self' | '' {
     if (g > 150 && r < 120 && b < 120) return 'ally';
   }
   const icon = object.icon.toLowerCase();
+  if (icon === 'player') return 'self';
   if (icon.includes('enemy')) return 'enemy';
   if (icon.includes('friend') || icon.includes('ally')) return 'ally';
   return '';
@@ -1141,6 +1179,8 @@ export class BattleWatcher {
    * valid:false 才是这一次阵亡；否则持续的失效读数会被每一轮轮询重复计成死亡。
    */
   private aliveArmed = false;
+  /** 入局播报已挂起的拍数；0 表示没有挂起的 enter。 */
+  private pendingEnterPolls = 0;
   /**
    * 本局基线：只认 id 大于它的播报，等于"入局那一刻之后发生的事"。
    *
@@ -1298,6 +1338,8 @@ export class BattleWatcher {
     this.baselineDmgId = -1;
     this.baselineEvtId = -1;
     this.lastFix = undefined;
+    // 开新局即作废上一局挂起的入局播报：留着会被带进新局，再补出一条「进战局」。
+    this.pendingEnterPolls = 0;
     this.snapshot = { vehicle, mode: '', army: '', speed: 0, altitude: 0, enemies: 0, allies: 0 };
   }
 
@@ -1357,14 +1399,23 @@ export class BattleWatcher {
         gridRow = Math.floor((zero[1] - wy) / step[1]);
       }
     }
-    // 对地速度：地图端点的 x/y 会随载具移动，两次采样的世界坐标差除以间隔就是位移速度。
-    // 真机 /state 常是 {"valid": false}、indicators.speed 是带符号的原始矢量，只有这条路径
-    // 能给出陆战与海战可信的 km/h。位移小于 3 km/h 当作静止，避免坐标抖动被读成在跑。
+    // 对地速度：陆战/海战优先用 /indicators.speed —— 真机实测它在坦克上就是 km/h
+    // （2026-11-10 Centauro RGO 那局 84 拍对拍：加速段 86/88、巡航 87~90/87~89、减速 70→26/65→22、
+    // 末段 21.4/21，差几公里是 0.23 秒采样与地图点抖动的量级），而且自机点还没进 /map_obj 时
+    // 它就有值（真机 20:00:19 起 speed=0.000000），不必等自机点出现。
+    // 位移法留作兜底：/indicators.speed 缺字段或那一拍无效时，仍按两次采样的世界坐标差算。
+    // 海战沿用同一口径（没单独核对过；若舰艇给的不是 km/h，再按兵种分开取）。
+    // 位移小于 3 km/h 当作静止，避免坐标抖动被读成在跑。
     let groundSpeedKmh: number | undefined;
     const observedAt = this.now();
+    const armyNow = state?.army || ind?.army || '';
+    const onGroundNow = armyNow === 'tank' || armyNow === 'ship';
+    if (onGroundNow && ind?.known && ind.valid && ind.speedKnown && Number.isFinite(ind.speed)) {
+      groundSpeedKmh = Math.round(ind.speed);
+    }
     if (worldX !== undefined && worldY !== undefined) {
       const prev = this.lastFix;
-      if (prev) {
+      if (groundSpeedKmh === undefined && prev) {
         const dtSec = (observedAt - prev.at) / 1000;
         if (dtSec >= 0.3) {
           const kmh = Math.round((Math.hypot(worldX - prev.x, worldY - prev.y) / dtSec) * 3.6);
@@ -1460,7 +1511,14 @@ export class BattleWatcher {
       }
       zones.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
     }
-    const vehicle = (state?.valid && state.vehicle) || (ind?.known && ind.valid ? vehicleFromType(ind.type) : '');
+    // 真机 /state 从不带 vehicle_type，载具身份只挂在 /indicators.type 上；那一拍请求失败、
+    // 返回残缺对象或 valid 抖成 false 时不能把已知载具清空，沿用上一拍的值（换载具走
+    // vehiclePending 分支，那里会明确清空）。
+    const vehicle = vehiclePending
+      ? ''
+      : (state?.valid && state.vehicle)
+        || (ind && ind.known && ind.valid ? vehicleFromType(ind.type) : '')
+        || (this.snapshot?.vehicle ?? '');
     const vehicleState = ind && ind.known && ind.valid
       ? {
         ...(ind.crewCurrent !== undefined ? { crewCurrent: ind.crewCurrent } : {}),
@@ -1518,7 +1576,9 @@ export class BattleWatcher {
     const online = state !== null || mission !== null || mapInfo !== null || objects.length > 0 || indicators !== null;
     const missionRunning = mission !== null && mission.running;
     const mapReady = mapInfo !== null && mapInfo.valid;
-    const stateOk = state !== null && state.valid && state.mapValid;
+    // 真机 /state 不带 map_valid（2026-11-10 复核 32 个字段全是飞行仪表），
+    // bool(undefined) 恒 false 会让这条信号源永远失效；只有客户端确实给了这个字段才采信它。
+    const stateOk = state !== null && state.valid && (state.mapValidKnown ? state.mapValid : true);
     // 单独的 objects.length 不能当判据：机库里 map_obj.json 可能还残留上一局的单位。
     const missionEnded = mission !== null && ['ended', 'completed', 'success', 'failed', 'fail', 'over'].includes(mission.status);
     // 机库实测（2026-11-02）：/state 与 /indicators 都是 valid:true，/mission.json 仍报
@@ -1590,14 +1650,21 @@ export class BattleWatcher {
       // 而被当成缺数据直接丢掉,玩家看到的现象就是"第一次阵亡从来不播"。
       const firstInd = probe.indicators;
       if (firstInd && firstInd.known && firstInd.valid && !firstInd.placeholder) this.aliveArmed = true;
-      out.push({ kind: 'enter', snapshot: this.snapshot });
-      return out;
+      // enter 不在这里发：加载画面里 type 还是 dummy_plane，这一拍推出去就是
+      // 「载具待生成 · 速度未读到…」，而一局只有一次 enter，之后再没有更正的机会。
+      // 先挂起交给每拍末尾的 flushPendingEnter；warmup 已经把 HUD 基线锚好，
+      // 击杀/阵亡归因不依赖 enter，所以推迟不会丢战绩。
+      this.pendingEnterPolls = 1;
+      // 不 return：这一拍继续走常规流程，让 refreshSnapshot 用最新读数把快照补齐。
     }
 
     if (!inBattle) {
       if (this.inBattle) {
         this.inBattle = false;
-        out.push({ kind: 'leave', summary: this.summaryOf() });
+        // enter 还没发出去就离场：没有「进战局」可对应的「离场」，这条不发。
+        const neverEntered = this.pendingEnterPolls > 0;
+        this.pendingEnterPolls = 0;
+        if (!neverEntered) out.push({ kind: 'leave', summary: this.summaryOf() });
         // 离场即把本局战绩清干净：结算界面里再查状态不该还挂着上一局的杀与死。
         this.kills = 0;
         this.deaths = 0;
@@ -1659,12 +1726,16 @@ export class BattleWatcher {
       .sort((left, right) => left.id - right.id);
     const cut = fresh.length > 1 ? battleStartIndex(fresh) : 0;
     if (cut > 0) {
-      out.push({ kind: 'leave', summary: this.summaryOf() });
+      // 上一局还没发出 enter 就又切局：没有「进」就没有「出」，这条 leave 不发。
+      const neverEntered = this.pendingEnterPolls > 0;
+      if (!neverEntered) out.push({ kind: 'leave', summary: this.summaryOf() });
       const carriedEvt = this.baselineEvtId;
       this.resetBattle(state?.vehicle ?? '');
       this.baselineDmgId = fresh[cut - 1].id;
       this.baselineEvtId = carriedEvt;
-      out.push({ kind: 'enter', snapshot: this.snapshot });
+      // 新一局的 enter 也交给 flushPendingEnter，与入局边沿那条统一：这里 refreshSnapshot
+      // 还没跑，直接 push 拿到的是上一局封存时的空载具（真机 /state 不带 vehicle_type）。
+      this.pendingEnterPolls = 1;
     }
 
     this.refreshSnapshot(probe);
@@ -1745,6 +1816,7 @@ export class BattleWatcher {
     // 就永远错过了（0.3.2 真机 bug：进局瞬间 mission 还没 running，整局 feed 被吃掉）。
     if (!feedLive) {
       this.invalidStreak = 0;
+      this.flushPendingEnter(out);
       return out;
     }
     for (const row of hud.damage) this.processedDamage.add(eventFingerprint(row));
@@ -1820,7 +1892,39 @@ export class BattleWatcher {
       out.push({ kind: 'hud', detail: text });
     }
 
+    this.flushPendingEnter(out);
     return out;
+  }
+
+  /**
+   * 挂起的入局播报：载具名读得出来就发。
+   *
+   * 判据盯的是「这一拍还是不是占位模型」，不拿 state.valid 放行——加载画面里
+   * /state 往往已经 valid:true，而 dummy_plane 还带着一整套「有效」飞机仪表（见
+   * refreshSnapshot 开头），单看 valid 或看读数都会把假读数播出去。
+   *
+   * 占位期不计数也不设上限：加载 40 秒就等 40 秒，等到 /indicators.type 变成真载具再说。
+   * 一局只有一次 enter，发空了没有更正机会，宁可不发也不发半句——所以这里没有
+   * 「只报进场一句」的兜底分支。ENTER_WAIT_POLLS 只兜「名字有了、陆战速度还没算出来」
+   * 的长尾，过了上限照发完整一行（名字在，速度写未读到）。
+   */
+  private flushPendingEnter(out: BattleEvent[]): void {
+    if (this.pendingEnterPolls === 0) return;
+    // 占位期：这一拍什么都不算，直接把挂起留着。
+    if (this.snapshot.readings?.vehiclePending === true) return;
+    this.pendingEnterPolls += 1;
+    // 占位期过了却仍解析不出载具名：不发。等这一局结束，挂起跟着作废（离场不补 leave）。
+    if (this.snapshot.vehicle === '') return;
+    // 陆战/海战报的是对地速度；/indicators.speed 一般进局就有，缺字段时才等地图位移。
+    const onGround = this.snapshot.army === 'tank' || this.snapshot.army === 'ship';
+    const speedGap = onGround && this.snapshot.groundSpeedKmh === undefined;
+    if (speedGap && this.pendingEnterPolls <= ENTER_WAIT_POLLS) return;
+    this.pendingEnterPolls = 0;
+    const event: BattleEvent = { kind: 'enter', snapshot: this.snapshot };
+    // 有 leave 的拍（切局）必须把 enter 插在 leave 之后，否则播报顺序成了「离场 → 进战局」倒置。
+    const leaveAt = out.findIndex((one) => one.kind === 'leave');
+    if (leaveAt >= 0) out.splice(leaveAt + 1, 0, event);
+    else out.unshift(event);
   }
 
   /**

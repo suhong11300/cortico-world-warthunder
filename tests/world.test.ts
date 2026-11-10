@@ -76,6 +76,12 @@ function fakeSpawn(plan: SpawnPlan) {
   return { impl, calls };
 }
 const inBattle = { valid: true, map_valid: true, vehicle_type: 'P-51D-30', game_mode: 'domination', army: 'usa' };
+/**
+ * 真机 /state（2026-11-10 复核 32 个字段）：只有飞行仪表，没有 vehicle_type / game_mode /
+ * army / map_valid。上面的 inBattle 比真机丰富，载具身份那条链路此前被它掩盖着，新用例
+ * 一律用这份样本，别只依赖 inBattle。
+ */
+const realState = { valid: true, 'IAS, km/h': 780, 'H, m': 4200, Ny: 4.2 };
 const inMenu = { valid: true, map_valid: false, vehicle_type: '', game_mode: '', army: '' };
 const flying = { valid: true, speed: 480, altitude: 2100, type: 'P-51D-30' };
 
@@ -749,6 +755,35 @@ describe('隐私与副作用闸', () => {
     expect(out).toContain('格 ');
     // 端口已经给的点位不该再触发截图。
     expect(fake.calls.length).toBe(0);
+    await world.stop();
+  });
+
+  it('fields=vehicle 与 fields=state 各自出行,不落到「没认出要报哪一项」', async () => {
+    const { world } = await boot({}, () => ({ state: inBattle }));
+    const onlyVehicle = await call(world, 'wt_battle_state', { fields: 'vehicle' });
+    expect(onlyVehicle).toContain('载具：');
+    expect(onlyVehicle).not.toContain('没认出');
+    expect(onlyVehicle).not.toContain('状态：');
+    const onlyState = await call(world, 'wt_battle_state', { fields: 'state' });
+    expect(onlyState).toContain('状态：');
+    expect(onlyState).not.toContain('没认出');
+    expect(onlyState).not.toContain('载具：');
+    await world.stop();
+  });
+
+  it('真机 /state 没有 vehicle_type 时载具由 /indicators.type 顶上,指标抖一拍也不清空', async () => {
+    let indicators: unknown = { valid: true, type: 'fa_18c_switzerland', army: 'air' };
+    const mapInfo = { valid: true, map_min: [0, 0], map_max: [4096, 4096] };
+    const map = [{ icon: 'Player', type: 'ground_model', x: 0.5, y: 0.5, 'color[]': [250, 200, 30] }];
+    const { world } = await boot({}, () => ({ state: realState, indicators, mission: { status: 'running' }, mapInfo, map }));
+    const first = await call(world, 'wt_battle_state', { fields: 'vehicle' });
+    expect(first).toContain('载具：');
+    expect(first).not.toContain('载具未知');
+    // 指标这一拍读不到身份：已认到的载具不能凭空消失。
+    indicators = { valid: false };
+    const second = await call(world, 'wt_battle_state', { fields: 'vehicle' });
+    expect(second).toContain('载具：');
+    expect(second).not.toContain('载具未知');
     await world.stop();
   });
 
