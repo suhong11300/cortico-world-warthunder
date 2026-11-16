@@ -2,6 +2,7 @@ import { mkdirSync, openSync, closeSync, fstatSync, readSync, writeSync, fsyncSy
 import { randomUUID } from 'node:crypto';
 import { fetchGuarded, normalizeKbSource } from './guard.ts';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { KB_SEED, KB_SEED_VERSION } from './kb-seed.ts';
 import type { KbEntry, KbKind } from './kb-types.ts';
 import { resolveKbLimits, checkKbBudget, preflightKbJson, type KbLimitInput, type KbLimits } from './kb-limits.ts';
@@ -16,10 +17,16 @@ export interface KbFile {
 
 export interface KbView {
   entries: KbEntry[];
-  /** 当前生效版本:有远程就是远程版本,否则内置版本。 */
+  /** 当前生效版本:本地远程库 > 随包库 > 种子。 */
   version: string;
   remoteVersion: string | null;
   remoteCount: number;
+  /** 随包预置库版本;包内没有可用文件时为 null。 */
+  bundledVersion: string | null;
+  /** 随包预置库条数;没有则为 0。 */
+  bundledCount: number;
+  /** 编译进代码的种子词条数,随包库缺失时它是唯一来源。 */
+  seedCount: number;
   fetchedAt: string;
   loadError?: string;
 }
@@ -44,6 +51,8 @@ export interface RemoteKb {
 
 export const KB_DIR = 'wt';
 export const KB_FILE = 'kb.json';
+/** 跟 npm 包一起发布的预置知识库:包根目录下的 kb.json。 */
+export const BUNDLED_KB_FILE = fileURLToPath(new URL('../kb.json', import.meta.url));
 const KINDS: KbKind[] = ['concept', 'vehicle', 'play'];
 
 /** <dataDir>/wt/kb.json 的绝对路径。 */
@@ -51,9 +60,9 @@ export function kbPath(dataDir: string): string {
   return join(dataDir, KB_DIR, KB_FILE);
 }
 
-/** 读远程那份;文件不存在或内容坏了都返回 null,不影响内置词条。 */
-function readKbChecked(dataDir: string, input?: KbLimitInput): KbFile {
-  const limits = resolveKbLimits(input), fd = openSync(kbPath(dataDir), 'r');
+/** 读任意一个知识库文件;校验字节、结构、条目三重上限。 */
+function readKbAtPath(file: string, input?: KbLimitInput): KbFile {
+  const limits = resolveKbLimits(input), fd = openSync(file, 'r');
   try {
     const stat = fstatSync(fd); if (!stat.isFile()) throw new Error('知识库不是普通文件');
     checkKbBudget(stat.size, 0, limits);
@@ -67,9 +76,31 @@ function readKbChecked(dataDir: string, input?: KbLimitInput): KbFile {
     return { version: parsed.version, fetchedAt: asOptionalString(payload.fetchedAt, 80) ?? '', entries: parsed.entries };
   } finally { closeSync(fd); }
 }
+/** 读远程那份;文件不存在或内容坏了都返回 null,不影响内置词条。 */
+function readKbChecked(dataDir: string, input?: KbLimitInput): KbFile {
+  return readKbAtPath(kbPath(dataDir), input);
+}
 export function readKbFile(dataDir: string, limits?: KbLimitInput): KbFile | null {
   try { return readKbChecked(dataDir, limits); } catch { return null; }
 }
+
+/** 随包库只解析一次:它随 npm 包发布、运行期不会被改写,重复扫描 12MB 没有意义。 */
+let bundledCache: KbFile | null | undefined;
+/**
+ * 读随包预置知识库。
+ *
+ * 包内没有文件、文件损坏、超出台账上限时一律返回 null,调用方回落到种子词条;
+ * 这一层不能因为外部文件坏掉而让整个 World 起不来。
+ */
+export function readBundledKb(limits?: KbLimitInput): KbFile | null {
+  if (bundledCache !== undefined) return bundledCache;
+  let file: KbFile | null = null;
+  try { file = readKbAtPath(BUNDLED_KB_FILE, limits); } catch { file = null; }
+  bundledCache = file;
+  return file;
+}
+/** 只给测试用:换掉随包文件后强制重新解析。 */
+export function resetBundledKbCache(): void { bundledCache = undefined; }
 
 /** 先写 .tmp 再 rename,避免半截文件。 */
 export function writeKbFile(dataDir: string, file: KbFile, input?: KbLimitInput): void {
@@ -101,35 +132,75 @@ export function writeKbFile(dataDir: string, file: KbFile, input?: KbLimitInput)
   }
 }
 
-/** 远程同 id 覆盖内置,远程独有的追加在后面。 */
-export function mergeKb(remote: KbEntry[] | null): KbEntry[] {
-  if (!remote || remote.length === 0) return KB_SEED.slice();
-  // 名字归一化：AI 整理的「虎式 H1」与内置「虎式H1」是同一个东西，不能并存两条。
-  const keyOf = (entry: KbEntry): string => entry.kind + '|' + entry.name.replace(/[\s\u3000]+/g, '').toLowerCase();
-  const merged: KbEntry[] = KB_SEED.slice();
-  const idIndex = new Map<string, number>();
-  merged.forEach((entry, index) => idIndex.set(entry.id, index));
-  const appended: KbEntry[] = [];
-  for (const entry of remote) {
-    const at = idIndex.get(entry.id);
-    if (at !== undefined) merged[at] = entry;
-    else appended.push(entry);
-  }
+/**
+ * 逻辑条目键：同 kind 同名字才算同一个东西。
+ *
+ * 但名字不够——同型号会分散在各分支科技树里（英国 M109A1 与美国 M109A1 是两条不同词条，
+ * 正文与国别都不同）。所以国别与分类一并进键，避免把真实不同的词条合掉。
+ */
+function nameKeyOf(entry: KbEntry): string {
+  // 概念词条的名字常常是页面小标题（「历史」「弹药」），重名不代表同一条，只按 id 去重。
+  if (entry.kind === 'concept') return 'id:' + entry.id;
+  return [
+    entry.kind,
+    entry.name.replace(/[\s\u3000]+/g, '').toLowerCase(),
+    entry.nation ?? '',
+    entry.category ?? '',
+  ].join('|');
+}
+
+/**
+ * 逐层叠加:后层同 id 或同名同 kind 覆盖前层,条目的位置保留首次出现的那次。
+ *
+ * 三层来源各有用处——种子是离线兜底、随包库是全量数据、本地库是用户自建的增量;
+ * 后加的那层必须压过前面,否则一个旧种子词条会永远挡住随包库里的同名新词条。
+ */
+export function mergeLayers(layers: KbEntry[][]): KbEntry[] {
   const byKey = new Map<string, KbEntry>();
-  for (const entry of merged) byKey.set(keyOf(entry), entry);
-  for (const entry of appended) byKey.set(keyOf(entry), entry);
+  const idToKey = new Map<string, string>();
+  for (const layer of layers) {
+    for (const entry of layer) {
+      const key = nameKeyOf(entry);
+      const previous = idToKey.get(entry.id);
+      // 同一条目改了名字:旧名字占的位要腾出来,否则库里会留一条同 id 的僵尸。
+      if (previous !== undefined && previous !== key) byKey.delete(previous);
+      byKey.set(key, entry);
+      idToKey.set(entry.id, key);
+    }
+  }
   return [...byKey.values()];
 }
 
-export function kbView(file: KbFile | null, loadError?: string): KbView {
-  if (!file || file.entries.length === 0) {
-    return { entries: KB_SEED.slice(), version: KB_SEED_VERSION, remoteVersion: null, remoteCount: 0, fetchedAt: '', ...(loadError ? { loadError } : {}) };
-  }
-  return { entries: mergeKb(file.entries), version: file.version || KB_SEED_VERSION, remoteVersion: file.version, remoteCount: file.entries.length, fetchedAt: file.fetchedAt };
+/** 兼容旧入口:远程同 id 覆盖种子,远程独有的追加。 */
+export function mergeKb(remote: KbEntry[] | null): KbEntry[] {
+  return mergeLayers([KB_SEED, remote ?? []]);
 }
-export function loadKb(dataDir: string, limits?: KbLimitInput): KbView {
-  try { return kbView(readKbChecked(dataDir, limits)); }
-  catch (error) { return kbView(null, (error as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : String((error as Error).message)); }
+
+/**
+ * 合成当前视图:种子 < 随包库 < 本地远程/自建库。
+ *
+ * bundled 由调用方显式传入,好处是纯函数层不碰文件系统——测试与本地覆盖都不受影响。
+ */
+export function kbView(file: KbFile | null, loadError?: string, bundled?: KbFile | null): KbView {
+  const bundledEntries = bundled && bundled.entries.length > 0 ? bundled.entries : [];
+  const localEntries = file && file.entries.length > 0 ? file.entries : [];
+  const entries = mergeLayers([KB_SEED, bundledEntries, localEntries]);
+  const version = (localEntries.length ? file!.version : '') || (bundledEntries.length ? bundled!.version : '') || KB_SEED_VERSION;
+  return {
+    entries,
+    version,
+    remoteVersion: localEntries.length ? file!.version : null,
+    remoteCount: localEntries.length,
+    bundledVersion: bundledEntries.length ? bundled!.version : null,
+    bundledCount: bundledEntries.length,
+    seedCount: KB_SEED.length,
+    fetchedAt: localEntries.length ? file!.fetchedAt : (bundledEntries.length ? bundled!.fetchedAt : ''),
+    ...(loadError ? { loadError } : {}),
+  };
+}
+export function loadKb(dataDir: string, limits?: KbLimitInput, bundled?: KbFile | null): KbView {
+  try { return kbView(readKbChecked(dataDir, limits), undefined, bundled); }
+  catch (error) { return kbView(null, (error as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : String((error as Error).message), bundled); }
 }
 
 export function kbCounts(entries: KbEntry[]): KbCounts {
@@ -167,10 +238,17 @@ function haystackOf(entry: KbEntry): { name: string; aliases: string; tags: stri
 }
 
 /** 名称命中权重最高,简介命中最低;整串命中额外加权。 */
-export function scoreEntry(entry: KbEntry, tokens: string[], whole: string): number {
-  if (tokens.length === 0) return 0;
+export interface ScoreDetail { score: number; strong: boolean }
+
+/**
+ * 命中详情。strong = 有结构性证据（整串命中任意字段，或 token 命中名称/别名/标签/分类）。
+ * 两万多条时任意 2-gram 都能在别人的摘要里撞到，纯摘要命中全是噪声，不计入有效结果。
+ */
+export function scoreEntryDetail(entry: KbEntry, tokens: string[], whole: string): ScoreDetail {
+  if (tokens.length === 0) return { score: 0, strong: false };
   const hay = haystackOf(entry);
   let score = 0;
+  let strong = false;
   if (whole) {
     if (hay.name === whole) score += 200;
     else if (hay.name.includes(whole)) score += 120;
@@ -179,15 +257,20 @@ export function scoreEntry(entry: KbEntry, tokens: string[], whole: string): num
     if (hay.tags.includes(whole)) score += 50;
     if (hay.summary.includes(whole)) score += 40;
     if (hay.extra.includes(whole)) score += 30;
+    if (score > 0) strong = true;
   }
   for (const token of tokens) {
-    if (hay.name.includes(token)) score += 18;
-    else if (hay.aliases.includes(token)) score += 14;
-    else if (hay.tags.includes(token)) score += 8;
+    if (hay.name.includes(token)) { score += 26; strong = true; }
+    else if (hay.aliases.includes(token)) { score += 22; strong = true; }
+    else if (hay.tags.includes(token)) { score += 12; strong = true; }
     else if (hay.summary.includes(token)) score += 5;
-    else if (hay.extra.includes(token)) score += 4;
+    else if (hay.extra.includes(token)) { score += 6; strong = true; }
   }
-  return score;
+  return { score, strong };
+}
+
+export function scoreEntry(entry: KbEntry, tokens: string[], whole: string): number {
+  return scoreEntryDetail(entry, tokens, whole).score;
 }
 
 export function searchKb(entries: KbEntry[], query: string, limit = 5): KbHit[] {
@@ -196,8 +279,8 @@ export function searchKb(entries: KbEntry[], query: string, limit = 5): KbHit[] 
   const whole = query.trim().toLowerCase();
   const hits: KbHit[] = [];
   for (const entry of entries) {
-    const score = scoreEntry(entry, tokens, whole);
-    if (score > 0) hits.push({ entry, score });
+    const detail = scoreEntryDetail(entry, tokens, whole);
+    if (detail.strong && detail.score > 0) hits.push({ entry, score: detail.score });
   }
   hits.sort((a, b) => (b.score - a.score) || (a.entry.name.length - b.entry.name.length) || a.entry.id.localeCompare(b.entry.id));
   return hits.slice(0, Math.max(1, limit));

@@ -195,7 +195,8 @@ describe('装配契约', () => {
     const vars = world.envPromptVars() ?? {};
     expect(Object.keys(vars).sort()).toEqual(['wt.battle', 'wt.budget', 'wt.chat', 'wt.kb', 'wt.now', 'wt.source', 'wt.speech', 'wt.status', 'wt.vehicle', 'wt.zone']);
     expect(vars['wt.status']).toBe('遥测离线/状态未知');
-    expect(vars['wt.kb']).toContain('53 条');
+    expect(vars['wt.kb']).toContain('21781');
+    expect(vars['wt.kb']).toContain('21791 条');
     await world.stop();
   });
 
@@ -348,7 +349,8 @@ describe('工具', () => {
     const text = await call(world, 'wt_status');
     expect(text).toContain('自检');
     expect(text).toContain('8111');
-    expect(text).toContain('知识库:v1.0.0');
+    expect(text).toContain('知识库:vwiki.biligame.com@21781');
+    expect(text).toContain('随包库 21781 条');
     expect(text).toContain('预算');
     await world.stop();
   });
@@ -386,8 +388,8 @@ describe('工具', () => {
   it('wt_kb_status 与 wt_kb_update 说明来源状态', async () => {
     const { world } = await boot({ kbUrl: '' });
     const status = await call(world, 'wt_kb_status');
-    expect(status).toContain('v1.0.0');
-    expect(status).toContain('仅内置');
+    expect(status).toContain('vwiki.biligame.com@21781');
+    expect(status).toContain('随包库 vwiki.biligame.com@21781');
     const update = await call(world, 'wt_kb_update');
     // 留空不等于没源:回落到内置默认源(国内镜像优先),这次取不到也只影响这一次。
     expect(update).not.toContain('知识库源没配');

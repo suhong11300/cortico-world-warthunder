@@ -39,7 +39,8 @@ import {
   lengthLimit,
   type BroadcastLength,
 } from './copy.ts';
-import { findVehicle, kbCounts, kbPath, loadKb, searchKb, resolveKbLimits, type KbView } from './kb.ts';
+import { vehicleZh } from './units-zh.ts';
+import { findVehicle, kbCounts, kbPath, loadKb, readBundledKb, searchKb, resolveKbLimits, type KbView } from './kb.ts';
 import { fetchKbMaterial, ingestKbEntries } from './kb-ingest.ts';
 import { splitKbSources, updateKbTransaction } from './kb-update.ts';
 import { MAX_BATTLE_KEEP, appendBattleRecord, formatBattleLine, readBattleLog } from './battles.ts';
@@ -339,7 +340,13 @@ export class WtWorld implements World {
 
   constructor(opts: WtWorldOptions) {
     this.opts = opts;
-    this.view = loadKb(opts.dataDir, this.kbLimits());
+    this.view = this.loadKbView();
+  }
+
+  /** 三层合成:种子打底,随包库覆盖种子,本地库覆盖前两者。 */
+  private loadKbView(): KbView {
+    const limits = this.kbLimits();
+    return loadKb(this.opts.dataDir, limits, readBundledKb(limits));
   }
 
   // ---- 基础读数 ----
@@ -998,7 +1005,7 @@ export class WtWorld implements World {
         limits: this.kbLimits(),
         maxEntries: Number.isFinite(cfg.kbIngestMaxEntries) ? cfg.kbIngestMaxEntries : 30,
       });
-      this.view = loadKb(this.opts.dataDir, this.kbLimits());
+      this.view = this.loadKbView();
       const counts = kbCounts(this.view.entries);
       const dropped = outcome.dropped > 0 ? '，丢弃 ' + String(outcome.dropped) + ' 条（' + outcome.reasons.join('；') + '）' : '';
       return '已入库：新增 ' + String(outcome.added) + ' 条、覆盖 ' + String(outcome.replaced) + ' 条' + dropped + '。库里现有 ' + String(counts.total) + ' 条（载具 ' + String(counts.vehicle) + ' / 概念 ' + String(counts.concept) + ' / 玩法 ' + String(counts.play) + '），版本 ' + outcome.version + '，立即生效。';
@@ -1483,8 +1490,7 @@ export class WtWorld implements World {
       '🗣 口吻:' + this.speechMode() + ' · ' + (this.speechStyle() === '人格' ? '主对话Persona，事实块不改写' : '模板原样转述'),
       '🎯 昵称:' + (cfg.playerName.trim() ? cfg.playerName.trim() : '未配置(不认领feed战绩,仪表失效仅作推断)'),
       '🎮 战局:' + (this.readNotice() ? '未知(读取关闭)' : !online ? '未知(遥测离线)' : battle && !battle.observedBattleKnown ? '未知(部分端点不可用)' : inBattle && snapshot ? '战局中(' + battleLine(this.labelled(snapshot), 'zh') + ')' : '不在战局'),
-      '📚 知识库:v' + this.view.version + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')' +
-        (this.view.remoteVersion ? ' · 远程 ' + this.view.remoteCount + ' 条' : ' · 仅内置'),
+      '📚 知识库:' + this.kbSourceBrief() + ' · ' + counts.total + ' 条(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')',
       '🧠 文案:' + this.sourceText(),
       '💰 今日 ' + book.yuan.toFixed(4) + ' 元 / 预算 ' + Math.max(0, cfg.dailyBudgetYuan) + ' 元',
       '💬 对话:' +
@@ -1510,7 +1516,7 @@ export class WtWorld implements World {
       '📚 知识库',
       '生效版本:v' + this.view.version,
       '条数:' + counts.total + '(载具 ' + counts.vehicle + ' / 概念 ' + counts.concept + ' / 玩法 ' + counts.play + ')',
-      '来源:' + (this.view.remoteVersion ? '内置 + 远程(v' + this.view.remoteVersion + ',' + this.view.remoteCount + ' 条)' : '仅内置'),
+      '来源:' + this.kbSourceDetail(),
       '更新源:' + (scrubUrl(cfg.kbUrl) || '未配置(worlds.wt.kbUrl 留空)'),
       '自动更新:' + (cfg.kbAutoUpdateHours > 0 ? '每 ' + cfg.kbAutoUpdateHours + ' 小时' : '已关'),
       '容量准入:有效 ' + (limits.maxBytes / 1048576) + ' MiB / ' + limits.maxEntries + ' 条；额外更新估算预算 ' + (limits.memoryBudgetBytes / 1048576) + ' MiB(非进程RSS硬上限，旧库与宿主另计)',
@@ -1518,14 +1524,34 @@ export class WtWorld implements World {
     ];
     const fetchedAt = this.readKbFetchedAt();
     if (fetchedAt) lines.push('上次拉取:' + fetchedAt);
-    if (this.view.loadError) lines.push('⚠️ 本地远程库未载入:' + this.view.loadError + '；原文件保留，仅内置库生效');
+    if (this.view.loadError) lines.push('⚠️ 本地远程库未载入:' + this.view.loadError + '；原文件保留，随包库与种子仍可用');
     return lines.join('\n');
   }
 
+  /** 一句话说清当前生效的是哪一层。 */
+  private kbSourceBrief(): string {
+    const view = this.view;
+    const parts = ['v' + view.version];
+    if (view.remoteVersion) parts.push('本地库 ' + view.remoteCount + ' 条');
+    if (view.bundledVersion) parts.push('随包库 ' + view.bundledCount + ' 条');
+    if (!view.remoteVersion && !view.bundledVersion) parts.push('仅种子 ' + view.seedCount + ' 条');
+    return parts.join(' · ');
+  }
+
+  /** 三层各自的版本与条数，缺哪层就明说缺。 */
+  private kbSourceDetail(): string {
+    const view = this.view;
+    const parts = ['种子 ' + view.seedCount + ' 条'];
+    parts.push(view.bundledVersion ? '随包库 v' + view.bundledVersion + '（' + view.bundledCount + ' 条）' : '随包库未载入（包内 kb.json 缺失或损坏）');
+    parts.push(view.remoteVersion ? '本地库 v' + view.remoteVersion + '（' + view.remoteCount + ' 条）' : '本地库未建（远程更新或 wt_kb_ingest 入库后才有）');
+    return parts.join(' + ');
+  }
   /** 载具中文名：知识库命中就用条目名，并附上客户端内部名便于核对。 */
   private vehicleLabel(name: string): string {
     if (!name) return '';
-    const label = findVehicle(this.view.entries, name)?.name?.trim() ?? '';
+    // 拆包语言表里的中文名优先（kb 条目名多为英文），查不到再回知识库。
+    const label = vehicleZh(this.opts.dataDir, name)
+      || (findVehicle(this.view.entries, name)?.name?.trim() ?? '');
     if (!label || label === name) return name;
     // 知识库名往往已经含内部名（P-51D-30 野马 / P-51D-30），重复附注反而难读。
     if (label.includes(name)) return label;
